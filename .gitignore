@@ -1,0 +1,19 @@
+# Nuitka build directories
+build/
+*.build/
+*.dist/
+*.onefile-build/
+
+# Dynamic build-time config
+agent_build_config.py
+
+# Local logs and output inventories
+*.log
+*.csv
+
+# Local encryption and credentials keys
+*.dat
+
+# Python caches
+__pycache__/
+*.pyc
