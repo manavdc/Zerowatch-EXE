@@ -2562,6 +2562,15 @@ def password_kill_cli():
         for i in range(3, 0, -1):
             print(f"      Stopping in {i}...")
             time.sleep(1)
+            
+        try:
+            request_shutdown_signal(base_dir, "watchdog-override")
+            unregister_windows_service()
+            unregister_task_scheduler()
+            unregister_startup_registry()
+        except Exception as e:
+            logging.error(f"Error during persistent unregistration: {e}")
+            
         sys.exit(0)  # Exit code 0 = authorized
     else:
         print("\n  [!!] ERROR: Incorrect kill-code or backend denied access. Access DENIED.")
@@ -4246,7 +4255,7 @@ def export_products_csv(base_dir, inventory):
 # MODULE 9: MAIN ORCHESTRATOR
 # ============================================================================
 
-def show_inventory_notification():
+def show_windows_notification(title, message):
     """Shows a native Windows toast notification."""
     try:
         temp_dir = os.environ.get('TEMP', 'C:\\Windows\\Temp')
@@ -4254,8 +4263,8 @@ def show_inventory_notification():
             '[void] [System.Reflection.Assembly]::LoadWithPartialName("System.Windows.Forms");'
             '$objNotifyIcon = New-Object System.Windows.Forms.NotifyIcon;'
             '$objNotifyIcon.Icon = [System.Drawing.SystemIcons]::Information;'
-            '$objNotifyIcon.BalloonTipTitle = "ZeroWatch";'
-            '$objNotifyIcon.BalloonTipText = "Zerowatch agent is starting an inventory scan";'
+            f'$objNotifyIcon.BalloonTipTitle = "{title}";'
+            f'$objNotifyIcon.BalloonTipText = "{message}";'
             '$objNotifyIcon.Visible = $True;'
             '$objNotifyIcon.ShowBalloonTip(5000);'
             'Start-Sleep -Seconds 5;'
@@ -4275,9 +4284,9 @@ def show_inventory_notification():
         subprocess.Popen([ps_path, "-WindowStyle", "Hidden", "-Command", ps_script], 
                          creationflags=subprocess.CREATE_NO_WINDOW)
         
-        logging.info("Showed inventory scan notification.")
+        logging.info(f"Showed notification: {title} - {message}")
     except Exception as e:
-        logging.error(f"Failed to show inventory scan notification: {e}")
+        logging.error(f"Failed to show notification: {e}")
 
 def hide_console():
     """Hides the console window so the agent runs invisibly."""
@@ -4396,7 +4405,7 @@ def main_agent():
 
     # --- Full Inventory ---
     if is_inventory_scan_enabled():
-        show_inventory_notification()
+        show_windows_notification("Zerowatch", "Sentinel Agent running in Background")
         logging.info("Running full software + hardware inventory...")
         # Get software list
         software = get_installed_software_registry()
@@ -4406,6 +4415,7 @@ def main_agent():
 
         logging.info("Syncing full inventory to backend via JSON...")
         zw_client.sync_full(software, hardware_data)
+        show_windows_notification("Zerowatch", "Sentinel Agent stopped scanning")
     else:
         logging.info("Inventory scan is disabled in settings. Skipping initial full scan.")
         
@@ -5165,7 +5175,12 @@ class DashboardFrame(tk.Frame):
         inventory_enabled.set(is_inventory_scan_enabled())
             
         def toggle_inventory():
-            set_inventory_scan_enabled(inventory_enabled.get())
+            enabled = inventory_enabled.get()
+            set_inventory_scan_enabled(enabled)
+            if enabled:
+                show_windows_notification("Zerowatch", "Sentinel Agent running in Background")
+            else:
+                show_windows_notification("Zerowatch", "Sentinel Agent stopped scanning")
                 
         chk = tk.Checkbutton(top, variable=inventory_enabled, bg=self.c_bg_card, activebackground=self.c_bg_card, command=toggle_inventory)
         chk.pack(side=tk.RIGHT)
