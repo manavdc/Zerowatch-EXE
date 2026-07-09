@@ -1377,6 +1377,8 @@ class ZeroWatchClient:
                  "/grant:r", "SYSTEM:(F)",
                  "/grant:r", "Administrators:(F)"],
                 capture_output=True, text=True, timeout=5,
+                startupinfo=_windows_hidden_startupinfo(),
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
         except Exception:
             pass
@@ -3110,7 +3112,7 @@ def _enable_ansi():
 
 
 def _cls():
-    os.system("cls" if os.name == "nt" else "clear")
+    print("\033[H\033[J", end="")
 
 
 def _print_banner():
