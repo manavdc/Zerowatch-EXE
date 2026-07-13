@@ -85,7 +85,7 @@ echo.
 if not defined SERVER_PRESET (
     echo Select target server for this EXE:
     echo   [1] Production  - https://zerowatch.deepcytes.io
-    echo   [2] Demo/Test   - https://dccveengine-vm.eastus.cloudapp.azure.com
+    echo   [2] Demo/Test   - https://zerowatch-testing.eastasia.cloudapp.azure.com
     echo   [3] Development - http://localhost:3001
     echo.
     choice /c 123 /n /m "Enter choice (1/2/3): "
@@ -106,7 +106,7 @@ if not defined SERVER_PRESET (
 echo [DEBUG] SERVER_PRESET resolved to: %SERVER_PRESET%
 
 if /I "%SERVER_PRESET%"=="prod" set "RAW_SERVER_URL=https://zerowatch.deepcytes.io"
-if /I "%SERVER_PRESET%"=="demo" set "RAW_SERVER_URL=https://dccveengine-vm.eastus.cloudapp.azure.com"
+if /I "%SERVER_PRESET%"=="demo" set "RAW_SERVER_URL=https://zerowatch-testing.eastasia.cloudapp.azure.com"
 if /I "%SERVER_PRESET%"=="dev" set "RAW_SERVER_URL=http://localhost:3001"
 if /I "%SERVER_PRESET%"=="custom" set "RAW_SERVER_URL=%CUSTOM_SERVER_URL%"
 
