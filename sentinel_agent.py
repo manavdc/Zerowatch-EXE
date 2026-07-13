@@ -1209,6 +1209,35 @@ class ZeroWatchClient:
             logging.warning(f"Join request failed: {e}")
             return {"success": False, "message": "Network error"}
 
+    def request_individual_join(self, individual_code):
+        """Submit an individual registration request for the given code."""
+        if not individual_code:
+            return {"success": False, "message": "Registration code required"}
+
+        try:
+            payload = {
+                "individualCode": individual_code,
+                "device_id": self.device_id,
+                "hostname": self.hostname,
+                "username": self.operator_username,
+                "asset_name": self.asset_name,
+                "os_info": f"Windows ({AGENT_VERSION})",
+                "fingerprint_json": self.fingerprint_data,
+            }
+            
+            resp = requests.post(
+                f"{AGENT_API_URL}/individual-enroll",
+                json=payload,
+                timeout=10,
+            )
+            data = resp.json() if resp.content else {"success": False}
+            if data.get("success") and data.get("jwt"):
+                self._save_jwt(data.get("jwt"))
+            return data
+        except Exception as e:
+            logging.warning(f"Individual registration failed: {e}")
+            return {"success": False, "message": "Network error"}
+
     def poll_join_status(self, timeout=600, interval=8):
         """Poll join status until approved, denied, or timed out."""
         start = time.time()
@@ -4593,6 +4622,10 @@ class EnrollmentFrame(tk.Frame):
         else:
             self.state = "TEAM_CODE" # TEAM_CODE -> METADATA -> PENDING
             
+        self.team_code = ""
+        self.individual_code = ""
+        self.is_individual = False
+            
         self._polling_active = False
         self._stop_event = threading.Event()
         self.setup_ui()
@@ -4620,6 +4653,7 @@ class EnrollmentFrame(tk.Frame):
         # Create screens as frames inside self.card
         self.screens = {}
         self.screens["TEAM_CODE"] = self._create_team_code_screen()
+        self.screens["INDIVIDUAL_CODE"] = self._create_individual_code_screen()
         self.screens["METADATA"] = self._create_metadata_screen()
         self.screens["PENDING"] = self._create_pending_screen()
         
@@ -4736,6 +4770,11 @@ class EnrollmentFrame(tk.Frame):
         btn_label = tk.Label(btn_frame, text="◎ NEXT", fg="black", bg=self.c_cyan, font=self.f_btn)
         btn_label.pack()
 
+        link_label = tk.Label(frame, text="Don't have a team? Register your asset here.", fg=self.c_cyan, bg=self.c_card_bg, font=("Arial", 10, "underline"), cursor="hand2")
+        link_label.pack(pady=(15, 0))
+        def go_to_individual(e): self.show_screen("INDIVIDUAL_CODE")
+        link_label.bind("<Button-1>", go_to_individual)
+
         self.status_label_team = tk.Label(frame, text="", fg=self.c_gray, bg=self.c_card_bg, font=("Arial", 10))
         self.status_label_team.pack(pady=(16, 0))
         
@@ -4812,6 +4851,86 @@ class EnrollmentFrame(tk.Frame):
         self.team_code = code
         self.show_screen("METADATA")
 
+    def _create_individual_code_screen(self):
+        frame = tk.Frame(self.card, bg=self.c_card_bg)
+        
+        # Header
+        header_frame = tk.Frame(frame, bg=self.c_card_bg)
+        header_frame.pack(fill=tk.X, pady=(0, 20))
+        
+        canvas_line = tk.Canvas(header_frame, height=20, width=550, bg=self.c_card_bg, highlightthickness=0)
+        canvas_line.pack()
+        canvas_line.create_line(50, 10, 180, 10, fill=self.c_card_border)
+        canvas_line.create_text(275, 10, text="[ INDIVIDUAL ENROLLMENT ]", fill=self.c_white, font=self.f_card_header)
+        canvas_line.create_line(390, 10, 500, 10, fill=self.c_card_border)
+        
+        tk.Label(frame, text="WELCOME TO ZEROWATCH SENTINEL AGENT", fg=self.c_white, bg=self.c_card_bg, font=self.f_card_title).pack()
+        tk.Label(frame, text="Premium Individual Registration", fg=self.c_white, bg=self.c_card_bg, font=self.f_card_sub).pack(pady=(5, 40))
+        
+        tk.Label(frame, text="ENTER REGISTRATION CODE", fg=self.c_cyan, bg=self.c_card_bg, font=self.f_badge).pack(pady=(0, 18))
+        
+        input_frame = tk.Frame(frame, bg=self.c_card_bg)
+        input_frame.pack(pady=(0, 40))
+        
+        self.indiv_entries = []
+        for i in range(6):
+            f = tk.Frame(input_frame, bg=self.c_input_bg, highlightbackground=self.c_cyan, highlightthickness=1, width=55, height=65)
+            f.pack(side=tk.LEFT, padx=(0, 10))
+            f.pack_propagate(False)
+            entry = tk.Entry(f, fg=self.c_cyan, bg=self.c_input_bg, font=self.f_input, justify='center', bd=0, highlightthickness=0, insertbackground=self.c_cyan)
+            entry.pack(expand=True, fill=tk.BOTH, pady=12)
+            self.indiv_entries.append(entry)
+            
+            def key_release(event, idx=i):
+                if event.keysym in ("BackSpace", "Left", "Right", "Tab"): return
+                content = self.indiv_entries[idx].get()
+                if len(content) > 0:
+                    if len(content) > 1:
+                        self.indiv_entries[idx].delete(0, tk.END)
+                        self.indiv_entries[idx].insert(0, content[-1])
+                    if idx < 5: self.indiv_entries[idx+1].focus_set()
+
+            def key_press(event, idx=i):
+                if event.keysym == "BackSpace":
+                    if len(self.indiv_entries[idx].get()) == 0 and idx > 0:
+                        self.indiv_entries[idx-1].focus_set()
+                        self.indiv_entries[idx-1].delete(0, tk.END)
+                        
+            entry.bind("<KeyRelease>", key_release)
+            entry.bind("<KeyPress>", key_press)
+
+        self.indiv_entries[0].focus_set()
+        
+        btn_frame = tk.Frame(frame, bg=self.c_cyan, pady=15, cursor="hand2")
+        btn_frame.pack(fill=tk.X)
+        btn_label = tk.Label(btn_frame, text="◎ NEXT", fg="black", bg=self.c_cyan, font=self.f_btn)
+        btn_label.pack()
+
+        link_label = tk.Label(frame, text="Back to Team Registration", fg=self.c_cyan, bg=self.c_card_bg, font=("Arial", 10, "underline"), cursor="hand2")
+        link_label.pack(pady=(15, 0))
+        def go_to_team(e): self.show_screen("TEAM_CODE")
+        link_label.bind("<Button-1>", go_to_team)
+
+        self.status_label_indiv = tk.Label(frame, text="", fg=self.c_gray, bg=self.c_card_bg, font=("Arial", 10))
+        self.status_label_indiv.pack(pady=(16, 0))
+        
+        def on_click(e): self._validate_individual_code()
+        btn_frame.bind("<Button-1>", on_click)
+        btn_label.bind("<Button-1>", on_click)
+        
+        return frame
+
+    def _validate_individual_code(self):
+        code = "".join(e.get().strip() for e in self.indiv_entries)
+        if len(code) != 6:
+            self.status_label_indiv.config(text="Please enter a 6-digit code", fg="#f87171")
+            return
+        
+        self.individual_code = code
+        self.is_individual = True
+        self.show_screen("METADATA")
+
+
     def _submit_enrollment(self):
         if getattr(self, "_submitting", False):
             return
@@ -4833,6 +4952,16 @@ class EnrollmentFrame(tk.Frame):
 
     def _run_join(self):
         try:
+            if getattr(self, "is_individual", False):
+                res = self.zw_client.request_individual_join(self.individual_code)
+                if res.get("success") and res.get("jwt"):
+                    self.after(0, self._on_success)
+                else:
+                    msg = res.get("message", "Registration failed")
+                    self.after(0, lambda: self.status_label_meta.config(text=msg, fg="#f87171"))
+                self._submitting = False
+                return
+
             res = self.zw_client.request_join(self.team_code)
             if res.get("success"):
                 if res.get("status") == "approved":
