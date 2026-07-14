@@ -20,7 +20,18 @@ import re
 import socket
 import socketio
 from urllib.parse import urlparse
-import requests
+import cert_pinning
+from cert_pinning import (
+    PinError,
+    SPKIPinningAdapter,
+    build_pinning_adapter,
+    is_loopback,
+    is_pin_failure,
+    PinnedSession,
+    is_valid_sha256_base64
+)
+
+
 
 # === CRASH DIAGNOSTICS ===
 import traceback
@@ -373,6 +384,74 @@ def _resolve_base_api_url():
 
 
 BASE_API_URL = _resolve_base_api_url()
+
+# Hardcoded SPKI Pins (SHA-256 hashes of the SubjectPublicKeyInfo in base64)
+# For production and demo environments, these should be updated to actual hashes.
+SPKI_PINS = {
+    "zerowatch.deepcytes.io": [
+        "PLACEHOLDER_PROD_PRIMARY_SPKI_HASH",
+        "PLACEHOLDER_PROD_BACKUP_SPKI_HASH"
+    ],
+    "https://zerowatch-testing.eastasia.cloudapp.azure.com": [
+        "PLACEHOLDER_DEMO_PRIMARY_SPKI_HASH",
+        "PLACEHOLDER_DEMO_BACKUP_SPKI_HASH"
+    ]
+}
+
+def _load_pins_for_url(base_url: str) -> list[str]:
+    """Resolves and returns the list of allowed SPKI pin hashes for the target URL.
+    Checks hardcoded pins, followed by agent_config.json overrides, and loopback bypasses.
+    """
+    if is_loopback(base_url):
+        logging.info(f"Certificate pinning bypassed for loopback address: {base_url}")
+        return []
+
+    try:
+        parsed = urlparse(base_url)
+        hostname = parsed.hostname
+    except Exception as e:
+        logging.error(f"Failed to parse base URL for pinning: {e}")
+        hostname = None
+
+    if not hostname:
+        return []
+
+    # Check if dev mode is enabled via command-line arguments, environment variable, or if target is localhost
+    is_dev_mode = ("--dev" in sys.argv or os.environ.get("ZEROWATCH_DEV_MODE") == "1" or is_loopback(base_url))
+
+    # 1. Load custom pins from agent_config.json
+    custom_pins = []
+    try:
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "agent_config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            raw_custom = cfg.get("custom_pins")
+            if isinstance(raw_custom, list):
+                custom_pins = [str(p) for p in raw_custom if is_valid_sha256_base64(str(p))]
+    except Exception as e:
+        logging.debug(f"Failed to load custom pins from agent_config.json: {e}")
+
+    # 2. Enforce hardcoded pins for official domains unless explicitly overridden in dev mode
+    if hostname in SPKI_PINS:
+        if is_dev_mode and custom_pins:
+            logging.warning(f"Development mode active. Overriding hardcoded pins for {hostname} with custom configuration pins.")
+            return custom_pins
+        return SPKI_PINS[hostname]
+
+    # 3. For custom staging/on-premise domains, return the configured custom pins
+    if custom_pins:
+        logging.info(f"Loaded {len(custom_pins)} valid custom pins from agent_config.json for host {hostname}")
+        return custom_pins
+
+    # 4. If HTTPS but no pins are defined, raise a fatal error to prevent unpinned connection.
+    if base_url.lower().startswith("https://"):
+        msg = f"Fatal: No certificate pins defined for secure host: {hostname}. Connection blocked."
+        logging.critical(msg)
+        raise RuntimeError(msg)
+
+    return []
+
 AGENT_API_URL = f"{BASE_API_URL}/agent"
 AUTH_API_URL = f"{BASE_API_URL}/auth"
 USER_API_URL = f"{BASE_API_URL}/user"
@@ -581,8 +660,19 @@ class ZeroWatchClient:
         self.team_info = self._load_team_info_from_state()
         _purge_legacy_build_artifacts(self.base_dir)
 
+        self.session = PinnedSession()
+        pins = _load_pins_for_url(BASE_API_URL)
+        if pins:
+            self.session.mount("https://", build_pinning_adapter(pins))
+
         # Real-time WebSocket support
-        self.sio = socketio.Client(reconnection=True, reconnection_attempts=0, logger=False, engineio_logger=False)
+        self.sio = socketio.Client(
+            reconnection=True,
+            reconnection_attempts=0,
+            logger=False,
+            engineio_logger=False,
+            http_session=self.session
+        )
         self.notification_queue = []
         self._last_approval_sync_at = 0.0
         self._approval_sync_in_flight = False
@@ -636,7 +726,7 @@ class ZeroWatchClient:
             try:
                 base_url = resolve_api_base_url()
                 # socketio expects the base URL (e.g. http://localhost:5000)
-                self.sio.connect(base_url, wait_timeout=10)
+                self.sio.connect(base_url, wait_timeout=10, transports=['polling'])
             except Exception as e:
                 logging.debug(f"[WS] Connection failed: {e}")
 
@@ -657,7 +747,7 @@ class ZeroWatchClient:
         try:
             url = f"{resolve_api_base_url()}/api/agent/notifications"
             headers = {"Authorization": f"Bearer {self.jwt}"}
-            resp = requests.get(url, headers=headers, timeout=5)
+            resp = self.session.get(url, headers=headers, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("success") and data.get("notifications"):
@@ -677,7 +767,7 @@ class ZeroWatchClient:
         try:
             url = f"{resolve_api_base_url()}/api/agent/notifications/ack"
             headers = {"Authorization": f"Bearer {self.jwt}"}
-            requests.post(url, headers=headers, json={"notificationId": notif_id}, timeout=5)
+            self.session.post(url, headers=headers, json={"notificationId": notif_id}, timeout=5)
         except Exception:
             pass
 
@@ -869,7 +959,7 @@ class ZeroWatchClient:
     def refresh_join_status_once(self):
         """Refreshes join status from backend using deviceId and updates local secure join-state file."""
         try:
-            resp = requests.get(
+            resp = self.session.get(
                 f"{AGENT_API_URL}/join-status",
                 params={"deviceId": self.device_id},
                 timeout=10,
@@ -1176,7 +1266,7 @@ class ZeroWatchClient:
                 team_code=team_code,
             )
             
-            resp = requests.post(
+            resp = self.session.post(
                 f"{AGENT_API_URL}/join-request",
                 json=payload,
                 timeout=10,
@@ -1225,7 +1315,7 @@ class ZeroWatchClient:
                 "fingerprint_json": self.fingerprint_data,
             }
             
-            resp = requests.post(
+            resp = self.session.post(
                 f"{AGENT_API_URL}/individual-enroll",
                 json=payload,
                 timeout=10,
@@ -1325,11 +1415,11 @@ class ZeroWatchClient:
         payload = item.get("payload")
 
         if method == "POST":
-            resp = requests.post(url, headers=self._auth_headers(), json=payload, timeout=15)
+            resp = self.session.post(url, headers=self._auth_headers(), json=payload, timeout=15)
         elif method == "GET":
-            resp = requests.get(url, headers=self._auth_headers(), timeout=10)
+            resp = self.session.get(url, headers=self._auth_headers(), timeout=10)
         elif method == "DELETE":
-            resp = requests.delete(url, headers=self._auth_headers(), timeout=10)
+            resp = self.session.delete(url, headers=self._auth_headers(), timeout=10)
         else:
             return False, None, f"unsupported method {method}"
 
@@ -1440,7 +1530,7 @@ class ZeroWatchClient:
             } for item in software_list]
 
             payload["inventory"] = formatted_software
-            resp = requests.post(f"{AGENT_API_URL}/sync/full", headers=self._auth_headers(), json=payload, timeout=30)
+            resp = self.session.post(f"{AGENT_API_URL}/sync/full", headers=self._auth_headers(), json=payload, timeout=30)
             self.last_server_status = resp.status_code
             data = self._parse_server_payload(resp)
             if self._handle_unlinked_response(resp, data):
@@ -1477,7 +1567,7 @@ class ZeroWatchClient:
             if hardware_snapshot and isinstance(hardware_snapshot, dict):
                 payload["hardware_snapshot"] = hardware_snapshot
 
-            resp = requests.post(f"{AGENT_API_URL}/sync/delta", headers=self._auth_headers(), json=payload, timeout=20)
+            resp = self.session.post(f"{AGENT_API_URL}/sync/delta", headers=self._auth_headers(), json=payload, timeout=20)
             self.last_server_status = resp.status_code
             data = self._parse_server_payload(resp)
             if self._handle_unlinked_response(resp, data):
@@ -1535,7 +1625,7 @@ class ZeroWatchClient:
         if not self.jwt:
             return False, "Device is not linked"
         try:
-            resp = requests.delete(f"{AGENT_API_URL}/unlink-self", headers=self._auth_headers(), timeout=10)
+            resp = self.session.delete(f"{AGENT_API_URL}/unlink-self", headers=self._auth_headers(), timeout=10)
             self.last_server_status = resp.status_code
             data = resp.json() if resp.content else {}
             if resp.ok and data.get("success"):
@@ -1560,7 +1650,7 @@ class ZeroWatchClient:
                 "username": self.operator_username,
                 "asset_name": self.asset_name,
             }
-            resp = requests.post(f"{AGENT_API_URL}/heartbeat", headers=self._auth_headers(), json=payload, timeout=5)
+            resp = self.session.post(f"{AGENT_API_URL}/heartbeat", headers=self._auth_headers(), json=payload, timeout=5)
             self.last_server_status = resp.status_code
             
             # 5xx = Server is down/restarting. Treat as "Offline" (None)
@@ -1591,7 +1681,7 @@ class ZeroWatchClient:
             return True
         try:
             logging.info("[LICENSE] Recheck sent (expired mode) via /license-status.")
-            resp = requests.get(
+            resp = self.session.get(
                 f"{AGENT_API_URL}/license-status",
                 headers=self._auth_headers(),
                 timeout=8,
@@ -1626,7 +1716,7 @@ class ZeroWatchClient:
             "details": details,
         }
         try:
-            resp = requests.post(f"{AGENT_API_URL}/log", headers=self._auth_headers(), json=payload, timeout=5)
+            resp = self.session.post(f"{AGENT_API_URL}/log", headers=self._auth_headers(), json=payload, timeout=5)
             self.last_server_status = resp.status_code
             data = self._parse_server_payload(resp)
             if self._handle_unlinked_response(resp, data):
@@ -1658,7 +1748,7 @@ class ZeroWatchClient:
             return password == KILL_PASSWORD
         try:
             payload = {"device_id": self.device_id, "password": password}
-            resp = requests.post(f"{AGENT_API_URL}/verify-kill", headers=self._auth_headers(), json=payload, timeout=10)
+            resp = self.session.post(f"{AGENT_API_URL}/verify-kill", headers=self._auth_headers(), json=payload, timeout=10)
             if resp.ok and resp.json().get("success"):
                 return True
             # Backend explicitly denied — also try local fallback password
@@ -1670,7 +1760,7 @@ class ZeroWatchClient:
     def get_dashboard_stats(self):
         if not self.jwt: return None
         try:
-            resp = requests.get(f"{AGENT_API_URL}/metrics", headers=self._auth_headers(), timeout=10)
+            resp = self.session.get(f"{AGENT_API_URL}/metrics", headers=self._auth_headers(), timeout=10)
             data = self._parse_json_payload(resp)
             if self._handle_unlinked_response(resp, data):
                 return "unlinked"
@@ -1690,7 +1780,7 @@ class ZeroWatchClient:
                 return data
             return None
         try:
-            resp = requests.get(f"{AGENT_API_URL}/info", headers=self._auth_headers(), timeout=10)
+            resp = self.session.get(f"{AGENT_API_URL}/info", headers=self._auth_headers(), timeout=10)
             data = self._parse_json_payload(resp)
             if self._handle_unlinked_response(resp, data):
                 return "unlinked"
@@ -1771,7 +1861,7 @@ class ZeroWatchClient:
         if not self.jwt: return None
         try:
             # We use the /metrics endpoint which returns the full stats object
-            resp = requests.get(f"{AGENT_API_URL}/metrics", headers=self._auth_headers(), timeout=10)
+            resp = self.session.get(f"{AGENT_API_URL}/metrics", headers=self._auth_headers(), timeout=10)
             data = self._parse_json_payload(resp)
             if self._handle_unlinked_response(resp, data):
                 return None
@@ -4465,6 +4555,10 @@ def main_agent():
     last_watchdog_check = 0
     last_asset_poll = 0
     was_offline = False
+
+    pin_mismatch_backoff_idx = 0
+    pin_mismatch_next_retry = 0.0
+
     while True:
         try:
             shutdown_request = consume_shutdown_signal(base_dir)
@@ -4477,8 +4571,24 @@ def main_agent():
                 unregister_windows_service()
                 break
 
+            now = time.time()
+            if cert_pinning.PIN_MISMATCH_DETECTED:
+                if now < pin_mismatch_next_retry:
+                    time.sleep(10)
+                    continue
+                else:
+                    logging.info("[PINNING] Retrying connection after pin mismatch backoff...")
+                    cert_pinning.PIN_MISMATCH_DETECTED = False
+
             time.sleep(30)  # Base loop interval
             now = time.time()
+
+            if cert_pinning.PIN_MISMATCH_DETECTED:
+                backoff_time = [30, 120, 300, 900, 3600][min(pin_mismatch_backoff_idx, 4)]
+                logging.warning(f"[PINNING] Pin mismatch active. Backing off for {backoff_time} seconds...")
+                pin_mismatch_next_retry = now + backoff_time
+                pin_mismatch_backoff_idx += 1
+                continue
 
             # --- Connectivity-aware offline queue flush ---
             network_ok = check_backend_connectivity()
@@ -4545,6 +4655,7 @@ def main_agent():
                     zw_client.log_event("LICENSE_RENEWED", {"status": "active"})
                 elif result is True:
                     logging.info("[HEARTBEAT] Success (status=%s).", zw_client.last_server_status)
+                    pin_mismatch_backoff_idx = 0
                     if was_offline:
                         was_offline = False
                         logging.info("[ONLINE] Reconnected to backend.")

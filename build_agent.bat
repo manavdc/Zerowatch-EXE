@@ -85,7 +85,7 @@ echo.
 if not defined SERVER_PRESET (
     echo Select target server for this EXE:
     echo   [1] Production  - https://zerowatch.deepcytes.io
-    echo   [2] Demo/Test   - https://dccveengine-vm.eastus.cloudapp.azure.com
+    echo   [2] Demo/Test   - https://zerowatch-testing.eastasia.cloudapp.azure.com
     echo   [3] Development - http://localhost:3001
     echo.
     choice /c 123 /n /m "Enter choice (1/2/3): "
@@ -106,7 +106,7 @@ if not defined SERVER_PRESET (
 echo [DEBUG] SERVER_PRESET resolved to: %SERVER_PRESET%
 
 if /I "%SERVER_PRESET%"=="prod" set "RAW_SERVER_URL=https://zerowatch.deepcytes.io"
-if /I "%SERVER_PRESET%"=="demo" set "RAW_SERVER_URL=https://dccveengine-vm.eastus.cloudapp.azure.com"
+if /I "%SERVER_PRESET%"=="demo" set "RAW_SERVER_URL=https://zerowatch-testing.eastasia.cloudapp.azure.com"
 if /I "%SERVER_PRESET%"=="dev" set "RAW_SERVER_URL=http://localhost:3001"
 if /I "%SERVER_PRESET%"=="custom" set "RAW_SERVER_URL=%CUSTOM_SERVER_URL%"
 
@@ -135,6 +135,16 @@ set "BUILD_CFG=agent_build_config.py"
 >> "%BUILD_CFG%" echo FORCED_BASE_API_URL = "%BASE_API_URL%"
 if errorlevel 1 (
     set "LAST_ERROR_MSG=Failed to write %BUILD_CFG%."
+    goto build_failed
+)
+echo.
+
+echo [2.5/5] Validating certificate pinning configuration...
+py -3.11 verify_pins.py %SERVER_PRESET%
+if errorlevel 1 (
+    echo [ERROR] Pin validation failed! Check error messages above.
+    set "LAST_ERROR_MSG=Pin validation check failed."
+    del /q "%BUILD_CFG%" >nul 2>nul
     goto build_failed
 )
 echo.
