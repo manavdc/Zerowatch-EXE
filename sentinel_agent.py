@@ -392,9 +392,9 @@ SPKI_PINS = {
         "PLACEHOLDER_PROD_PRIMARY_SPKI_HASH",
         "PLACEHOLDER_PROD_BACKUP_SPKI_HASH"
     ],
-    "https://zerowatch-testing.eastasia.cloudapp.azure.com": [
-        "PLACEHOLDER_DEMO_PRIMARY_SPKI_HASH",
-        "PLACEHOLDER_DEMO_BACKUP_SPKI_HASH"
+    "zerowatch-testing.eastasia.cloudapp.azure.com": [
+        "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",
+        "EzSBE12fT2ZrphmumaBjrpdpXv9G71RhZQHMvuwszI4="
     ]
 }
 

@@ -187,6 +187,8 @@ call :run_compile
 set "BUILD_EXIT=%ERRORLEVEL%"
 if not "%BUILD_EXIT%"=="0" (
     echo [WARN] Zig build failed with exit code %BUILD_EXIT%. Retrying without --zig...
+    if exist "build\sentinel_agent.build" rd /s /q "build\sentinel_agent.build"
+    if exist "build\sentinel_agent.onefile-build" rd /s /q "build\sentinel_agent.onefile-build"
     set "BASE_FLAGS=--assume-yes-for-downloads --windows-console-mode=disable --output-dir=build --output-filename=%OUTPUT_NAME% %ICON_FLAG% --include-data-file=%ICON_PATH%=favicon.ico"
     call :run_compile
     set "BUILD_EXIT=%ERRORLEVEL%"

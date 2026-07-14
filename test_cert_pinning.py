@@ -75,7 +75,7 @@ class TestCertPinning(unittest.TestCase):
 
     def test_load_pins_demo(self):
         pins = sentinel_agent._load_pins_for_url("https://zerowatch-testing.eastasia.cloudapp.azure.com/api")
-        self.assertIn("PLACEHOLDER_DEMO_PRIMARY_SPKI_HASH", pins)
+        self.assertIn("SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=", pins)
 
     def test_load_pins_localhost_empty(self):
         pins = sentinel_agent._load_pins_for_url("http://localhost:3001/api")
@@ -200,6 +200,14 @@ class TestCertPinning(unittest.TestCase):
              patch("sys.argv", ["sentinel_agent.py", "--dev"]):
             pins = sentinel_agent._load_pins_for_url("https://zerowatch.deepcytes.io/api")
             self.assertEqual(pins, ["dK85yRZtQWIab16/niIHoJelcw85aRSZHmkiMhgN3WY="])
+
+    def test_pinned_ssl_context_instantiation(self):
+        import ssl
+        try:
+            ctx = cert_pinning.PinnedSSLContext(ssl.PROTOCOL_TLS_CLIENT, ["dK85yRZtQWIab16/niIHoJelcw85aRSZHmkiMhgN3WY="])
+            self.assertEqual(ctx.pins, ["dK85yRZtQWIab16/niIHoJelcw85aRSZHmkiMhgN3WY="])
+        except TypeError as e:
+            self.fail(f"PinnedSSLContext instantiation failed: {e}")
 
 if __name__ == "__main__":
     unittest.main()

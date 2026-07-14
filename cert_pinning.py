@@ -108,7 +108,8 @@ class PinnedSSLContext(ssl.SSLContext):
     - This mechanism must be thoroughly regression-tested during any future Python runtime version upgrades.
     """
     def __init__(self, protocol, pins, hostname_target=None):
-        super().__init__(protocol)
+        # We do not call super().__init__(protocol) because ssl.SSLContext.__init__ resolves
+        # to object.__init__, which does not accept any arguments.
         self.pins = pins
         self.hostname_target = hostname_target
 

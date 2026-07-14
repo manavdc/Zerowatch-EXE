@@ -18,7 +18,7 @@ def check_pins(preset):
     # Critical hosts to validate per build preset
     preset_hosts = {
         "prod": ["zerowatch.deepcytes.io"],
-        "demo": ["https://zerowatch-testing.eastasia.cloudapp.azure.com"]
+        "demo": ["zerowatch-testing.eastasia.cloudapp.azure.com"]
     }
     
     critical_hosts = preset_hosts.get(preset.lower(), [])
