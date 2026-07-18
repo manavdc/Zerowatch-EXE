@@ -4187,60 +4187,8 @@ def watchdog_process(target_exe_path):
                     logging.info("[WATCHDOG] Shutdown signal detected; exiting watchdog.")
                     sys.exit(0)
 
-                logging.info("[WATCHDOG] Main agent killed! Attempting to spawn password prompt...")
-
-                # --- ANTI-FORK-BOMB: only ONE password prompt at a time ---
-                prompt_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, PROMPT_MUTEX_NAME)
-                prompt_err = ctypes.windll.kernel32.GetLastError()
-                if prompt_err == 183:  # Another prompt already running
-                    logging.info("[WATCHDOG] Another password prompt is already running. Waiting...")
-                    if prompt_mutex:
-                        ctypes.windll.kernel32.CloseHandle(prompt_mutex)
-                    time.sleep(10)
-                    continue
-
-                # Spawn a VISIBLE password prompt as a completely separate process
-                if target_exe_path.endswith('.py'):
-                    prompt_args = [sys.executable, target_exe_path, "--password-prompt"]
-                else:
-                    prompt_args = [target_exe_path, "--password-prompt"]
-                    
-                try:
-                    exit_code = subprocess.call(
-                        prompt_args,
-                        creationflags=subprocess.CREATE_NEW_CONSOLE,
-                    )
-                except Exception as e:
-                    logging.error(f"[WATCHDOG] Failed to spawn password prompt: {e}")
-                    exit_code = 1  # If prompt itself crashed, treat as denied
-                finally:
-                    # Release the prompt mutex
-                    if prompt_mutex:
-                        ctypes.windll.kernel32.CloseHandle(prompt_mutex)
-
-                if exit_code == 0:
-                    # Correct password — authorized shutdown
-                    logging.info("[WATCHDOG] Authorized shutdown. Exiting watchdog.")
-                    sys.exit(0)
-                else:
-                    # Wrong password or window closed — REVIVE the agent!
-                    logging.info("[WATCHDOG] Unauthorized kill. Reviving main agent (no-watchdog mode)...")
-                    # Use --no-watchdog to prevent the revived agent from spawning ANOTHER watchdog
-                    # (this watchdog is still alive and monitoring)
-                    if target_exe_path.endswith('.py'):
-                        subprocess.Popen(
-                            [sys.executable, target_exe_path, "--no-watchdog"],
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                            startupinfo=_windows_hidden_startupinfo(),
-                        )
-                    else:
-                        subprocess.Popen(
-                            [target_exe_path, "--no-watchdog"],
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                            startupinfo=_windows_hidden_startupinfo(),
-                        )
-                    # 30-second cooldown to prevent rapid fork cycling
-                    time.sleep(30)
+                logging.info("[WATCHDOG] Main agent killed! Exiting watchdog (termination protection disabled).")
+                sys.exit(0)
 
             time.sleep(5)  # Reduced polling frequency (was 3s)
         except Exception as e:
@@ -4619,6 +4567,7 @@ def main_agent():
             time.sleep(10)
 
     logging.info("SentinelAgent shutdown completed.")
+
 class EnrollmentFrame(tk.Frame):
     def __init__(self, master, zw_client):
         super().__init__(master)
@@ -4685,56 +4634,8 @@ class EnrollmentFrame(tk.Frame):
         self.screens["INDIVIDUAL_CODE"] = self._create_individual_code_screen()
         self.screens["METADATA"] = self._create_metadata_screen()
         self.screens["PENDING"] = self._create_pending_screen()
-        
-        settings_btn = tk.Button(main_content, text="⚙ Settings", bg=self.c_bg_main, fg=self.c_cyan, font=self.f_btn, bd=0, activebackground=self.c_bg_main, activeforeground=self.c_cyan_hover, cursor="hand2", command=self.show_settings_popup)
-        settings_btn.place(relx=0.98, rely=0.02, anchor=tk.NE)
             
         self.show_screen(self.state)
-
-    def show_settings_popup(self):
-        try:
-            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except Exception:
-            is_admin = False
-            
-        if not is_admin:
-            import tkinter.messagebox as mb
-            mb.showerror("Access Denied", "This feature can only be accessed with administrator access.")
-            return
-
-        popup = tk.Toplevel(self)
-        popup.title("SETTINGS")
-        popup.geometry("600x400")
-        popup.configure(bg=self.c_bg_main)
-        popup.resizable(False, False)
-        
-        header = tk.Frame(popup, bg=self.c_bg_main)
-        header.pack(fill=tk.X, pady=(20, 20), padx=20)
-        tk.Label(header, text="SETTINGS", fg=self.c_white, bg=self.c_bg_main, font=("Arial", 18, "bold")).pack(side=tk.LEFT)
-        
-        desc = tk.Label(popup, text="Configure agent system settings. Changes require administrator privileges.", fg=self.c_gray, bg=self.c_bg_main, font=self.f_normal, justify=tk.LEFT)
-        desc.pack(anchor="w", pady=(0, 20), padx=20)
-        
-        container = tk.Frame(popup, bg=self.c_bg_main)
-        container.pack(fill=tk.BOTH, expand=True, padx=20)
-        
-        card = tk.Frame(container, bg=self.c_card_bg, highlightbackground=self.c_card_border, highlightthickness=1, padx=20, pady=15)
-        card.pack(fill=tk.X, pady=5)
-        
-        top = tk.Frame(card, bg=self.c_card_bg)
-        top.pack(fill=tk.X)
-        tk.Label(top, text="Inventory Scan", fg=self.c_cyan, bg=self.c_card_bg, font=("Arial", 11, "bold")).pack(side=tk.LEFT)
-        
-        inventory_enabled = tk.BooleanVar()
-        inventory_enabled.set(is_inventory_scan_enabled())
-            
-        def toggle_inventory():
-            set_inventory_scan_enabled(inventory_enabled.get())
-                
-        chk = tk.Checkbutton(top, variable=inventory_enabled, bg=self.c_card_bg, activebackground=self.c_card_bg, command=toggle_inventory)
-        chk.pack(side=tk.RIGHT)
-        
-        tk.Label(card, text="Automatically scan and collect hardware and software inventory.", fg=self.c_gray, bg=self.c_card_bg, font=("Arial", 9), justify=tk.LEFT).pack(anchor="w", pady=(10,0))
 
     def show_screen(self, state):
         self.state = state
@@ -6092,9 +5993,9 @@ def _daemon_args():
         args.append("--hardened")
     return args
 
-def prompt_consent(base_dir):
+def prompt_consent(base_dir, force_show=False):
     consent_file = os.path.join(_secure_state_dir(base_dir), "consent_accepted.dat")
-    if os.path.exists(consent_file):
+    if not force_show and os.path.exists(consent_file):
         return True
 
     root = tk.Tk()
@@ -6196,7 +6097,6 @@ def run_interactive():
 
     try:
         base_dir = get_base_dir()
-        prompt_consent(base_dir)
         _append_gui_log(base_dir, "GUI startup: begin")
         hostname = resolve_hostname(base_dir)
         operator_username = resolve_agent_username(base_dir, prompt=False)
@@ -6222,6 +6122,11 @@ def run_interactive():
             asset_name=asset_name,
         )
         _append_gui_log(base_dir, "GUI startup: client initialized")
+
+        if not zw_client.is_enrolled():
+            prompt_consent(base_dir, force_show=True)
+        else:
+            prompt_consent(base_dir, force_show=False)
 
         # Ensure a daemon is running so background monitoring persists.
         try:
