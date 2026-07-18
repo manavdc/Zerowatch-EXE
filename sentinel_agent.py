@@ -3029,6 +3029,35 @@ def set_inventory_scan_enabled(enabled):
         logging.error(f"Failed to set InventoryScan registry: {e}")
 
 
+def is_auto_start_enabled():
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+        val, _ = winreg.QueryValueEx(key, "ZerowatchSentinelAgent")
+        winreg.CloseKey(key)
+        return True
+    except Exception:
+        return False
+
+def set_auto_start_enabled(enabled):
+    try:
+        import winreg
+        import sys
+        import os
+        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
+        if enabled:
+            exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
+            winreg.SetValueEx(key, "ZerowatchSentinelAgent", 0, winreg.REG_SZ, f'"{exe_path}"')
+        else:
+            try:
+                winreg.DeleteValue(key, "ZerowatchSentinelAgent")
+            except FileNotFoundError:
+                pass
+        winreg.CloseKey(key)
+    except Exception as e:
+        logging.error(f"Failed to set auto start registry: {e}")
+
+
 # ============================================================================
 # MODULE 6: WATCHER — Change Detection (Safe Registry Polling)
 # ============================================================================
@@ -5426,6 +5455,63 @@ class DashboardFrame(tk.Frame):
         chk.pack(side=tk.RIGHT)
         
         tk.Label(card, text="Automatically scan and collect hardware and software inventory.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
+        
+        card2 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=20, pady=15)
+        card2.pack(fill=tk.X, pady=5)
+        
+        top2 = tk.Frame(card2, bg=self.c_bg_card)
+        top2.pack(fill=tk.X)
+        tk.Label(top2, text="Auto Start Agent", fg=self.c_cyan, bg=self.c_bg_card, font=self.f_normal_bold).pack(side=tk.LEFT)
+        
+        auto_start_enabled = tk.BooleanVar()
+        auto_start_enabled.set(is_auto_start_enabled())
+            
+        def toggle_auto_start():
+            enabled = auto_start_enabled.get()
+            set_auto_start_enabled(enabled)
+            if enabled:
+                show_windows_notification("Zerowatch", "Agent will now auto start on boot")
+            else:
+                show_windows_notification("Zerowatch", "Auto start on boot disabled")
+                
+        chk2 = tk.Checkbutton(top2, variable=auto_start_enabled, bg=self.c_bg_card, activebackground=self.c_bg_card, command=toggle_auto_start)
+        chk2.pack(side=tk.RIGHT)
+        
+        tk.Label(card2, text="Automatically start the agent when the computer boots.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
+
+        card3 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=20, pady=15)
+        card3.pack(fill=tk.X, pady=5)
+        
+        top3 = tk.Frame(card3, bg=self.c_bg_card)
+        top3.pack(fill=tk.X)
+        tk.Label(top3, text="Unlink Device", fg=self.c_red, bg=self.c_bg_card, font=self.f_normal_bold).pack(side=tk.LEFT)
+        
+        def on_unlink_click():
+            import tkinter.messagebox as messagebox
+            if messagebox.askyesno("Confirm Unlink", "Are you sure you want to unlink this device from the team? This action cannot be undone."):
+                res = self.zw_client.unlink_self()
+                # unlink_self returns a tuple (bool, str) usually or "unlinked"
+                success = False
+                msg = ""
+                if isinstance(res, tuple):
+                    success, msg = res
+                elif res == "unlinked":
+                    success = True
+                
+                if success:
+                    show_windows_notification("Zerowatch", "Device successfully unlinked.")
+                    if hasattr(self.winfo_toplevel(), 'show_enrollment'):
+                        self.winfo_toplevel().show_enrollment()
+                    else:
+                        sys.exit(0)
+                else:
+                    messagebox.showerror("Unlink Failed", f"Failed to unlink device: {msg}")
+
+        unlink_btn = tk.Button(top3, text="Unlink", bg=self.c_red, fg=self.c_white, font=self.f_normal_bold, bd=0, activebackground=self.c_bg_card, activeforeground=self.c_red, cursor="hand2", command=on_unlink_click)
+        unlink_btn.pack(side=tk.RIGHT)
+        
+        tk.Label(card3, text="Disconnect this device from the currently linked team.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
+
 
     def _build_data_info_content(self, parent_frame):
         header = tk.Frame(parent_frame, bg=self.c_bg_base)
