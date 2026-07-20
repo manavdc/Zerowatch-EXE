@@ -151,6 +151,16 @@ if errorlevel 1 (
 )
 echo.
 
+echo [2.5/4] Validating certificate pinning configuration...
+py -3.11 verify_pins.py %SERVER_PRESET%
+if errorlevel 1 (
+    echo [ERROR] Pin validation failed! Check error messages above.
+    set "LAST_ERROR_MSG=Pin validation check failed."
+    del /q "%BUILD_CFG%" >nul 2>nul
+    goto build_failed
+)
+echo.
+
 echo [3/4] Preparing output directory...
 if not exist "build" mkdir "build"
 if exist "build\dist\%OUTPUT_NAME%.exe" (
