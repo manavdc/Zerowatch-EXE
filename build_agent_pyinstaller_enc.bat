@@ -134,7 +134,7 @@ echo.
 
 echo [1/4] Installing build dependencies (PyInstaller 5.x + tinyaes)...
 rem We install pyinstaller<6.0 because version 6.0 removed the --key option
-py -3.11 -m pip install "pyinstaller<6.0" tinyaes "setuptools<70.0.0" wmi requests zstandard "python-socketio[client]"
+py -3.11 -m pip install "pyinstaller<6.0" tinyaes "setuptools<70.0.0" cryptography wmi requests zstandard "python-socketio[client]"
 if errorlevel 1 (
     set "LAST_ERROR_MSG=Failed to install build dependencies."
     goto build_failed
