@@ -57,7 +57,140 @@ def _global_crash_handler(exc_type, exc_value, exc_traceback):
 sys.excepthook = _global_crash_handler
 # === END CRASH DIAGNOSTICS ===
 
+def _setup_tcl_tk_paths():
+    return # Disabled to let Nuitka plugin handle it!
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if "onefile_" in current_dir and "TEMP" in current_dir:
+        tcl86_dir = os.path.join(current_dir, "tcl8.6")
+        tcl_dir = os.path.join(current_dir, "tcl")
+        tk86_dir = os.path.join(current_dir, "tk8.6")
+        tk_dir = os.path.join(current_dir, "tk")
+        
+        import shutil
+        
+        # If we have tcl8.6 but not tcl, copy files to tcl
+        if os.path.isdir(tcl86_dir) and not os.path.isfile(os.path.join(tcl_dir, "init.tcl")):
+            try:
+                os.makedirs(tcl_dir, exist_ok=True)
+                for item in os.listdir(tcl86_dir):
+                    s = os.path.join(tcl86_dir, item)
+                    d = os.path.join(tcl_dir, item)
+                    if os.path.isdir(s):
+                        shutil.copytree(s, d, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(s, d)
+            except Exception:
+                pass
+                
+        # If we have tk8.6 but not tk, copy files to tk
+        if os.path.isdir(tk86_dir) and not os.path.isfile(os.path.join(tk_dir, "tk.tcl")):
+            try:
+                os.makedirs(tk_dir, exist_ok=True)
+                for item in os.listdir(tk86_dir):
+                    s = os.path.join(tk86_dir, item)
+                    d = os.path.join(tk_dir, item)
+                    if os.path.isdir(s):
+                        shutil.copytree(s, d, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(s, d)
+            except Exception:
+                pass
+                
+        # Set environment variables to the 'tcl' and 'tk' folders which the error message looks for
+        os.environ["TCL_LIBRARY"] = tcl_dir
+        os.environ["TK_LIBRARY"] = tk_dir
+        return
 
+    def _has_tcl(path):
+        return bool(path) and os.path.isfile(os.path.join(path, "init.tcl"))
+
+    def _has_tk(path):
+        return bool(path) and os.path.isfile(os.path.join(path, "tk.tcl"))
+
+    tcl_env = os.environ.get("TCL_LIBRARY")
+    tk_env = os.environ.get("TK_LIBRARY")
+    if tcl_env and os.path.isdir(tcl_env):
+        tcl_candidate = os.path.join(tcl_env, "tcl8.6")
+        if _has_tcl(tcl_candidate):
+            os.environ["TCL_LIBRARY"] = tcl_candidate
+            tcl_env = tcl_candidate
+    if (not tk_env) and tcl_env:
+        tcl_parent = os.path.dirname(tcl_env)
+        tk_candidate = os.path.join(tcl_parent, "tk8.6")
+        if _has_tk(tk_candidate):
+            os.environ["TK_LIBRARY"] = tk_candidate
+            tk_env = tk_candidate
+
+    if tcl_env and not _has_tcl(tcl_env):
+        os.environ.pop("TCL_LIBRARY", None)
+        tcl_env = None
+    if tk_env and not _has_tk(tk_env):
+        os.environ.pop("TK_LIBRARY", None)
+        tk_env = None
+    if tcl_env and tk_env:
+        return
+
+    candidates = []
+    try:
+        candidates.append(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    try:
+        candidates.append(__nuitka_binary_dir)  # noqa: F821
+    except NameError:
+        pass
+
+    def _first_valid(paths, predicate):
+        for path in paths:
+            try:
+                if predicate(path):
+                    return path
+            except Exception:
+                continue
+        return None
+
+    for base in candidates:
+        tcl_candidates = [
+            os.path.join(base, "tcl"),
+            os.path.join(base, "tcl", "tcl8.6"),
+            os.path.join(base, "tcl8.6"),
+        ]
+        tk_candidates = [
+            os.path.join(base, "tk"),
+            os.path.join(base, "tcl", "tk8.6"),
+            os.path.join(base, "tk8.6"),
+        ]
+        tcl_dir = _first_valid(tcl_candidates, _has_tcl)
+        tk_dir = _first_valid(tk_candidates, _has_tk)
+        if tcl_dir:
+            os.environ["TCL_LIBRARY"] = tcl_dir
+        if tk_dir:
+            os.environ["TK_LIBRARY"] = tk_dir
+        if os.environ.get("TCL_LIBRARY") and os.environ.get("TK_LIBRARY"):
+            break
+
+    if not (os.environ.get("TCL_LIBRARY") and os.environ.get("TK_LIBRARY")):
+        for base in candidates:
+            tcl_root = os.path.join(base, "tcl")
+            if not os.path.isdir(tcl_root):
+                continue
+            found_tcl = None
+            found_tk = None
+            for root, _, files in os.walk(tcl_root):
+                if not found_tcl and "init.tcl" in files:
+                    found_tcl = root
+                if not found_tk and "tk.tcl" in files:
+                    found_tk = root
+                if found_tcl and found_tk:
+                    break
+            if found_tcl:
+                os.environ["TCL_LIBRARY"] = found_tcl
+            if found_tk:
+                os.environ["TK_LIBRARY"] = found_tk
+            if os.environ.get("TCL_LIBRARY") and os.environ.get("TK_LIBRARY"):
+                break
+
+_setup_tcl_tk_paths()
 
 
 import tkinter as tk
