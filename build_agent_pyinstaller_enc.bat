@@ -17,9 +17,16 @@ set "ICON_PATH=%~dp0resources\favicon.ico"
 set "ICON_FLAG="
 set "CONSOLE_FLAG=--noconsole"
 set "ENCRYPTION_KEY=D33pCytes2026S3c"
+set "SYFT_PATH=%~dp0resources\syft.exe"
+set "SYFT_FLAG="
 
 if exist "%ICON_PATH%" (
     set "ICON_FLAG=--icon=%ICON_PATH%"
+)
+if exist "%SYFT_PATH%" (
+    set "SYFT_FLAG=--add-data ""%SYFT_PATH%;."""
+) else (
+    echo [WARNING] syft.exe not found in resources folder! Deep scan feature will be unavailable.
 )
 
 :parse_args
@@ -188,6 +195,7 @@ rem Compiling with AES encryption key (requires PyInstaller 5.x)
 py -3.11 -m PyInstaller --noconfirm %STYLE_FLAGS% %CONSOLE_FLAG% %UAC_FLAG% ^
     --name "%OUTPUT_NAME%" ^
     %ICON_FLAG% ^
+    %SYFT_FLAG% ^
     --add-data "%ICON_PATH%;." ^
     --key="%ENCRYPTION_KEY%" ^
     --distpath build\dist ^
