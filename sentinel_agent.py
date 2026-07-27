@@ -318,6 +318,7 @@ def run_syft_deep_scan(base_dir, target_folder="C:\\"):
             [syft_path, f"dir:{target_folder}", "--exclude", "**/AppData/**", "--exclude", "**/node_modules/**", "--exclude", "**/Windows/**", "-o", "json"],
             capture_output=True,
             text=True,
+            timeout=120,  # Hard limit: syft on C:\ would otherwise hang indefinitely
             startupinfo=si,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
@@ -326,6 +327,9 @@ def run_syft_deep_scan(base_dir, target_folder="C:\\"):
         else:
             logging.error(f"Syft scan failed: {result.stderr}")
             return None
+    except subprocess.TimeoutExpired:
+        logging.warning(f"Syft scan timed out after 120s on {target_folder}")
+        return None
     except Exception as e:
         logging.error(f"Exception during syft scan: {e}")
         return None
@@ -633,17 +637,25 @@ def _configure_logging():
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
     root_logger.setLevel(logging.INFO)
+    
+    # Encrypted file handler (always active)
     handler = EncryptedFileHandler(LOG_FILE)
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S",
-        )
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
     )
+    handler.setFormatter(formatter)
     root_logger.addHandler(handler)
+
+    # Console stream handler (active when running as standard Python script from CLI)
+    if not str(sys.argv[0]).endswith('.exe'):
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
 
 
 _configure_logging()
+
 
 # ============================================================================
 # MODULE 0.5: ZERO-WATCH REST API CLIENT
@@ -3110,75 +3122,115 @@ def set_auto_start_enabled(enabled):
 # MODULE 6: WATCHER — Change Detection (Safe Registry Polling)
 # ============================================================================
 
-def monitor_system_changes(base_dir, fingerprint, zw_client):
+def monitor_system_changes(base_dir, fingerprint, zw_client, orchestrator=None):
     """
     Background thread that polls every MONITOR_INTERVAL seconds.
     Detects software installs/uninstalls/updates AND hardware profile changes.
     Sends only deltas to the backend (no CSV, no full sync).
-    """
-    # Software snapshot — keyed by "name::version" for accurate update detection
-    last_sw_snapshot = {f"{s['name']}::{s['version']}": s for s in get_installed_software_registry()}
 
-    # Hardware snapshot hash for full-profile diffing
+    When an orchestrator is provided (normal path), software delta is
+    computed via orchestrator.run_registry_delta() which covers the
+    Uninstall hive, Windows Store apps, and active drivers.
+
+    When orchestrator is None (fallback / import failure), the original
+    registry-only snapshot logic is used unchanged.
+    """
+    # ── Software snapshot initialisation ──────────────────────────────────
+    # When using the orchestrator the snapshot is maintained inside it.
+    # When falling back, we keep the local dict for diffing.
+    if orchestrator is None:
+        last_sw_snapshot = {
+            f"{s['name']}::{s['version']}": s
+            for s in get_installed_software_registry()
+        }
+    else:
+        last_sw_snapshot = {}  # unused in orchestrator path
+
+    # ── Hardware snapshot (shared by both paths) ───────────────────────────
     last_hardware_profile = get_detailed_hardware_profile()
     last_hardware_hash = hashlib.sha256(
         json.dumps(last_hardware_profile, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
+    # Hardware changes at most when hardware is physically swapped —
+    # checking every 60s was wasteful.  15 minutes is more than sufficient.
+    _HW_CHECK_INTERVAL = 900  # seconds
+    last_hw_check_time = time.time()
 
     while True:
         try:
             time.sleep(MONITOR_INTERVAL)
-            
+
             if not is_inventory_scan_enabled():
                 continue
 
-            # --- Software delta ---
-            current_list = get_installed_software_registry()
-            current_sw_snapshot = {f"{s['name']}::{s['version']}": s for s in current_list}
+            # ── Software delta ─────────────────────────────────────────────
+            if orchestrator is not None:
+                # Orchestrator path: covers registry + Store + drivers.
+                # Returns (added_list, removed_list) as API-ready dicts.
+                sw_added_list, sw_removed_list = orchestrator.run_registry_delta()
+                sw_added   = sw_added_list    # already tagged change_type="added"
+                sw_removed = sw_removed_list  # already tagged change_type="removed"
+            else:
+                # Fallback path: original registry-only diffing (unchanged logic)
+                current_list = get_installed_software_registry()
+                current_sw_snapshot = {
+                    f"{s['name']}::{s['version']}": s for s in current_list
+                }
+                added_keys   = set(current_sw_snapshot.keys()) - set(last_sw_snapshot.keys())
+                removed_keys = set(last_sw_snapshot.keys()) - set(current_sw_snapshot.keys())
 
-            sw_added   = set(current_sw_snapshot.keys()) - set(last_sw_snapshot.keys())
-            sw_removed = set(last_sw_snapshot.keys()) - set(current_sw_snapshot.keys())
+                for key in added_keys:
+                    current_sw_snapshot[key]["change_type"] = "added"
+                for key in removed_keys:
+                    last_sw_snapshot[key]["change_type"] = "removed"
 
-            # --- Hardware delta (full-profile hash + key-level diff summary) ---
-            current_hardware_profile = get_detailed_hardware_profile()
-            current_hardware_hash = hashlib.sha256(
-                json.dumps(current_hardware_profile, sort_keys=True, default=str).encode("utf-8")
-            ).hexdigest()
+                sw_added   = [current_sw_snapshot[k] for k in added_keys]
+                sw_removed = [last_sw_snapshot[k]    for k in removed_keys]
+                last_sw_snapshot = current_sw_snapshot
 
+            # ── Hardware delta (throttled to once per 15 minutes) ──────────
+            now = time.time()
             hw_added   = []
             hw_removed = []
 
-            if current_hardware_hash != last_hardware_hash:
-                old_flat = flatten_hardware_profile(last_hardware_profile)
-                new_flat = flatten_hardware_profile(current_hardware_profile)
+            if now - last_hw_check_time >= _HW_CHECK_INTERVAL:
+                last_hw_check_time = now
+                current_hardware_profile = get_detailed_hardware_profile()
+                current_hardware_hash = hashlib.sha256(
+                    json.dumps(current_hardware_profile, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()
 
-                for key, value in new_flat.items():
-                    if old_flat.get(key) != value:
-                        hw_added.append({
-                            "name": key,
-                            "vendor": "Hardware",
-                            "version": value,
-                            "category": "profile",
-                        })
+                if current_hardware_hash != last_hardware_hash:
+                    old_flat = flatten_hardware_profile(last_hardware_profile)
+                    new_flat = flatten_hardware_profile(current_hardware_profile)
 
-                for key, value in old_flat.items():
-                    if new_flat.get(key) != value:
-                        hw_removed.append({
-                            "name": key,
-                            "vendor": "Hardware",
-                            "version": value,
-                            "category": "profile",
-                        })
+                    for key, value in new_flat.items():
+                        if old_flat.get(key) != value:
+                            hw_added.append({
+                                "name": key,
+                                "vendor": "Hardware",
+                                "version": value,
+                                "category": "profile",
+                            })
 
+                    for key, value in old_flat.items():
+                        if new_flat.get(key) != value:
+                            hw_removed.append({
+                                "name": key,
+                                "vendor": "Hardware",
+                                "version": value,
+                                "category": "profile",
+                            })
+
+                    last_hardware_profile = current_hardware_profile
+                    last_hardware_hash    = current_hardware_hash
+            else:
+                # Not time for a hardware check — reuse the last known profile
+                # so hw_added / hw_removed stay empty and we skip the sync.
+                current_hardware_profile = last_hardware_profile
+
+            # ── Sync if anything changed ───────────────────────────────────
             if sw_added or sw_removed or hw_added or hw_removed:
-                for key in sw_added:
-                    current_sw_snapshot[key]["change_type"] = "added"
-                for key in sw_removed:
-                    last_sw_snapshot[key]["change_type"] = "removed"
-
-                sw_added_list   = [current_sw_snapshot[k] for k in sw_added]
-                sw_removed_list = [last_sw_snapshot[k] for k in sw_removed]
-
                 logging.info(
                     f"System change detected: SW +{len(sw_added)} -{len(sw_removed)} | "
                     f"HW +{len(hw_added)} -{len(hw_removed)}"
@@ -3186,20 +3238,18 @@ def monitor_system_changes(base_dir, fingerprint, zw_client):
 
                 if zw_client:
                     zw_client.sync_delta(
-                        sw_added_list, sw_removed_list,
-                        added_hw=hw_added if hw_added else None,
+                        sw_added, sw_removed,
+                        added_hw=hw_added   if hw_added   else None,
                         removed_hw=hw_removed if hw_removed else None,
-                        hardware_snapshot=current_hardware_profile if hw_added or hw_removed else None,
+                        hardware_snapshot=current_hardware_profile if (hw_added or hw_removed) else None,
                     )
-                    event_detail = {"sw_added": len(sw_added), "sw_removed": len(sw_removed)}
+                    event_detail = {
+                        "sw_added":   len(sw_added),
+                        "sw_removed": len(sw_removed),
+                    }
                     if hw_added or hw_removed:
                         event_detail["hw_changes"] = len(hw_added) + len(hw_removed)
                     zw_client.log_event("SYSTEM_CHANGE", event_detail)
-
-                # Always update snapshots
-                last_sw_snapshot = current_sw_snapshot
-                last_hardware_profile = current_hardware_profile
-                last_hardware_hash = current_hardware_hash
 
         except Exception as e:
             logging.error(f"Monitor error: {e}")
@@ -4547,32 +4597,73 @@ def main_agent():
         logging.info("Skipping file ACL protection in standard profile.")
 
 
+    # --- Initialize Scan Orchestrator ---
+    # Wraps the existing registry scanner + adds Store apps, drivers,
+    # OS version, portable PE binaries, and manifest parsing.
+    # The orchestrator is passed to the monitor thread so both share
+    # the same SQLite cache and snapshot state.
+    try:
+        from scanner import ScanOrchestrator
+        _orchestrator = ScanOrchestrator(
+            base_dir=base_dir,
+            existing_registry_fn=get_installed_software_registry,
+            agent_version=AGENT_VERSION,
+        )
+        # Warm the delta snapshot from the previous session's cache so
+        # the first run_registry_delta() doesn't treat everything as new.
+        _orchestrator.load_snapshot_from_cache()
+        logging.info("ScanOrchestrator initialized (scan cache warmed).")
+    except Exception as _orch_err:
+        logging.error(f"ScanOrchestrator init failed, falling back to registry only: {_orch_err}")
+        _orchestrator = None
+
     # --- Full Inventory ---
     if is_inventory_scan_enabled():
         show_windows_notification("Zerowatch", "Sentinel Agent running in Background")
         logging.info("Running full software + hardware inventory...")
-        # Get software list
-        software = get_installed_software_registry()
-        
-        # Get high-fidelity hardware profile
+
+        if _orchestrator is not None:
+            # Phase A: Layer 0 only (registry, Store, drivers, OS version).
+            # Completes in <1s — submit to backend immediately so the first
+            # heartbeat is never delayed by a slow filesystem walk.
+            software = _orchestrator.run_full_scan(include_filesystem=False)
+        else:
+            # Fallback: existing registry scanner (unchanged behaviour).
+            software = get_installed_software_registry()
+
+        # Get high-fidelity hardware profile (unchanged)
         hardware_data = get_detailed_hardware_profile()
 
         logging.info("Syncing full inventory to backend via JSON...")
         zw_client.sync_full(software, hardware_data)
         show_windows_notification("Zerowatch", "Sentinel Agent stopped scanning")
+
+        if _orchestrator is not None:
+            # Phase B: periodic incremental filesystem scan (background daemon thread).
+            # Priority scan runs every 4h covering well-known software locations.
+            # Deep scan runs every 24h covering all fixed drives from root.
+            # Results are submitted as sync_delta calls — additions and removals.
+            def _on_fs_delta(added_items, removed_items):
+                if (added_items or removed_items) and zw_client.jwt:
+                    zw_client.sync_delta(added_items, removed_items)
+
+            _orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
+            logging.info("Periodic filesystem scan started (4h priority / 24h deep).")
+
     else:
         logging.info("Inventory scan is disabled in settings. Skipping initial full scan.")
-        
+
     zw_client.log_event("STARTUP", {"version": AGENT_VERSION, "status": "active"})
 
     # --- Background Monitor ---
     logging.info("Starting background change monitor...")
     monitor = threading.Thread(
         target=monitor_system_changes,
-        args=(base_dir, fingerprint, zw_client),
+        args=(base_dir, fingerprint, zw_client, _orchestrator),
         daemon=True
     )
     monitor.start()
+
 
     # --- Heartbeat & Mutual Monitoring Loop ---
     logging.info("Entering heartbeat loop. Agent is fully active.")
@@ -6248,7 +6339,14 @@ def _is_daemon_running():
 
 def _spawn_daemon_process():
     exe_path = get_exe_path()
-    args = [exe_path] + _daemon_args()
+    # When running as a compiled .exe, execute it directly.
+    # When running as a .py script from the interpreter, we must prepend
+    # sys.executable so Windows doesn't try to run the .py file as a Win32
+    # application (which causes WinError 193 "not a valid Win32 application").
+    if sys.argv[0].endswith('.exe'):
+        args = [exe_path] + _daemon_args()
+    else:
+        args = [sys.executable, exe_path] + _daemon_args()
     try:
         DETACHED = 0x00000008
         NEW_GROUP = 0x00000200

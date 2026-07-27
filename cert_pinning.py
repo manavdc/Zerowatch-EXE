@@ -120,9 +120,11 @@ class PinnedSSLContext(ssl.SSLContext):
         if not self.pins:
             return wrapped
             
+        # Resolve hostname from SNI arguments or stored target
+        hostname = kwargs.get('server_hostname') or self.hostname_target or ""
         try:
             cert_der = wrapped.getpeercert(binary_form=True)
-            _verify_pin(self.hostname_target or "", cert_der, self.pins)
+            _verify_pin(hostname, cert_der, self.pins)
         except PinError:
             try:
                 wrapped.close()
