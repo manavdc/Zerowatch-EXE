@@ -300,6 +300,37 @@ def run_hidden(args, timeout=None, shell=False):
     )
 
 
+def run_syft_deep_scan(base_dir, target_folder="C:\\"):
+    import sys
+    if hasattr(sys, '_MEIPASS'):
+        syft_path = os.path.join(sys._MEIPASS, "syft.exe")
+    else:
+        syft_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "syft.exe")
+    
+    if not os.path.exists(syft_path):
+        logging.error("syft.exe not found.")
+        return None
+        
+    try:
+        logging.info(f"Starting deep scan with syft on {target_folder}...")
+        si = _windows_hidden_startupinfo()
+        result = subprocess.run(
+            [syft_path, f"dir:{target_folder}", "--exclude", "**/AppData/**", "--exclude", "**/node_modules/**", "--exclude", "**/Windows/**", "-o", "json"],
+            capture_output=True,
+            text=True,
+            startupinfo=si,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+        else:
+            logging.error(f"Syft scan failed: {result.stderr}")
+            return None
+    except Exception as e:
+        logging.error(f"Exception during syft scan: {e}")
+        return None
+
+
 def check_backend_connectivity():
     """Checks if the configured backend endpoint is reachable before network operations."""
     try:
@@ -702,6 +733,11 @@ class ZeroWatchClient:
             logging.info("[WS] Received unlink notification")
             self.notification_queue.append({"type": "unlink", "data": data})
 
+        @self.sio.on("deep_scan")
+        def on_deep_scan(data):
+            logging.info("[WS] Received deep_scan command")
+            self.notification_queue.append({"type": "deep_scan", "data": data})
+
     def is_enrolled(self):
         """Checks if this device is approved in the join state, independent of JWT."""
         state = self.join_state if isinstance(self.join_state, dict) else self._load_join_state()
@@ -716,6 +752,18 @@ class ZeroWatchClient:
         is_ok = (status == "approved" and team_code and device_id == self.device_id)
         logging.info(f"Enrollment check: status='{status}', team='{team_code}', match={device_id == self.device_id} => {is_ok}")
         return is_ok
+
+    def send_sbom(self, sbom_data):
+        if not self.jwt or not sbom_data: return False
+        try:
+            # Note: assuming _auth_headers() exists on client, we construct it:
+            headers = {"Authorization": f"Bearer {self.jwt}", "Content-Type": "application/json"}
+            url = f"{resolve_api_base_url()}/api/agent/sbom"
+            resp = self.session.post(url, headers=headers, json=sbom_data, timeout=120)
+            return resp.status_code == 200
+        except Exception as e:
+            logging.error(f"Failed to send SBOM: {e}")
+            return False
 
     def connect_socket(self):
         """Connect to WebSocket server in a separate thread if not already connected."""
@@ -4277,60 +4325,8 @@ def watchdog_process(target_exe_path):
                     logging.info("[WATCHDOG] Shutdown signal detected; exiting watchdog.")
                     sys.exit(0)
 
-                logging.info("[WATCHDOG] Main agent killed! Attempting to spawn password prompt...")
-
-                # --- ANTI-FORK-BOMB: only ONE password prompt at a time ---
-                prompt_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, PROMPT_MUTEX_NAME)
-                prompt_err = ctypes.windll.kernel32.GetLastError()
-                if prompt_err == 183:  # Another prompt already running
-                    logging.info("[WATCHDOG] Another password prompt is already running. Waiting...")
-                    if prompt_mutex:
-                        ctypes.windll.kernel32.CloseHandle(prompt_mutex)
-                    time.sleep(10)
-                    continue
-
-                # Spawn a VISIBLE password prompt as a completely separate process
-                if target_exe_path.endswith('.py'):
-                    prompt_args = [sys.executable, target_exe_path, "--password-prompt"]
-                else:
-                    prompt_args = [target_exe_path, "--password-prompt"]
-                    
-                try:
-                    exit_code = subprocess.call(
-                        prompt_args,
-                        creationflags=subprocess.CREATE_NEW_CONSOLE,
-                    )
-                except Exception as e:
-                    logging.error(f"[WATCHDOG] Failed to spawn password prompt: {e}")
-                    exit_code = 1  # If prompt itself crashed, treat as denied
-                finally:
-                    # Release the prompt mutex
-                    if prompt_mutex:
-                        ctypes.windll.kernel32.CloseHandle(prompt_mutex)
-
-                if exit_code == 0:
-                    # Correct password — authorized shutdown
-                    logging.info("[WATCHDOG] Authorized shutdown. Exiting watchdog.")
-                    sys.exit(0)
-                else:
-                    # Wrong password or window closed — REVIVE the agent!
-                    logging.info("[WATCHDOG] Unauthorized kill. Reviving main agent (no-watchdog mode)...")
-                    # Use --no-watchdog to prevent the revived agent from spawning ANOTHER watchdog
-                    # (this watchdog is still alive and monitoring)
-                    if target_exe_path.endswith('.py'):
-                        subprocess.Popen(
-                            [sys.executable, target_exe_path, "--no-watchdog"],
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                            startupinfo=_windows_hidden_startupinfo(),
-                        )
-                    else:
-                        subprocess.Popen(
-                            [target_exe_path, "--no-watchdog"],
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                            startupinfo=_windows_hidden_startupinfo(),
-                        )
-                    # 30-second cooldown to prevent rapid fork cycling
-                    time.sleep(30)
+                logging.info("[WATCHDOG] Main agent killed! Exiting watchdog (termination protection disabled).")
+                sys.exit(0)
 
             time.sleep(5)  # Reduced polling frequency (was 3s)
         except Exception as e:
@@ -4730,6 +4726,7 @@ def main_agent():
             time.sleep(10)
 
     logging.info("SentinelAgent shutdown completed.")
+
 class EnrollmentFrame(tk.Frame):
     def __init__(self, master, zw_client):
         super().__init__(master)
@@ -4796,56 +4793,8 @@ class EnrollmentFrame(tk.Frame):
         self.screens["INDIVIDUAL_CODE"] = self._create_individual_code_screen()
         self.screens["METADATA"] = self._create_metadata_screen()
         self.screens["PENDING"] = self._create_pending_screen()
-        
-        settings_btn = tk.Button(main_content, text="⚙ Settings", bg=self.c_bg_main, fg=self.c_cyan, font=self.f_btn, bd=0, activebackground=self.c_bg_main, activeforeground=self.c_cyan_hover, cursor="hand2", command=self.show_settings_popup)
-        settings_btn.place(relx=0.98, rely=0.02, anchor=tk.NE)
             
         self.show_screen(self.state)
-
-    def show_settings_popup(self):
-        try:
-            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except Exception:
-            is_admin = False
-            
-        if not is_admin:
-            import tkinter.messagebox as mb
-            mb.showerror("Access Denied", "This feature can only be accessed with administrator access.")
-            return
-
-        popup = tk.Toplevel(self)
-        popup.title("SETTINGS")
-        popup.geometry("600x400")
-        popup.configure(bg=self.c_bg_main)
-        popup.resizable(False, False)
-        
-        header = tk.Frame(popup, bg=self.c_bg_main)
-        header.pack(fill=tk.X, pady=(20, 20), padx=20)
-        tk.Label(header, text="SETTINGS", fg=self.c_white, bg=self.c_bg_main, font=("Arial", 18, "bold")).pack(side=tk.LEFT)
-        
-        desc = tk.Label(popup, text="Configure agent system settings. Changes require administrator privileges.", fg=self.c_gray, bg=self.c_bg_main, font=self.f_normal, justify=tk.LEFT)
-        desc.pack(anchor="w", pady=(0, 20), padx=20)
-        
-        container = tk.Frame(popup, bg=self.c_bg_main)
-        container.pack(fill=tk.BOTH, expand=True, padx=20)
-        
-        card = tk.Frame(container, bg=self.c_card_bg, highlightbackground=self.c_card_border, highlightthickness=1, padx=20, pady=15)
-        card.pack(fill=tk.X, pady=5)
-        
-        top = tk.Frame(card, bg=self.c_card_bg)
-        top.pack(fill=tk.X)
-        tk.Label(top, text="Inventory Scan", fg=self.c_cyan, bg=self.c_card_bg, font=("Arial", 11, "bold")).pack(side=tk.LEFT)
-        
-        inventory_enabled = tk.BooleanVar()
-        inventory_enabled.set(is_inventory_scan_enabled())
-            
-        def toggle_inventory():
-            set_inventory_scan_enabled(inventory_enabled.get())
-                
-        chk = tk.Checkbutton(top, variable=inventory_enabled, bg=self.c_card_bg, activebackground=self.c_card_bg, command=toggle_inventory)
-        chk.pack(side=tk.RIGHT)
-        
-        tk.Label(card, text="Automatically scan and collect hardware and software inventory.", fg=self.c_gray, bg=self.c_card_bg, font=("Arial", 9), justify=tk.LEFT).pack(anchor="w", pady=(10,0))
 
     def show_screen(self, state):
         self.state = state
@@ -5512,6 +5461,102 @@ class DashboardFrame(tk.Frame):
         
         tk.Label(card3, text="Disconnect this device from the currently linked team.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
 
+        # --- Card 4: Deep Scan ---
+        card4 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=20, pady=15)
+        card4.pack(fill=tk.X, pady=5)
+
+        top4 = tk.Frame(card4, bg=self.c_bg_card)
+        top4.pack(fill=tk.X)
+        tk.Label(top4, text="Deep Scan (SBOM)", fg=self.c_cyan, bg=self.c_bg_card, font=self.f_normal_bold).pack(side=tk.LEFT)
+
+        scan_controls = tk.Frame(top4, bg=self.c_bg_card)
+        scan_controls.pack(side=tk.RIGHT)
+
+        folder_var = tk.StringVar(value="C:\\")
+
+        def browse_folder():
+            from tkinter import filedialog
+            folder = filedialog.askdirectory(title="Select Folder to Scan")
+            if folder:
+                folder_var.set(folder)
+
+        tk.Button(scan_controls, text="Browse", bg=self.c_bg_sidebar, fg=self.c_white, font=self.f_small, bd=1, command=browse_folder).pack(side=tk.LEFT, padx=5)
+        tk.Entry(scan_controls, textvariable=folder_var, bg=self.c_bg_sidebar, fg=self.c_white, width=30).pack(side=tk.LEFT, padx=5)
+
+        # Add a progress frame below the description
+        progress_frame = tk.Frame(card4, bg=self.c_bg_card)
+        # It will be packed later
+
+        from tkinter import ttk
+        style = ttk.Style()
+        style.theme_use('default')
+        style.configure("TProgressbar", thickness=10, background=self.c_cyan_dark)
+        
+        progress_bar = ttk.Progressbar(progress_frame, style="TProgressbar", mode='indeterminate')
+        status_label = tk.Label(progress_frame, text="", fg=self.c_cyan, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT)
+
+        def mock_progress_worker(target, scan_running):
+            import os, time
+            for root, dirs, files in os.walk(target):
+                if not scan_running[0]:
+                    break
+                # Skip excluded dirs for visual consistency
+                if "AppData" in root or "node_modules" in root or "Windows" in root:
+                    continue
+                for name in files:
+                    if not scan_running[0]:
+                        break
+                    path = os.path.join(root, name)
+                    # Safe UI update from thread
+                    try:
+                        trunc_path = path if len(path) < 70 else "..." + path[-67:]
+                        status_label.config(text=f"Scanning: {trunc_path}")
+                    except:
+                        pass
+                    time.sleep(0.005) # Small delay to not lock UI and match syft speed roughly
+
+        def run_scan_thread(target):
+            scan_running = [True]
+            progress_frame.pack(fill=tk.X, pady=(10,0))
+            progress_bar.pack(fill=tk.X, pady=5)
+            status_label.pack(anchor="w")
+            progress_bar.start(10)
+            
+            run_btn.config(state="disabled")
+            
+            import threading
+            prog_t = threading.Thread(target=mock_progress_worker, args=(target, scan_running), daemon=True)
+            prog_t.start()
+            
+            try:
+                # run_syft_deep_scan is a top-level function
+                sbom_data = run_syft_deep_scan(self.zw_client.base_dir, target)
+                if sbom_data:
+                    status_label.config(text="Uploading SBOM to dashboard...")
+                    self.zw_client.send_sbom(sbom_data)
+            except Exception as e:
+                import logging
+                logging.error(f"Manual scan error: {e}")
+            finally:
+                scan_running[0] = False
+                progress_bar.stop()
+                progress_bar.pack_forget()
+                status_label.config(text="Scan Complete!")
+                run_btn.config(state="normal")
+                show_windows_notification("Zerowatch", f"Deep scan on {target} finished.")
+
+        def on_run_scan():
+            import threading
+            target = folder_var.get()
+            if not target: return
+            show_windows_notification("Zerowatch", f"Starting deep scan on {target}...")
+            threading.Thread(target=run_scan_thread, args=(target,), daemon=True).start()
+
+        run_btn = tk.Button(scan_controls, text="Run Scan", bg=self.c_cyan_dark, fg=self.c_cyan, font=self.f_normal_bold, bd=0, cursor="hand2", command=on_run_scan)
+        run_btn.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(card4, text="Manually trigger a Syft scan on a selected folder. This will generate an SBOM and upload it to the dashboard.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
+
 
     def _build_data_info_content(self, parent_frame):
         header = tk.Frame(parent_frame, bg=self.c_bg_base)
@@ -6120,6 +6165,26 @@ class UnifiedSentinelGUI(tk.Tk):
                     else:
                          _append_gui_log(self.zw_client.base_dir, "[GUI] Unlink signal could not be verified (Spoof?). Ignoring.")
                 
+                elif ntype == "deep_scan":
+                    target_folder = "C:\\"
+                    if isinstance(data, dict) and data.get("target_folder"):
+                        target_folder = str(data.get("target_folder")).strip()
+                    
+                    _append_gui_log(self.zw_client.base_dir, f"[GUI] Deep scan command received for {target_folder}. Starting background scan...")
+                    def _scan_thread(t_folder):
+                        sbom_data = run_syft_deep_scan(self.zw_client.base_dir, t_folder)
+                        if sbom_data:
+                            _append_gui_log(self.zw_client.base_dir, "[GUI] Deep scan completed. Sending to server...")
+                            success = self.zw_client.send_sbom(sbom_data)
+                            if success:
+                                _append_gui_log(self.zw_client.base_dir, "[GUI] SBOM successfully sent.")
+                            else:
+                                _append_gui_log(self.zw_client.base_dir, "[GUI] Failed to send SBOM data.")
+                        else:
+                            _append_gui_log(self.zw_client.base_dir, "[GUI] Deep scan failed.")
+                    
+                    threading.Thread(target=_scan_thread, args=(target_folder,), daemon=True).start()
+
                 elif ntype == "feed_ready":
                     # Debounce: don't refresh more than once every 5 seconds from notifications
                     now = time.time()
@@ -6203,9 +6268,9 @@ def _daemon_args():
         args.append("--hardened")
     return args
 
-def prompt_consent(base_dir):
+def prompt_consent(base_dir, force_show=False):
     consent_file = os.path.join(_secure_state_dir(base_dir), "consent_accepted.dat")
-    if os.path.exists(consent_file):
+    if not force_show and os.path.exists(consent_file):
         return True
 
     root = tk.Tk()
@@ -6307,7 +6372,6 @@ def run_interactive():
 
     try:
         base_dir = get_base_dir()
-        prompt_consent(base_dir)
         _append_gui_log(base_dir, "GUI startup: begin")
         hostname = resolve_hostname(base_dir)
         operator_username = resolve_agent_username(base_dir, prompt=False)
@@ -6333,6 +6397,11 @@ def run_interactive():
             asset_name=asset_name,
         )
         _append_gui_log(base_dir, "GUI startup: client initialized")
+
+        if not zw_client.is_enrolled():
+            prompt_consent(base_dir, force_show=True)
+        else:
+            prompt_consent(base_dir, force_show=False)
 
         # Ensure a daemon is running so background monitoring persists.
         try:
