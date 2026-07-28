@@ -4639,7 +4639,37 @@ def main_agent():
         show_windows_notification("Zerowatch", "Sentinel Agent stopped scanning")
 
         if _orchestrator is not None:
-            # Phase B: periodic incremental filesystem scan (background daemon thread).
+            # Phase B-1: Immediately flush cached items from previous session.
+            # The scan cache already has 7,000+ items from the last completed scan.
+            # Emit them as 'added' deltas right now so the backend shows the full
+            # inventory within seconds — before any race condition can interrupt us.
+            # The periodic scan will then only need to send *changes* since last run.
+            try:
+                cached_items = _orchestrator._cache.all_cached_items()
+                if cached_items:
+                    # Build additions: items in cache that are NOT already in the
+                    # current snapshot (which only has Layer 0 registry items).
+                    with _orchestrator._snapshot_lock:
+                        existing_keys = set(_orchestrator._last_snapshot.keys())
+                    new_additions = []
+                    for item in cached_items:
+                        if item.is_valid() and item.dedup_key() not in existing_keys:
+                            d = item.to_api_dict()
+                            d["change_type"] = "added"
+                            new_additions.append(d)
+                    if new_additions:
+                        logging.info(
+                            "Flushing %d cached items to backend as initial delta.",
+                            len(new_additions),
+                        )
+                        zw_client.sync_delta(new_additions, [])
+                        logging.info("Cache flush complete: %d items pushed.", len(new_additions))
+                    else:
+                        logging.info("Cache flush: no new items beyond Layer 0.")
+            except Exception as _flush_err:
+                logging.warning("Cache flush failed (non-fatal): %s", _flush_err)
+
+            # Phase B-2: periodic incremental filesystem scan (background daemon thread).
             # Priority scan runs every 4h covering well-known software locations.
             # Deep scan runs every 24h covering all fixed drives from root.
             # Results are submitted as sync_delta calls — additions and removals.

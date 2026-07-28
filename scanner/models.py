@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import datetime
 from dataclasses import dataclass, field, asdict
-from typing import Optional
+from typing import ClassVar, Dict, Optional
 
 
 # ── Source tag constants ──────────────────────────────────────────────────────
@@ -85,15 +85,76 @@ class SoftwareItem:
 
     # ── Normalisation helpers ─────────────────────────────────────────────────
 
+    # Maps a source tag prefix to a short ecosystem bucket used in dedup keys.
+    # All npm-family sources (npm_manifest, npm_lockfile) share one bucket so
+    # the same package reported by package.json AND package-lock.json still
+    # deduplicates. Packages from completely different ecosystems (npm vs pip)
+    # that happen to share a name and version are kept separate because they
+    # are different software with independent CVE exposure.
+    _ECOSYSTEM_MAP: ClassVar[Dict[str, str]] = {
+        "npm":              "npm",
+        "pip":              "pip",
+        "pyproject":        "pip",
+        "maven":            "maven",
+        "gradle":           "maven",    # Gradle declares the same GAV coordinates
+        "cargo":            "cargo",
+        "go_mod":           "go",
+        "gem":              "gem",
+        "composer":         "composer",
+        "nuget":            "nuget",
+        "jar":              "jar",
+        "zip":              "zip",
+    }
+
+    @classmethod
+    def _ecosystem_bucket(cls, source: str) -> str:
+        """
+        Derive a short ecosystem label from the source tag.
+        
+        Rules:
+        - npm_manifest  → npm
+        - npm_lockfile  → npm   (same bucket — both report the same packages)
+        - pip_requirements → pip
+        - pip_lockfile  → pip
+        - registry / windows_store / os → 'system'  (OS-managed; high priority)
+        - pe_binary / pe_dll / pe_sys  → 'pe'       (binary inspection)
+        - driver                       → 'driver'
+        Everything else maps to its own source name so nothing is lost.
+        """
+        src = (source or "").lower()
+        # System-level sources
+        if src in ("registry", "windows_store", "os"):
+            return "system"
+        if src in ("driver", "pe_sys"):
+            return "driver"
+        if src in ("pe_binary", "pe_dll"):
+            return "pe"
+        # Ecosystem prefix match
+        for prefix, bucket in cls._ECOSYSTEM_MAP.items():
+            if src.startswith(prefix):
+                return bucket
+        return src  # Fallback: use the source tag verbatim
+
     def dedup_key(self) -> str:
         """
         Stable dedup key used for merging items from multiple scanner layers.
         Lower-cased so "Firefox" and "firefox" collapse to the same entry.
         Version is included so that a version upgrade is treated as a new item.
+        Ecosystem is included so that an npm package and a pip package that
+        share the same name and version are NOT incorrectly merged — they are
+        completely different software with independent CVE histories.
+
+        Format: {ecosystem}::{name}::{version}
+        Examples:
+          npm::lodash::4.17.21
+          pip::requests::2.31.0
+          system::python::3.11.5
+          pe::nmap::7.94
         """
+        eco = self._ecosystem_bucket(self.source)
         n = (self.name or "").strip().lower()
         v = (self.version or "").strip().lower()
-        return f"{n}::{v}"
+        return f"{eco}::{n}::{v}"
 
     def is_valid(self) -> bool:
         """A SoftwareItem is only worth keeping if it has a non-empty name."""

@@ -95,8 +95,13 @@ class EntryKind(Enum):
 
 # ── Skip rules ────────────────────────────────────────────────────────────────
 
-# Directory names (DirEntry.name) that should NEVER be recursed into.
-# These are matched case-insensitively against the last path component.
+# ── Skip rules ────────────────────────────────────────────────────────────────
+
+# Directory names that are ALWAYS skipped regardless of context.
+# These never contain CVE-relevant data:
+#   - OS internals (System32, WinSxS) – covered by Layer 0 registry
+#   - Build output dirs that contain no installed packages
+#   - VCS housekeeping, IDE metadata, browser caches
 SKIP_DIR_NAMES: FrozenSet[str] = frozenset({
     # --- Windows OS internals ---
     "system32", "syswow64", "winsxs",
@@ -110,23 +115,17 @@ SKIP_DIR_NAMES: FrozenSet[str] = frozenset({
     "$recycle.bin", "recycler",
     "system volume information",
     "$windows.~bt", "$windows.~ws",
-    "drivers",                      # C:\Windows\System32\drivers is inside System32; kept for clarity
+    "drivers",                      # C:\Windows\System32\drivers — inside System32
 
-    # --- Development build artifacts (no CVE value; parse manifests instead) ---
-    "node_modules",
-    ".yarn",
-    "venv", ".venv", "env", ".env",
+    # --- Python / JS tool caches (not installed packages) ---
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
     ".eggs",
     ".tox",
-    "build",                        # Python setuptools build dir
-    "dist",                         # Python/JS dist output
-    "target",                       # Rust / Maven build output
-    "out",                          # Gradle / misc build output
-    ".gradle",                      # Gradle cache
+    ".yarn",                        # yarn plug'n'play cache
+    ".gradle",                      # Gradle wrapper/build cache
     ".cargo",                       # Rust registry cache — parse Cargo.lock instead
     ".rustup",
     "cmake-build-debug",
@@ -160,8 +159,85 @@ SKIP_DIR_NAMES: FrozenSet[str] = frozenset({
     "onedrivetemp",
 })
 
-# Full path prefixes (lowercased).  Matched against the absolute path of
-# a directory before attempting to recurse into it.  Use these for paths
+# Dependency vendor directories that are CONDITIONALLY skipped.
+# Each entry maps an ecosystem manifest filename to the set of directories
+# that should be skipped when that manifest (or any manifest in its group)
+# is found co-located in the same parent directory.
+#
+# Logic in _walk_dir:
+#   1. Scan all entries in a directory.
+#   2. If any manifest file in a group is present → skip all of that
+#      group's dep directories.
+#   3. If NO manifest is found → fall through and scan the dep directory
+#      as a fallback so packages inside it are not silently missed.
+#
+# Key design decisions:
+#   - npm: node_modules is skipped when package.json OR any lockfile is
+#     found. package.json alone is sufficient because lockfiles may not
+#     exist in legacy projects.
+#   - Python venvs: skipped when any Python dependency manifest is found.
+#     Virtual environments contain only installed wheels — the same data
+#     is captured more accurately from the manifest/lockfile.
+#   - Java: .m2 and .gradle caches live in %USERPROFILE% not next to
+#     pom.xml, so they are handled by SKIP_DIR_NAMES_ALWAYS globally.
+#   - Rust: "target" is skipped when Cargo.toml or Cargo.lock is found.
+#   - PHP: "vendor" is skipped when composer.json or composer.lock is found.
+#   - Go: module caches live in %USERPROFILE%\go\pkg\mod, not next to
+#     go.mod, so only the local "vendor" directory (if used) is conditional.
+
+# A single group entry: (frozenset of trigger manifests, frozenset of dirs to skip)
+_ConditionalSkipGroup = Tuple[FrozenSet[str], FrozenSet[str]]
+
+CONDITIONAL_SKIP_GROUPS: Tuple[_ConditionalSkipGroup, ...] = (
+    # Node.js: skip node_modules when any npm/yarn/pnpm manifest is found
+    (
+        frozenset({
+            "package.json", "package-lock.json",
+            "yarn.lock", "pnpm-lock.yaml",
+        }),
+        frozenset({"node_modules"}),
+    ),
+    # Python: skip virtual-env dirs when any Python dependency file is found
+    (
+        frozenset({
+            "requirements.txt", "requirements-dev.txt",
+            "requirements-prod.txt", "requirements-test.txt",
+            "Pipfile", "Pipfile.lock",
+            "pyproject.toml", "setup.py", "setup.cfg",
+            "poetry.lock", "pdm.lock", "uv.lock",
+        }),
+        frozenset({"venv", ".venv", "env", ".env"}),
+    ),
+    # Java: skip local Maven / Gradle build outputs when build files are found
+    # (.m2 / .gradle global caches are in %USERPROFILE% so they are NOT
+    # skipped here — they land in SKIP_DIR_NAMES_ALWAYS above)
+    (
+        frozenset({
+            "pom.xml", "build.gradle", "build.gradle.kts",
+            "settings.gradle", "settings.gradle.kts",
+        }),
+        frozenset({"target", "out", "build", "dist"}),
+    ),
+    # PHP: skip vendor dir when Composer files are present
+    (
+        frozenset({"composer.json", "composer.lock"}),
+        frozenset({"vendor"}),
+    ),
+    # Rust: skip target dir when Cargo files are present
+    (
+        frozenset({"Cargo.toml", "Cargo.lock"}),
+        frozenset({"target"}),
+    ),
+    # Go: skip local vendor directory when go.mod is present
+    (
+        frozenset({"go.mod", "go.sum"}),
+        frozenset({"vendor"}),
+    ),
+)
+
+
+# Full path prefixes (lowercased). Matched against the absolute path of
+# a directory before attempting to recurse into it. Use these for paths
 # that contain folders matching benign names (e.g. a real app could be
 # called "Build" but C:\Windows\... is always noise).
 _WINDIR = (os.environ.get("SystemRoot") or r"C:\Windows").lower()
@@ -180,7 +256,26 @@ SKIP_PATH_PREFIXES: Tuple[str, ...] = (
         os.environ.get("ProgramFiles", r"C:\Program Files"),
         "WindowsApps",
     ).lower(),
+    # Global Rust & Cargo registry caches — nothing running here
+    os.path.join(os.environ.get("USERPROFILE", ""), ".cargo").lower(),
+    os.path.join(os.environ.get("USERPROFILE", ""), ".rustup").lower(),
+    # Global Go module download cache — covered by go.mod manifests
+    os.path.join(os.environ.get("USERPROFILE", ""), "go", "pkg", "mod").lower(),
+    # Global Maven local repository — covered by pom.xml manifests
+    os.path.join(os.environ.get("USERPROFILE", ""), ".m2").lower(),
+    # Global Gradle caches — covered by build.gradle manifests
+    os.path.join(os.environ.get("USERPROFILE", ""), ".gradle").lower(),
+    # Global pip/uv/poetry caches — raw wheels, not installed packages
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "pip", "Cache").lower(),
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "uv", "cache").lower(),
+    # npm global cache — raw tarballs, not installed packages
+    os.path.join(os.environ.get("APPDATA", ""), "npm-cache").lower(),
+    # NuGet global packages cache — covered by .csproj/packages.config
+    os.path.join(os.environ.get("USERPROFILE", ""), ".nuget", "packages").lower(),
+    # pnpm global store
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "pnpm").lower(),
 )
+
 
 
 # ── File target sets ──────────────────────────────────────────────────────────
@@ -321,18 +416,57 @@ def get_local_fixed_drives() -> List[str]:
 
 # ── Core walker ───────────────────────────────────────────────────────────────
 
-def _should_skip_dir(entry: os.DirEntry, abs_path_lower: str) -> bool:
+def _build_conditional_skip_set(dir_entry_names: Set[str]) -> FrozenSet[str]:
+    """
+    Given the set of filenames present in a directory, return the set of
+    subdirectory names that should be skipped because a manifest covering
+    their ecosystem has been found.
+
+    Example:
+        dir contains "package.json"  →  {"node_modules"} should be skipped
+        dir contains "Cargo.lock"    →  {"target"} should be skipped
+        dir contains nothing useful  →  frozenset()  (don't skip anything)
+    """
+    skip: Set[str] = set()
+    for trigger_manifests, dep_dirs in CONDITIONAL_SKIP_GROUPS:
+        # Case-insensitive check: lowercase the trigger set and compare
+        if any(
+            name.lower() in {m.lower() for m in trigger_manifests}
+            for name in dir_entry_names
+        ):
+            skip.update(name.lower() for name in dep_dirs)
+    return frozenset(skip)
+
+
+def _should_skip_dir(
+    entry: os.DirEntry,
+    abs_path_lower: str,
+    conditional_skip: FrozenSet[str] = frozenset(),
+) -> bool:
     """
     Returns True if a directory entry should be skipped entirely.
-    Fast path: name match first (no stat, no path construction).
+
+    Two-tier check:
+    1. Unconditional: name is in SKIP_DIR_NAMES (OS, caches, VCS)
+    2. Conditional: name is in conditional_skip (dep dirs whose ecosystem
+       is covered by a co-located manifest in the parent directory)
+    3. Path prefix: full path matches a known noisy subtree prefix
+
+    The conditional_skip set is built by _build_conditional_skip_set() for
+    each parent directory, so it only suppresses dependency dirs when the
+    corresponding manifest has been confirmed to exist.
     """
     name_lower = entry.name.lower()
 
-    # Skip by name match
+    # Tier 1: always skip
     if name_lower in SKIP_DIR_NAMES:
         return True
 
-    # Skip by path prefix (only checked when the name itself didn't match)
+    # Tier 2: conditionally skip (manifest-gated)
+    if conditional_skip and name_lower in conditional_skip:
+        return True
+
+    # Tier 3: path prefix
     for prefix in SKIP_PATH_PREFIXES:
         if abs_path_lower.startswith(prefix):
             return True
@@ -376,50 +510,104 @@ def walk_drives(
 def _walk_dir(
     dirpath: str,
 ) -> Generator[Tuple[str, EntryKind], None, None]:
-    """Recursive inner walk for a single directory."""
+    """
+    Recursive inner walk for a single directory.
+
+    Context-aware skip strategy
+    ───────────────────────────
+    Before recursing into any subdirectory, we check which filenames are
+    present in *this* directory.  If a package manifest is found (e.g.
+    package.json), the corresponding dependency vendor directory (e.g.
+    node_modules) is skipped — we already have the dependency information
+    from the manifest and scanning node_modules would just produce duplicate
+    entries.
+
+    If NO manifest is found in this directory, the dependency directory is
+    NOT skipped.  This is the fallback path that covers legacy or
+    non-standard project layouts where packages are installed without a
+    manifest file.
+
+    Performance note
+    ────────────────
+    os.scandir() is called once per directory and the result is held in a
+    list.  We make a single pass over the entries:
+      - Collect file names for manifest detection (cheap string ops, no I/O)
+      - Collect (entry, abs_path_lower) pairs for directories to recurse
+      - Yield matching files inline
+    The conditional_skip set is computed once per directory from the
+    collected file names, so the manifest detection adds zero extra syscalls.
+    """
     try:
         entries = list(os.scandir(dirpath))
     except (PermissionError, OSError) as exc:
         logger.debug("scandir skipped %s: %s", dirpath, exc)
         return
 
+    # ── Single-pass collection ─────────────────────────────────────────────
+    file_names: Set[str] = set()   # filenames present in this directory
+    dir_entries: list  = []        # (entry, abs_path_lower) for subdirs
+
     for entry in entries:
         try:
             if entry.is_symlink():
-                continue  # Never follow symlinks
-
+                continue
             if entry.is_dir(follow_symlinks=False):
-                abs_path_lower = entry.path.lower()
-                if _should_skip_dir(entry, abs_path_lower):
-                    logger.debug("Skipping dir: %s", entry.path)
-                    continue
-                yield from _walk_dir(entry.path)
-
+                dir_entries.append((entry, entry.path.lower()))
             elif entry.is_file(follow_symlinks=False):
-                name_lower = entry.name.lower()
+                file_names.add(entry.name)
+        except (PermissionError, OSError):
+            pass
 
-                # ── Manifest filename exact match ──────────────────────────
-                if entry.name in MANIFEST_FILENAMES or name_lower in MANIFEST_FILENAMES:
-                    # Quick size guard — don't even stat if we can avoid it.
-                    # os.DirEntry.stat() caches the result so this is cheap.
-                    try:
-                        st = entry.stat(follow_symlinks=False)
-                        if 0 < st.st_size <= MAX_MANIFEST_SIZE_BYTES:
-                            yield (entry.path, EntryKind.MANIFEST)
-                    except OSError:
-                        pass
-                    continue
+    # Determine which dep-vendor dirs to conditionally suppress based on
+    # co-located manifest files found in this directory.
+    conditional_skip = _build_conditional_skip_set(file_names)
 
-                # ── Binary extension match ─────────────────────────────────
-                ext = os.path.splitext(name_lower)[1]
-                if ext in BINARY_EXTENSIONS:
-                    try:
-                        st = entry.stat(follow_symlinks=False)
-                        if 0 < st.st_size <= MAX_BINARY_SIZE_BYTES:
-                            yield (entry.path, EntryKind.BINARY)
-                    except OSError:
-                        pass
+    # ── Yield matching files ───────────────────────────────────────────────
+    for entry in entries:
+        try:
+            if entry.is_symlink() or entry.is_dir(follow_symlinks=False):
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                continue
 
+            name_lower = entry.name.lower()
+
+            # ── Manifest filename exact match ──────────────────────────────
+            if entry.name in MANIFEST_FILENAMES or name_lower in MANIFEST_FILENAMES:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    if 0 < st.st_size <= MAX_MANIFEST_SIZE_BYTES:
+                        yield (entry.path, EntryKind.MANIFEST)
+                except OSError:
+                    pass
+                continue
+
+            # ── Binary extension match ─────────────────────────────────────
+            ext = os.path.splitext(name_lower)[1]
+            if ext in BINARY_EXTENSIONS:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    if 0 < st.st_size <= MAX_BINARY_SIZE_BYTES:
+                        yield (entry.path, EntryKind.BINARY)
+                except OSError:
+                    pass
+
+        except (PermissionError, OSError) as exc:
+            logger.debug("Entry error %s: %s", getattr(entry, "path", "?"), exc)
+        except Exception as exc:
+            logger.warning("Unexpected walk error at %s: %s", dirpath, exc)
+
+    # ── Recurse into subdirectories ────────────────────────────────────────
+    for entry, abs_path_lower in dir_entries:
+        try:
+            if _should_skip_dir(entry, abs_path_lower, conditional_skip):
+                logger.debug(
+                    "Skipping dir (%s): %s",
+                    "manifest-gated" if entry.name.lower() in conditional_skip else "always-skip",
+                    entry.path,
+                )
+                continue
+            yield from _walk_dir(entry.path)
         except (PermissionError, OSError) as exc:
             logger.debug("Entry error %s: %s", getattr(entry, "path", "?"), exc)
         except Exception as exc:
