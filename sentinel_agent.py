@@ -653,6 +653,12 @@ def _configure_logging():
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
 
+    # Silence noisy urllib3/socketio connectionpool retry warnings during long-polling
+    logging.getLogger("urllib3").setLevel(logging.ERROR)
+    logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
+    logging.getLogger("engineio").setLevel(logging.ERROR)
+    logging.getLogger("socketio").setLevel(logging.ERROR)
+
 
 _configure_logging()
 
@@ -707,6 +713,21 @@ class ZeroWatchClient:
         pins = _load_pins_for_url(BASE_API_URL)
         if pins:
             self.session.mount("https://", build_pinning_adapter(pins))
+
+        # Configure retry logic for HTTP/HTTPS
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[502, 503, 504],
+            allowed_methods=["GET", "POST"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        if not pins:
+            self.session.mount("https://", adapter)
 
         # Real-time WebSocket support
         self.sio = socketio.Client(
@@ -1851,6 +1872,14 @@ class ZeroWatchClient:
                 return asset_data
             
             # Fallback to cache on server error
+            cached = self._load_dashboard_cache()
+            if cached:
+                data = cached.get("data", {})
+                data["from_cache"] = True
+                return data
+            return None
+        except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+            logging.warning(f"[TRANSIENT] Asset info fetch lost connection (will retry next cycle): {e}")
             cached = self._load_dashboard_cache()
             if cached:
                 data = cached.get("data", {})
@@ -3882,6 +3911,62 @@ def _wait_for_enrollment(zw_client, base_dir):
     return bool(zw_client.jwt)
 
 
+def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
+    """
+    Runs the full post-enrollment scan sequence:
+      1. Layer 0 registry sync (fast, immediate)
+      2. Cache flush: push cached filesystem items as initial delta
+      3. Reset orchestrator cold-start flag so next periodic run = deep scan
+      4. Restart periodic scans (will immediately deep-scan)
+    Called after every re-enrollment event (unlink, auth failure, license renewal).
+    """
+    try:
+        # Step 1: Layer 0 inventory sync
+        if orchestrator is not None:
+            software = orchestrator.run_full_scan(include_filesystem=False)
+        else:
+            software = get_installed_software_registry()
+        hardware_data = get_detailed_hardware_profile()
+        zw_client.sync_full(software, hardware_data)
+        logging.info("[RE-ENROLL] Layer 0 sync complete.")
+
+        if orchestrator is not None:
+            # Step 2: Flush cached filesystem items as delta
+            try:
+                cached_items = orchestrator._cache.all_cached_items()
+                if cached_items:
+                    with orchestrator._snapshot_lock:
+                        existing_keys = set(orchestrator._last_snapshot.keys())
+                    new_additions = []
+                    for item in cached_items:
+                        if item.is_valid() and item.dedup_key() not in existing_keys:
+                            d = item.to_api_dict()
+                            d["change_type"] = "added"
+                            new_additions.append(d)
+                    if new_additions:
+                        zw_client.sync_delta(new_additions, [])
+                        logging.info("[RE-ENROLL] Flushed %d cached items.", len(new_additions))
+            except Exception as flush_err:
+                logging.warning("[RE-ENROLL] Cache flush failed (non-fatal): %s", flush_err)
+
+            # Step 3 & 4: Stop existing scan thread, reset cold-start, restart scans
+            orchestrator.stop_periodic_scans()
+            orchestrator.reset_for_reenrollment()
+
+            def _on_fs_delta(added_items, removed_items):
+                if (added_items or removed_items) and zw_client.jwt:
+                    zw_client.sync_delta(added_items, removed_items)
+
+            orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
+            logging.info("[RE-ENROLL] Periodic scans restarted — deep scan will run immediately.")
+
+    except Exception as e:
+        logging.error("[RE-ENROLL] Post-enrollment scan failed: %s", e)
+
+
+
+
+
 def _append_gui_log(base_dir, message):
     try:
         path = _state_path(base_dir, "gui_startup.log")
@@ -4736,6 +4821,18 @@ def main_agent():
                 pin_mismatch_backoff_idx += 1
                 continue
 
+            # --- Dynamic JWT Reloading for Re-enrollment ---
+            if not zw_client.jwt:
+                zw_client.jwt = zw_client._load_jwt()
+                if zw_client.jwt:
+                    logging.info("[MAIN] Token dynamically re-loaded from disk. Re-enrolling agent.")
+                    _run_post_enrollment_scan(zw_client, _orchestrator, base_dir)
+                    last_heartbeat = 0
+                    was_offline = False
+                else:
+                    # Skip active heartbeat checks until token is available
+                    continue
+
             # --- Connectivity-aware offline queue flush ---
             network_ok = check_backend_connectivity()
             if not network_ok:
@@ -4795,9 +4892,7 @@ def main_agent():
                     logging.info("[LICENSE] License inactive. Pausing telemetry and heartbeat until renewed.")
                 elif (not license_was_active) and license_is_active:
                     logging.info("[LICENSE] License renewed. Resuming heartbeat and data collection.")
-                    software = get_installed_software_registry()
-                    hardware_data = get_detailed_hardware_profile()
-                    zw_client.sync_full(software, hardware_data)
+                    _run_post_enrollment_scan(zw_client, _orchestrator, base_dir)
                     zw_client.log_event("LICENSE_RENEWED", {"status": "active"})
                 elif result is True:
                     logging.info("[HEARTBEAT] Success (status=%s).", zw_client.last_server_status)
@@ -4811,9 +4906,7 @@ def main_agent():
                     zw_client.clear_local_state()
                     if not _wait_for_enrollment(zw_client, base_dir):
                         break
-                    software = get_installed_software_registry()
-                    hardware_data = get_detailed_hardware_profile()
-                    zw_client.sync_full(software, hardware_data)
+                    _run_post_enrollment_scan(zw_client, _orchestrator, base_dir)
                     zw_client.log_event("REENROLLED", {"status": "active"})
                     last_heartbeat = 0
                     was_offline = False
@@ -4832,9 +4925,7 @@ def main_agent():
                             break
                         # Reset state after successful re-enrollment
                         zw_client.auth_failure_count = 0
-                        software = get_installed_software_registry()
-                        hardware_data = get_detailed_hardware_profile()
-                        zw_client.sync_full(software, hardware_data)
+                        _run_post_enrollment_scan(zw_client, _orchestrator, base_dir)
                         zw_client.log_event("REENROLLED", {"status": "active"})
                         last_heartbeat = 0
                         was_offline = False
@@ -6547,7 +6638,7 @@ def run_interactive():
             verify_res = zw_client.refresh_join_status_once() # This has a timeout
             
             # If server explicitly says we are NOT approved, wipe and show enrollment
-            if verify_res.get("status") in {"denied", "unknown", "unlinked"}:
+            if verify_res.get("status") in {"denied", "unlinked"}:
                 logging.info("Startup: Server rejected enrollment. Wiping local state.")
                 zw_client.clear_local_state()
                 is_enrolled_locally = False

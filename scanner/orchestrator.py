@@ -826,6 +826,24 @@ class ScanOrchestrator:
             self._deep_scan_interval / 3600,
         )
 
+    def stop_periodic_scans(self, timeout: float = 10.0) -> None:
+        """Signal the background scan thread to stop and wait for it to exit."""
+        if self._bg_thread and self._bg_thread.is_alive():
+            logger.info("Stopping periodic scan thread for re-enrollment reset.")
+            self._bg_stop.set()
+            self._bg_thread.join(timeout=timeout)
+        self._bg_thread = None
+        self._bg_stop.clear()
+
+    def reset_for_reenrollment(self) -> None:
+        """Clear cached scan timestamps so next start_periodic_scans() does a cold deep scan."""
+        try:
+            self._cache.delete_meta("last_fs_scan_at")
+            logger.info("Scan cache reset for re-enrollment: next scan will be a cold deep scan.")
+        except Exception as e:
+            logger.warning("Failed to reset scan cache for re-enrollment: %s", e)
+
+
     def _run_full_drive_scan(
         self,
         stop_event: Optional[threading.Event] = None,

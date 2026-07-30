@@ -189,6 +189,12 @@ class ScanCache:
         )
         self._conn().commit()
 
+    def delete_meta(self, key: str) -> None:
+        self._conn().execute(
+            "DELETE FROM full_scan_meta WHERE key=?", (key,)
+        )
+        self._conn().commit()
+
     # ── File cache lookup ──────────────────────────────────────────────────────
 
     def lookup(
