@@ -2,7 +2,7 @@
 common/scanner/interfaces.py
 ─────────────────────────────────────────────────────────────────────────────
 Abstract Base Classes (ABCs) for Endpoint Agent Scanner & Hardware components.
-Defines required interface contracts based on existing Windows implementations.
+Defines capability-focused interface contracts.
 """
 
 from __future__ import annotations
@@ -55,11 +55,11 @@ class BinaryInspector(ABC):
 
 
 class FilesystemWalker(ABC):
-    """Abstract interface for platform drive and filesystem traversal."""
+    """Abstract interface for platform storage and filesystem traversal."""
 
     @abstractmethod
-    def walk_drives(self, extra_dirs: Optional[List[str]] = None) -> Generator[Tuple[str, Any], None, None]:
-        """Traverse fixed local drives yielding (filepath, entry_kind) tuples."""
+    def walk_filesystem(self, extra_dirs: Optional[List[str]] = None) -> Generator[Tuple[str, Any], None, None]:
+        """Traverse system storage locations yielding (filepath, entry_kind) tuples."""
         ...
 
 
