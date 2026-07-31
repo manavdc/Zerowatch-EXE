@@ -428,7 +428,11 @@ class ScanOrchestrator:
 
         # ── Update snapshot for next delta computation ─────────────────────
         with self._snapshot_lock:
-            self._last_snapshot = {item.dedup_key(): item for item in unique}
+            if include_filesystem:
+                self._last_snapshot = {item.dedup_key(): item for item in unique}
+            else:
+                for item in unique:
+                    self._last_snapshot[item.dedup_key()] = item
 
         # ── Update cache meta ──────────────────────────────────────────────
         self._cache.set_meta("last_full_scan_at", self._utc_now_iso())
@@ -890,6 +894,8 @@ class ScanOrchestrator:
                     try:
                         st = os.stat(path)
                         if cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                            cached_items = self._cache.get_items_for_path(path)
+                            new_items.extend(cached_items)
                             continue
                     except OSError:
                         continue

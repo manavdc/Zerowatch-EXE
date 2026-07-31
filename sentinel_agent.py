@@ -1293,6 +1293,16 @@ class ZeroWatchClient:
     def clear_local_state(self):
         _append_gui_log(self.base_dir, "clear_local_state() called - DELETING ALL PERSISTENT FILES")
         """Reset local auth/state files so the endpoint behaves like fresh install."""
+        db_files = []
+        for sdir in [
+            os.path.join(os.environ.get("PROGRAMDATA", ""), "ZeroWatch", "state"),
+            os.path.join(self.base_dir, "state"),
+        ]:
+            if os.path.exists(sdir):
+                for f in os.listdir(sdir):
+                    if f.startswith("scan_cache.db"):
+                        db_files.append(os.path.join(sdir, f))
+
         files_to_remove = [
             self.token_file,
             self.join_state_file,
@@ -1301,7 +1311,7 @@ class ZeroWatchClient:
             _state_path(self.base_dir, "products.csv"),
             _state_path(self.base_dir, "sentinel_agent.log"),
             _state_path(self.base_dir, "dashboard_cache.dat"),
-        ]
+        ] + db_files
 
         for file_path in files_to_remove:
             try:
@@ -4688,28 +4698,23 @@ def main_agent():
     # The orchestrator is passed to the monitor thread so both share
     # the same SQLite cache and snapshot state.
     try:
-        from scanner import (
-            ScanOrchestrator,
-            WindowsSoftwareCollector,
-            WindowsBinaryInspector,
-            WindowsFilesystemWalker,
-        )
-        sw_collector = WindowsSoftwareCollector(get_installed_software_registry)
-        bin_inspector = WindowsBinaryInspector()
-        fs_walker = WindowsFilesystemWalker()
+        from scanner import ScanOrchestrator
+        from windows.platform import WindowsPlatform
+
+        win_platform = WindowsPlatform(get_installed_software_registry)
 
         _orchestrator = ScanOrchestrator(
             base_dir=base_dir,
             existing_registry_fn=get_installed_software_registry,
             agent_version=AGENT_VERSION,
-            software_collector=sw_collector,
-            binary_inspector=bin_inspector,
-            filesystem_walker=fs_walker,
+            software_collector=win_platform.software_collector,
+            binary_inspector=win_platform.binary_inspector,
+            filesystem_walker=win_platform.filesystem_walker,
         )
         # Warm the delta snapshot from the previous session's cache so
         # the first run_registry_delta() doesn't treat everything as new.
         _orchestrator.load_snapshot_from_cache()
-        logging.info("ScanOrchestrator initialized with injected Windows collectors (scan cache warmed).")
+        logging.info("ScanOrchestrator initialized with WindowsPlatform (scan cache warmed).")
     except Exception as _orch_err:
         logging.error(f"ScanOrchestrator init failed, falling back to registry only: {_orch_err}")
         _orchestrator = None
@@ -4754,6 +4759,8 @@ def main_agent():
                             d = item.to_api_dict()
                             d["change_type"] = "added"
                             new_additions.append(d)
+                            with _orchestrator._snapshot_lock:
+                                _orchestrator._last_snapshot[item.dedup_key()] = item
                     if new_additions:
                         logging.info(
                             "Flushing %d cached items to backend as initial delta.",
