@@ -4699,22 +4699,22 @@ def main_agent():
     # the same SQLite cache and snapshot state.
     try:
         from scanner import ScanOrchestrator
-        from windows.platform import WindowsPlatform
+        from platforms import PlatformFactory
 
-        win_platform = WindowsPlatform(get_installed_software_registry)
+        platform = PlatformFactory.create(get_installed_software_registry)
 
         _orchestrator = ScanOrchestrator(
             base_dir=base_dir,
             existing_registry_fn=get_installed_software_registry,
             agent_version=AGENT_VERSION,
-            software_collector=win_platform.software_collector,
-            binary_inspector=win_platform.binary_inspector,
-            filesystem_walker=win_platform.filesystem_walker,
+            software_collector=platform.software_collector,
+            binary_inspector=platform.binary_inspector,
+            filesystem_walker=platform.filesystem_walker,
         )
         # Warm the delta snapshot from the previous session's cache so
         # the first run_registry_delta() doesn't treat everything as new.
         _orchestrator.load_snapshot_from_cache()
-        logging.info("ScanOrchestrator initialized with WindowsPlatform (scan cache warmed).")
+        logging.info("ScanOrchestrator initialized via PlatformFactory (scan cache warmed).")
     except Exception as _orch_err:
         logging.error(f"ScanOrchestrator init failed, falling back to registry only: {_orch_err}")
         _orchestrator = None

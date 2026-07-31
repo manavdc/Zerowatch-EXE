@@ -10,7 +10,7 @@ import logging
 import os
 import subprocess
 import winreg
-from typing import List
+from typing import List, Optional
 
 from common.persistence.interfaces import PersistenceManager
 
@@ -80,10 +80,11 @@ def unregister_startup_registry() -> bool:
 class WindowsPersistenceManager(PersistenceManager):
     """Windows implementation of PersistenceManager interface."""
 
-    def register_persistence(self) -> bool:
-        return register_startup_registry(os.sys.executable)
+    def register_startup(self, exe_path: str, daemon_args: Optional[List[str]] = None) -> bool:
+        daemon_cmd = " ".join(daemon_args) if daemon_args else "--daemon"
+        return register_startup_registry(exe_path, daemon_cmd=daemon_cmd)
 
-    def unregister_persistence(self) -> bool:
+    def unregister_startup(self) -> bool:
         return unregister_startup_registry()
 
     def is_persistence_active(self) -> bool:

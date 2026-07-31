@@ -66,3 +66,29 @@ class WindowsHardwareCollector(HardwareCollector):
                 "capacity_bytes": ram_bytes,
             }
         ]
+
+    def get_detailed_hardware_profile(self) -> Dict[str, Any]:
+        ram_bytes = get_total_ram_bytes()
+        ram_kb = str(ram_bytes // 1024) if ram_bytes else "0"
+        return {
+            "cpu": "Central Processor",
+            "cpu_details": {
+                "cores": os.cpu_count(),
+                "logical_processors": os.cpu_count(),
+                "max_clock_mhz": "Unknown",
+                "manufacturer": "GenuineIntel/AuthenticAMD",
+                "processor_id": "ANONYMIZED",
+            },
+            "ram": {
+                "total_kb": ram_kb,
+                "total_gb": round((float(ram_kb) / (1024 * 1024)), 2) if ram_kb != "0" else 0.0,
+                "modules": [],
+                "module_count": 0,
+            },
+            "gpu": "Unknown",
+            "gpus": [],
+            "motherboard": {},
+            "bios": {},
+            "os_info": {},
+            "mac_addresses": ["ANONYMIZED"],
+        }
