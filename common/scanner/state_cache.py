@@ -90,7 +90,7 @@ class ScanCache:
 
         if needs_wipe:
             logger.info(
-                "Scan cache invalidated (schema=%s→%s agent=%s→%s). Wiping.",
+                "Scan cache invalidated (schema=%s->%s agent=%s->%s). Wiping.",
                 stored_schema, SCHEMA_VERSION,
                 stored_agent, self._agent_version,
             )

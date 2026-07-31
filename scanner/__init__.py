@@ -2,14 +2,16 @@
 scanner/__init__.py
 ─────────────────────────────────────────────────────────────────────────────
 Public surface for the scanner package.
-
-Only the orchestrator is exposed here.  Callers in sentinel_agent.py
-import ScanOrchestrator and nothing else; all inner modules are
-considered private implementation details.
+Exposes ScanOrchestrator, Windows adapters, and SoftwareItem models.
 """
 
 from .orchestrator import ScanOrchestrator
-from .models import (
+from .adapters import (
+    WindowsSoftwareCollector,
+    WindowsBinaryInspector,
+    WindowsFilesystemWalker,
+)
+from common.scanner.models import (
     SoftwareItem,
     SOURCE_REGISTRY, SOURCE_WINDOWS_STORE, SOURCE_DRIVER,
     SOURCE_PE_BINARY, SOURCE_PE_DLL, SOURCE_PE_SYS,
@@ -17,6 +19,9 @@ from .models import (
 
 __all__ = [
     "ScanOrchestrator",
+    "WindowsSoftwareCollector",
+    "WindowsBinaryInspector",
+    "WindowsFilesystemWalker",
     "SoftwareItem",
     "SOURCE_REGISTRY",
     "SOURCE_WINDOWS_STORE",

@@ -4688,16 +4688,28 @@ def main_agent():
     # The orchestrator is passed to the monitor thread so both share
     # the same SQLite cache and snapshot state.
     try:
-        from scanner import ScanOrchestrator
+        from scanner import (
+            ScanOrchestrator,
+            WindowsSoftwareCollector,
+            WindowsBinaryInspector,
+            WindowsFilesystemWalker,
+        )
+        sw_collector = WindowsSoftwareCollector(get_installed_software_registry)
+        bin_inspector = WindowsBinaryInspector()
+        fs_walker = WindowsFilesystemWalker()
+
         _orchestrator = ScanOrchestrator(
             base_dir=base_dir,
             existing_registry_fn=get_installed_software_registry,
             agent_version=AGENT_VERSION,
+            software_collector=sw_collector,
+            binary_inspector=bin_inspector,
+            filesystem_walker=fs_walker,
         )
         # Warm the delta snapshot from the previous session's cache so
         # the first run_registry_delta() doesn't treat everything as new.
         _orchestrator.load_snapshot_from_cache()
-        logging.info("ScanOrchestrator initialized (scan cache warmed).")
+        logging.info("ScanOrchestrator initialized with injected Windows collectors (scan cache warmed).")
     except Exception as _orch_err:
         logging.error(f"ScanOrchestrator init failed, falling back to registry only: {_orch_err}")
         _orchestrator = None

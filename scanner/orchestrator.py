@@ -87,21 +87,18 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .fs_walker import (
     EntryKind,
-    walk_drives,
     walk_specified_dirs,
     get_priority_scan_dirs,
     BINARY_EXTENSIONS,
 )
-from .layer0_registry import (
-    get_software_from_registry,
-    get_windows_store_apps,
-    get_driver_inventory,
-    get_os_software_item,
-)
-from .layer1_paths import inspect_pe_file
 from .layer2_manifests import parse_manifest_file
 from .models import SoftwareItem, SOURCE_REGISTRY
 from .state_cache import ScanCache
+from common.scanner.interfaces import (
+    SoftwareCollector,
+    BinaryInspector,
+    FilesystemWalker,
+)
 
 logger = logging.getLogger("scanner.orchestrator")
 
@@ -145,6 +142,7 @@ _MANIFEST_BATCH_SIZE = 20   # manifests per worker task
 class ScanOrchestrator:
     """
     Central coordinator for all scanner layers.
+    Receives scanner implementations via constructor injection.
 
     Parameters
     ──────────
@@ -152,44 +150,73 @@ class ScanOrchestrator:
         The agent's base directory (where state files are stored).
 
     existing_registry_fn
-        A callable reference to sentinel_agent.get_installed_software_registry().
-        This avoids circular imports while reusing the exact existing logic.
+        # TODO: Remove after Windows migration completes.
+        Legacy registry callable for backward compatibility.
 
     agent_version
         Used to invalidate the cache when the agent is updated.
 
     max_workers
-        Thread pool size for Layer 1/2 I/O workers.  Default 4.
+        Thread pool size for Layer 1/2 I/O workers. Default 4.
 
     extra_scan_dirs
         Optional additional directories to include in every filesystem scan.
-        Useful for non-standard install roots or team-configured paths.
 
     fs_scan_interval_hours
-        How often the priority-path incremental scan runs.  Default 4 hours.
-        Covers well-known software locations on all drives.
+        How often the priority-path incremental scan runs. Default 4 hours.
 
     deep_scan_interval_hours
-        How often the full drive walk runs.  Default 24 hours.
-        Covers non-standard install paths missed by the priority scan.
-        Set to 0 to disable the deep scan entirely.
+        How often the full drive walk runs. Default 24 hours.
+
+    software_collector
+        Injected implementation of SoftwareCollector interface.
+
+    binary_inspector
+        Injected implementation of BinaryInspector interface.
+
+    filesystem_walker
+        Injected implementation of FilesystemWalker interface.
     """
 
     def __init__(
         self,
         base_dir: str,
-        existing_registry_fn: Callable[[], List[dict]],
+        existing_registry_fn: Optional[Callable[[], List[dict]]] = None,  # TODO: Remove after Windows migration completes.
         agent_version: str = "unknown",
         max_workers: int = 4,
         extra_scan_dirs: Optional[List[str]] = None,
         fs_scan_interval_hours: float = 4.0,
         deep_scan_interval_hours: float = 24.0,
+        software_collector: Optional[SoftwareCollector] = None,
+        binary_inspector: Optional[BinaryInspector] = None,
+        filesystem_walker: Optional[FilesystemWalker] = None,
     ):
         self._base_dir = base_dir
-        self._registry_fn = existing_registry_fn
+        self._registry_fn = existing_registry_fn  # TODO: Remove after Windows migration completes.
         self._agent_version = agent_version
         self._max_workers = max_workers
         self._extra_dirs = extra_scan_dirs or []
+
+        # Fallback adapter resolution for legacy constructor invocations
+        if software_collector is None or binary_inspector is None or filesystem_walker is None:
+            from .adapters import create_default_windows_collectors
+            reg_fn = existing_registry_fn or (lambda: [])
+            def_sw, def_bin, def_fs = create_default_windows_collectors(reg_fn)
+            software_collector = software_collector or def_sw
+            binary_inspector = binary_inspector or def_bin
+            filesystem_walker = filesystem_walker or def_fs
+
+        # Interface validation against ABCs
+        if not isinstance(software_collector, SoftwareCollector):
+            raise TypeError(f"software_collector must implement SoftwareCollector, got {type(software_collector).__name__}")
+        if not isinstance(binary_inspector, BinaryInspector):
+            raise TypeError(f"binary_inspector must implement BinaryInspector, got {type(binary_inspector).__name__}")
+        if not isinstance(filesystem_walker, FilesystemWalker):
+            raise TypeError(f"filesystem_walker must implement FilesystemWalker, got {type(filesystem_walker).__name__}")
+
+        self._software_collector = software_collector
+        self._binary_inspector = binary_inspector
+        self._filesystem_walker = filesystem_walker
 
         # ── Scan interval configuration ────────────────────────────────────
         self._fs_scan_interval   = fs_scan_interval_hours * 3600
@@ -268,37 +295,10 @@ class ScanOrchestrator:
 
     def _run_layer0(self) -> List[SoftwareItem]:
         """
-        Run all Layer 0 scanners synchronously.
+        Run all Layer 0 scanners synchronously via the injected software_collector interface.
         Returns combined list of SoftwareItems.
         """
-        items: List[SoftwareItem] = []
-
-        # 1. Installed software (existing registry scanner)
-        try:
-            items.extend(get_software_from_registry(self._registry_fn))
-        except Exception as exc:
-            logger.error("Layer 0 registry scan failed: %s", exc)
-
-        # 2. Windows Store apps
-        try:
-            items.extend(get_windows_store_apps())
-        except Exception as exc:
-            logger.warning("Layer 0 Store scan failed: %s", exc)
-
-        # 3. OS version
-        try:
-            os_item = get_os_software_item()
-            if os_item:
-                items.append(os_item)
-        except Exception as exc:
-            logger.warning("Layer 0 OS version failed: %s", exc)
-
-        # 4. Drivers
-        try:
-            items.extend(get_driver_inventory())
-        except Exception as exc:
-            logger.warning("Layer 0 driver scan failed: %s", exc)
-
+        items = self._software_collector.collect_software()
         logger.info("Layer 0 complete: %d items", len(items))
         return items
 
@@ -338,7 +338,7 @@ class ScanOrchestrator:
                     binary_batch.clear()
                     futures.append(
                         pool.submit(
-                            _process_binary_batch, batch_copy, self._cache
+                            _process_binary_batch, batch_copy, self._cache, self._binary_inspector
                         )
                     )
 
@@ -352,7 +352,7 @@ class ScanOrchestrator:
                         )
                     )
 
-            for path, kind in walk_drives(extra_dirs=self._extra_dirs):
+            for path, kind in self._filesystem_walker.walk_filesystem(extra_dirs=self._extra_dirs):
                 if stop_event and stop_event.is_set():
                     logger.info("Filesystem scan aborted by stop event.")
                     break
@@ -588,7 +588,7 @@ class ScanOrchestrator:
                     batch = list(binary_batch)
                     binary_batch.clear()
                     futures.append(
-                        pool.submit(_process_binary_batch, batch, self._cache)
+                        pool.submit(_process_binary_batch, batch, self._cache, self._binary_inspector)
                     )
 
             def _flush_manifests() -> None:
@@ -870,7 +870,7 @@ class ScanOrchestrator:
                     batch = list(binary_batch)
                     binary_batch.clear()
                     futures.append(
-                        pool.submit(_process_binary_batch, batch, self._cache)
+                        pool.submit(_process_binary_batch, batch, self._cache, self._binary_inspector)
                     )
 
             def _flush_manifests() -> None:
@@ -881,7 +881,7 @@ class ScanOrchestrator:
                         pool.submit(_process_manifest_batch, batch, self._cache)
                     )
 
-            for path, kind in walk_drives(extra_dirs=self._extra_dirs):
+            for path, kind in self._filesystem_walker.walk_filesystem(extra_dirs=self._extra_dirs):
                 if stop_event and stop_event.is_set():
                     break
                 seen_paths.add(path)
@@ -958,12 +958,16 @@ class ScanOrchestrator:
 # ── Thread pool worker functions (module-level for picklability) ──────────────
 
 def _process_binary_batch(
-    paths: List[str], cache: ScanCache
+    paths: List[str], cache: ScanCache, inspector: Optional[BinaryInspector] = None
 ) -> List[SoftwareItem]:
     items: List[SoftwareItem] = []
     for path in paths:
         try:
-            items.extend(inspect_pe_file(path, cache=cache))
+            if inspector is not None:
+                items.extend(inspector.inspect_binary(path, cache=cache))
+            else:
+                from .layer1_paths import inspect_pe_file
+                items.extend(inspect_pe_file(path, cache=cache))
         except Exception as exc:
             logger.debug("Binary error %s: %s", path, exc)
     return items
