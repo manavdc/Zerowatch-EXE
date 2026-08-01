@@ -1087,6 +1087,17 @@ class ZeroWatchClient:
         self.join_state = None
         self.join_state_tampered = False
 
+    def cancel_join_request(self):
+        """Notifies the backend to remove pending join requests for this device, then clears local state."""
+        try:
+            url = f"{resolve_api_base_url()}/api/agent/join-request/cancel"
+            payload = {"device_id": self.device_id}
+            self.session.post(url, json=payload, timeout=5)
+            logging.info("Sent cancel join request signal to backend")
+        except Exception as e:
+            logging.warning(f"Failed sending cancel join request to backend: {e}")
+        self.clear_join_state()
+
     def has_pending_join(self):
         current = self.join_state if isinstance(self.join_state, dict) else self._load_join_state()
         self.join_state = current
@@ -5419,7 +5430,7 @@ class EnrollmentFrame(tk.Frame):
         self.status_label_pending.pack(pady=(30, 0))
         
         def on_cancel():
-            self.zw_client.clear_join_state() # clear state
+            self.zw_client.cancel_join_request() # notify server & clear local state
             self.show_screen("TEAM_CODE")
             
         cancel_btn = tk.Button(frame, text="Cancel Request", bg=self.c_card_bg, fg=self.c_gray, font=self.f_normal, bd=0, activebackground=self.c_card_bg, activeforeground=self.c_white, cursor="hand2", command=on_cancel)
