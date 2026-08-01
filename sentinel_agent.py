@@ -1088,15 +1088,19 @@ class ZeroWatchClient:
         self.join_state_tampered = False
 
     def cancel_join_request(self):
-        """Notifies the backend to remove pending join requests for this device, then clears local state."""
-        try:
-            url = f"{resolve_api_base_url()}/api/agent/join-request/cancel"
-            payload = {"device_id": self.device_id}
-            self.session.post(url, json=payload, timeout=5)
-            logging.info("Sent cancel join request signal to backend")
-        except Exception as e:
-            logging.warning(f"Failed sending cancel join request to backend: {e}")
+        """Notifies the backend asynchronously to remove pending requests, and clears local state immediately."""
         self.clear_join_state()
+
+        def _bg_cancel():
+            try:
+                url = f"{resolve_api_base_url()}/api/agent/join-request/cancel"
+                payload = {"device_id": self.device_id}
+                self.session.post(url, json=payload, timeout=5)
+                logging.info("Sent cancel join request signal to backend asynchronously")
+            except Exception as e:
+                logging.warning(f"Failed sending cancel join request to backend in background: {e}")
+
+        threading.Thread(target=_bg_cancel, daemon=True).start()
 
     def has_pending_join(self):
         current = self.join_state if isinstance(self.join_state, dict) else self._load_join_state()
