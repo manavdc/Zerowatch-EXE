@@ -39,6 +39,16 @@ SOURCE_COMPOSER          = "composer"
 SOURCE_JAR               = "jar_manifest"
 SOURCE_ZIP_ARCHIVE       = "zip_archive"
 
+# ── Linux source tags ─────────────────────────────────────────────────────────
+SOURCE_DEB_PACKAGE       = "deb_package"
+SOURCE_RPM_PACKAGE       = "rpm_package"
+SOURCE_PACMAN_PKG        = "pacman_package"
+SOURCE_SNAP_APP          = "snap_app"
+SOURCE_FLATPAK_APP       = "flatpak_app"
+SOURCE_KERNEL_MODULE     = "kernel_module"
+SOURCE_ELF_BINARY        = "elf_binary"
+SOURCE_ELF_LIB           = "elf_lib"
+
 
 # ── Item dataclass ────────────────────────────────────────────────────────────
 

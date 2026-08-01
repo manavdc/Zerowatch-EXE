@@ -392,6 +392,7 @@ class ScanOrchestrator:
     def run_full_scan(
         self,
         include_filesystem: bool = True,
+        stop_event: Optional[threading.Event] = None,
     ) -> List[dict]:
         """
         Run all layers and return the unified inventory as a list of dicts
@@ -402,6 +403,9 @@ class ScanOrchestrator:
         include_filesystem
             If False, runs only Layer 0 (registry-based scans).  Used
             for the initial startup sync so the first heartbeat is fast.
+
+        stop_event
+            Optional shutdown signal to abort the filesystem scan.
 
         Returns
         ───────
@@ -421,10 +425,11 @@ class ScanOrchestrator:
 
         # ── Layers 1 + 2 (filesystem, threaded) ───────────────────────────
         if include_filesystem:
-            fs_new, _fs_removed = self._run_full_drive_scan()
+            fs_new, _fs_removed = self._run_full_drive_scan(stop_event=stop_event)
             items.extend(fs_new)
             # Mark filesystem scan as completed in cache
-            self._cache.set_meta("last_fs_scan_at", self._utc_now_iso())
+            if not (stop_event and stop_event.is_set()):
+                self._cache.set_meta("last_fs_scan_at", self._utc_now_iso())
         else:
             # On warm start, merge cached filesystem items with Layer 0 registry items
             # so the full sync payload is complete and doesn't wipe them from the server.

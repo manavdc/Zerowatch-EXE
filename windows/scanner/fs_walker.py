@@ -15,6 +15,14 @@ import sys
 from enum import Enum, auto
 from typing import Generator, FrozenSet, List, Set, Tuple
 
+from common.scanner.fs_constants import (
+    MANIFEST_FILENAMES,
+    CONDITIONAL_SKIP_GROUPS,
+    MAX_BINARY_SIZE_BYTES,
+    MAX_MANIFEST_SIZE_BYTES,
+    SKIP_DIR_NAMES_COMMON,
+)
+
 logger = logging.getLogger("windows.scanner.fs_walker")
 
 
@@ -25,7 +33,8 @@ class EntryKind(Enum):
 
 # ── Skip rules ────────────────────────────────────────────────────────────────
 
-SKIP_DIR_NAMES: FrozenSet[str] = frozenset({
+# Windows-specific skip directories (merged with common ones at runtime)
+_WIN_SKIP_DIR_NAMES_EXTRA: FrozenSet[str] = frozenset({
     "system32", "syswow64", "winsxs",
     "softwareDistribution",
     "catroot", "catroot2",
@@ -38,77 +47,18 @@ SKIP_DIR_NAMES: FrozenSet[str] = frozenset({
     "system volume information",
     "$windows.~bt", "$windows.~ws",
     "drivers",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".eggs",
-    ".tox",
-    ".yarn",
-    ".gradle",
-    ".cargo",
-    ".rustup",
-    "cmake-build-debug",
-    "cmake-build-release",
-    ".git", ".svn", ".hg", ".bzr",
-    ".idea", ".vscode",
     ".vs",
     "ipch",
-    ".sonarwork",
-    "cache", "caches",
     "inetcache", "temporary internet files",
     "thumbnails",
     "packagescache",
-    "crashreports",
-    "logs",
-    "docker",
-    ".docker",
     "containers",
     "virtual machines",
     "hyper-v",
     "onedrivetemp",
 })
 
-_ConditionalSkipGroup = Tuple[FrozenSet[str], FrozenSet[str]]
-
-CONDITIONAL_SKIP_GROUPS: Tuple[_ConditionalSkipGroup, ...] = (
-    (
-        frozenset({
-            "package.json", "package-lock.json",
-            "yarn.lock", "pnpm-lock.yaml",
-        }),
-        frozenset({"node_modules"}),
-    ),
-    (
-        frozenset({
-            "requirements.txt", "requirements-dev.txt",
-            "requirements-prod.txt", "requirements-test.txt",
-            "Pipfile", "Pipfile.lock",
-            "pyproject.toml", "setup.py", "setup.cfg",
-            "poetry.lock", "pdm.lock", "uv.lock",
-        }),
-        frozenset({"venv", ".venv", "env", ".env"}),
-    ),
-    (
-        frozenset({
-            "pom.xml", "build.gradle", "build.gradle.kts",
-            "settings.gradle", "settings.gradle.kts",
-        }),
-        frozenset({"target", "out", "build", "dist"}),
-    ),
-    (
-        frozenset({"composer.json", "composer.lock"}),
-        frozenset({"vendor"}),
-    ),
-    (
-        frozenset({"Cargo.toml", "Cargo.lock"}),
-        frozenset({"target"}),
-    ),
-    (
-        frozenset({"go.mod", "go.sum"}),
-        frozenset({"vendor"}),
-    ),
-)
+SKIP_DIR_NAMES: FrozenSet[str] = SKIP_DIR_NAMES_COMMON | _WIN_SKIP_DIR_NAMES_EXTRA
 
 _WINDIR = (os.environ.get("SystemRoot") or r"C:\Windows").lower()
 _SYSTEM32 = os.path.join(_WINDIR, "system32")
@@ -138,50 +88,8 @@ SKIP_PATH_PREFIXES: Tuple[str, ...] = (
 )
 
 
-MANIFEST_FILENAMES: FrozenSet[str] = frozenset({
-    "package.json",
-    "package-lock.json",
-    "yarn.lock",
-    "pnpm-lock.yaml",
-    ".yarn-integrity",
-    "requirements.txt",
-    "requirements-dev.txt",
-    "requirements-prod.txt",
-    "requirements-test.txt",
-    "Pipfile",
-    "Pipfile.lock",
-    "pyproject.toml",
-    "setup.py",
-    "setup.cfg",
-    "poetry.lock",
-    "pdm.lock",
-    "uv.lock",
-    "pom.xml",
-    "build.gradle",
-    "build.gradle.kts",
-    "settings.gradle",
-    "settings.gradle.kts",
-    "packages.config",
-    "project.json",
-    "project.assets.json",
-    "nuget.config",
-    "go.mod",
-    "go.sum",
-    "Cargo.toml",
-    "Cargo.lock",
-    "Gemfile",
-    "Gemfile.lock",
-    "composer.json",
-    "composer.lock",
-    "Podfile.lock",
-    "Package.swift",
-    "Package.resolved",
-    "environment.yml",
-    "environment.yaml",
-    "conda-lock.yml",
-    "apk.installed",
-    "dpkg.installed",
-})
+# Imported from common.scanner.fs_constants:
+# MANIFEST_FILENAMES, CONDITIONAL_SKIP_GROUPS, MAX_BINARY_SIZE_BYTES, MAX_MANIFEST_SIZE_BYTES
 
 BINARY_EXTENSIONS: FrozenSet[str] = frozenset({
     ".exe", ".dll", ".sys", ".ocx", ".cpl", ".scr",
@@ -191,9 +99,6 @@ BINARY_EXTENSIONS: FrozenSet[str] = frozenset({
     ".whl",
     ".apk",
 })
-
-MAX_BINARY_SIZE_BYTES = 200 * 1024 * 1024
-MAX_MANIFEST_SIZE_BYTES = 10 * 1024 * 1024
 
 
 DRIVE_REMOVABLE = 2

@@ -41,12 +41,10 @@ class PlatformFactory:
             return WindowsPlatform(reg_fn)
 
         elif plat.startswith("linux"):
-            # Extension point: LinuxPlatform implementation (Phase 5)
-            logger.error("LinuxPlatform selected but not yet implemented.")
-            raise NotImplementedError(
-                "Linux platform support is scheduled for Phase 5. "
-                "LinuxPlatform implementation pending."
-            )
+            from linux.platform import LinuxPlatform
+            reg_fn = existing_registry_fn or (lambda: [])
+            logger.info("Initializing LinuxPlatform for linux host...")
+            return LinuxPlatform(reg_fn)
 
         elif plat == "darwin":
             # Extension point: MacPlatform implementation (Phase 5)

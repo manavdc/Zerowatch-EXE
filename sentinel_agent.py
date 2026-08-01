@@ -1,5 +1,4 @@
 import requests
-import winreg
 import uuid
 import subprocess
 import json
@@ -13,7 +12,6 @@ import threading
 import hashlib
 import hmac
 import ctypes
-import ctypes.wintypes as wt
 import signal
 import logging
 import re
@@ -21,6 +19,14 @@ import socket
 import socketio
 from urllib.parse import urlparse
 import cert_pinning
+
+if sys.platform == "win32":
+    import winreg
+    import ctypes.wintypes as wt
+else:
+    winreg = None
+    wt = None
+
 from cert_pinning import (
     PinError,
     SPKIPinningAdapter,
@@ -42,6 +48,10 @@ def _global_crash_handler(exc_type, exc_value, exc_traceback):
         return
     
     msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    
+    # Print to stderr for visibility in CLI/daemon environments
+    sys.stderr.write(msg)
+    sys.stderr.flush()
     
     # Try to write to Desktop
     try:
@@ -204,9 +214,14 @@ def _setup_tcl_tk_paths():
 _setup_tcl_tk_paths()
 
 
-import tkinter as tk
-from tkinter import font as tkfont
-from tkinter import ttk
+try:
+    import tkinter as tk
+    from tkinter import font as tkfont
+    from tkinter import ttk
+except ImportError:
+    tk = None
+    tkfont = None
+    ttk = None
 
 import math
 
@@ -513,17 +528,15 @@ def _color(text, color):
     return f"{ANSI_COLORS.get(color, '')}{text}{ANSI_COLORS['reset']}"
 
 # --- DPAPI Cryptography ---
-def encrypt_data(data_bytes):
-    # Encrypts data using Windows DPAPI (LocalMachine for cross-user persistence)
-    flags = 0x4  # CRYPTPROTECT_LOCAL_MACHINE
+_in_crypto = threading.local()
 
+def _windows_dpapi_encrypt(data_bytes):
+    flags = 0x4  # CRYPTPROTECT_LOCAL_MACHINE
     class DATA_BLOB(ctypes.Structure):
         _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
-
     in_buffer = ctypes.create_string_buffer(data_bytes)
     in_blob = DATA_BLOB(len(data_bytes), ctypes.cast(in_buffer, ctypes.POINTER(ctypes.c_ubyte)))
     out_blob = DATA_BLOB()
-
     try:
         ok = ctypes.windll.crypt32.CryptProtectData(
             ctypes.byref(in_blob),
@@ -536,7 +549,6 @@ def encrypt_data(data_bytes):
         )
         if not ok:
             return None
-
         try:
             protected = ctypes.string_at(out_blob.pbData, out_blob.cbData)
             return protected
@@ -546,14 +558,12 @@ def encrypt_data(data_bytes):
         logging.error(f"DPAPI Encryption failed: {e}")
         return None
 
-def decrypt_data(encrypted_bytes):
+def _windows_dpapi_decrypt(encrypted_bytes):
     class DATA_BLOB(ctypes.Structure):
         _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
-
     in_buffer = ctypes.create_string_buffer(encrypted_bytes)
     in_blob = DATA_BLOB(len(encrypted_bytes), ctypes.cast(in_buffer, ctypes.POINTER(ctypes.c_ubyte)))
     out_blob = DATA_BLOB()
-
     try:
         ok = ctypes.windll.crypt32.CryptUnprotectData(
             ctypes.byref(in_blob),
@@ -566,7 +576,6 @@ def decrypt_data(encrypted_bytes):
         )
         if not ok:
             return None
-
         try:
             return ctypes.string_at(out_blob.pbData, out_blob.cbData)
         finally:
@@ -574,6 +583,42 @@ def decrypt_data(encrypted_bytes):
     except Exception as e:
         logging.error(f"DPAPI Decryption failed: {e}")
         return None
+
+def encrypt_data(data_bytes):
+    if sys.platform == "win32":
+        return _windows_dpapi_encrypt(data_bytes)
+
+    if getattr(_in_crypto, "active", False):
+        return None
+    _in_crypto.active = True
+    try:
+        from platforms import PlatformFactory
+        plat = PlatformFactory.create()
+        if plat and plat.secure_store:
+            return plat.secure_store.encrypt(data_bytes)
+    except Exception:
+        pass
+    finally:
+        _in_crypto.active = False
+    return None
+
+def decrypt_data(encrypted_bytes):
+    if sys.platform == "win32":
+        return _windows_dpapi_decrypt(encrypted_bytes)
+
+    if getattr(_in_crypto, "active", False):
+        return None
+    _in_crypto.active = True
+    try:
+        from platforms import PlatformFactory
+        plat = PlatformFactory.create()
+        if plat and plat.secure_store:
+            return plat.secure_store.decrypt(encrypted_bytes)
+    except Exception:
+        pass
+    finally:
+        _in_crypto.active = False
+    return None
 # --------------------------
 
 
@@ -584,7 +629,7 @@ class EncryptedFileHandler(logging.Handler):
         # PID-suffixed temp file so the GUI process and daemon process never
         # collide on the same .tmp file when both write to the same log path.
         self._temp_path = f"{self.filepath}.{os.getpid()}.tmp"
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
 
     def emit(self, record):
@@ -622,17 +667,18 @@ class EncryptedFileHandler(logging.Handler):
                 except OSError:
                     # Another process is mid-write; skip this record rather than crash.
                     return
-                try:
-                    subprocess.run(
-                        ["attrib", "+H", "+S", self.filepath],
-                        capture_output=True,
-                        text=True,
-                        timeout=3,
-                        startupinfo=_windows_hidden_startupinfo(),
-                        creationflags=subprocess.CREATE_NO_WINDOW,
-                    )
-                except Exception:
-                    pass
+                if sys.platform == "win32":
+                    try:
+                        subprocess.run(
+                            ["attrib", "+H", "+S", self.filepath],
+                            capture_output=True,
+                            text=True,
+                            timeout=3,
+                            startupinfo=_windows_hidden_startupinfo(),
+                            creationflags=subprocess.CREATE_NO_WINDOW,
+                        )
+                    except Exception:
+                        pass
         except Exception:
             self.handleError(record)
 
@@ -1631,13 +1677,23 @@ class ZeroWatchClient:
             "hardware": hardware_info
         }
         try:
-            formatted_software = [{
-                "name": item.get("name"),
-                "version": item.get("version"),
-                "vendor": item.get("vendor"),
-                "install_date": item.get("install_date"),
-                "source": item.get("source")
-            } for item in software_list]
+            formatted_software = []
+            for item in (software_list or []):
+                if hasattr(item, "to_dict"):
+                    d = item.to_dict()
+                elif isinstance(item, dict):
+                    d = item
+                elif hasattr(item, "__dict__"):
+                    d = item.__dict__
+                else:
+                    d = {}
+                formatted_software.append({
+                    "name": d.get("name"),
+                    "version": d.get("version"),
+                    "vendor": d.get("vendor"),
+                    "install_date": d.get("install_date"),
+                    "source": d.get("source")
+                })
 
             payload["inventory"] = formatted_software
             resp = self.session.post(f"{AGENT_API_URL}/sync/full", headers=self._auth_headers(), json=payload, timeout=30)
@@ -1662,17 +1718,27 @@ class ZeroWatchClient:
 
     def sync_delta(self, added, removed, added_hw=None, removed_hw=None, hardware_snapshot=None):
         if not self.jwt or not self.license_active: return False
+
+        def _to_dict(it):
+            if hasattr(it, "to_dict"): return it.to_dict()
+            if isinstance(it, dict): return it
+            if hasattr(it, "__dict__"): return it.__dict__
+            return {}
+
+        added_dicts = [_to_dict(x) for x in (added or [])]
+        removed_dicts = [_to_dict(x) for x in (removed or [])]
+
         payload = {
             "device_id": self.device_id,
             "username": self.operator_username,
-            "added": added,
-            "removed": removed
+            "added": added_dicts,
+            "removed": removed_dicts
         }
         try:
             if added_hw:
-                payload["added"] = added + [{"source": "hardware", **h} for h in added_hw]
+                payload["added"] = added_dicts + [{"source": "hardware", **h} for h in added_hw]
             if removed_hw:
-                payload["removed"] = removed + [{"source": "hardware", **h} for h in removed_hw]
+                payload["removed"] = removed_dicts + [{"source": "hardware", **h} for h in removed_hw]
 
             if hardware_snapshot and isinstance(hardware_snapshot, dict):
                 payload["hardware_snapshot"] = hardware_snapshot
@@ -2033,9 +2099,23 @@ def get_exe_path():
 
 def enforce_single_instance():
     """
-    Claims a named Windows kernel mutex. If one already exists from another 
+    Claims a named Windows kernel mutex or POSIX lock file. If one already exists from another 
     running instance, this process exits silently.
     """
+    if sys.platform != "win32":
+        import fcntl
+        lock_path = os.path.join(get_base_dir(), "state", "daemon.lock")
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        try:
+            f = open(lock_path, "w")
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            f.write(str(os.getpid()))
+            f.flush()
+            return f
+        except (BlockingIOError, PermissionError):
+            logging.info("Another instance is already running. Exiting silently.")
+            sys.exit(0)
+
     mutex = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
     last_err = ctypes.windll.kernel32.GetLastError()
     if last_err == 183:  # ERROR_ALREADY_EXISTS
@@ -2048,8 +2128,12 @@ def enforce_single_instance():
 # MODULE 2: FINGERPRINT — Device Identity & UID Generation
 # ============================================================================
 
-def _read_reg_key(key_path, value_name, hive=winreg.HKEY_LOCAL_MACHINE):
+def _read_reg_key(key_path, value_name, hive=None):
     """Safely reads a string registry value. Spawns zero subprocesses."""
+    if winreg is None:
+        return None
+    if hive is None:
+        hive = winreg.HKEY_LOCAL_MACHINE
     try:
         key = winreg.OpenKey(hive, key_path, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
         value, _ = winreg.QueryValueEx(key, value_name)
@@ -2058,8 +2142,12 @@ def _read_reg_key(key_path, value_name, hive=winreg.HKEY_LOCAL_MACHINE):
     except Exception:
         return None
 
-def _read_reg_subkeys(key_path, hive=winreg.HKEY_LOCAL_MACHINE):
+def _read_reg_subkeys(key_path, hive=None):
     """Enumerates subkeys of a registry key. Spawns zero subprocesses."""
+    if winreg is None:
+        return []
+    if hive is None:
+        hive = winreg.HKEY_LOCAL_MACHINE
     subkeys = []
     try:
         key = winreg.OpenKey(hive, key_path, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
@@ -2261,6 +2349,32 @@ def collect_fingerprint():
     Collects a comprehensive device fingerprint from multiple hardware layers.
     Returns a dict with all hardware identifiers and a deterministic computed Device ID.
     """
+    if sys.platform != "win32":
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            fp = plat.hardware_collector.collect_fingerprint()
+            if isinstance(fp, dict) and "device_id" not in fp:
+                fp["device_id"] = plat.hardware_collector.generate_device_id(fp)
+            return fp
+        except Exception as exc:
+            logging.error(f"WSL/Linux fingerprint collection failed: {exc}")
+            return {
+                "bios_serial":        "UNAVAILABLE",
+                "bios_uuid":          "UNAVAILABLE",
+                "motherboard_serial": "UNAVAILABLE",
+                "motherboard_product": "UNAVAILABLE",
+                "cpu_id":             "UNAVAILABLE",
+                "os_serial":          "UNAVAILABLE",
+                "machine_guid":       "UNAVAILABLE",
+                "mac_address":        get_mac_address(),
+                "mac_addresses":      [get_mac_address()],
+                "disk_serial":        "UNAVAILABLE",
+                "collected_at":       datetime.datetime.now().isoformat(),
+                "agent_version":      AGENT_VERSION,
+                "device_id":          "0fea5a130097afd6ed65c3b02bfeac0104fe92fbfa5a0d596f7572d4c5a18ff1", # Fallback device id
+            }
+
     import wmi
     try:
         c = wmi.WMI()
@@ -2406,8 +2520,16 @@ def _parse_registry_install_date(raw_value):
 
 def get_installed_software_registry():
     """
-    Primary software scanner: reads the Windows Registry Uninstall keys.
+    Primary software scanner: reads the Windows Registry Uninstall keys or Linux package databases.
     """
+    if sys.platform != "win32":
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            return plat.software_collector.collect_software()
+        except Exception:
+            return []
+
     results = []
     registry_paths = [
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -2463,6 +2585,14 @@ def get_hardware_inventory():
     Each item is returned as a flat dict row for CSV export (legacy format).
     Spawns zero subprocesses and anonymizes serial numbers.
     """
+    if sys.platform != "win32":
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            return plat.hardware_collector.get_hardware_inventory()
+        except Exception:
+            return []
+
     results = []
 
     # 1. CPU
@@ -2631,6 +2761,14 @@ def get_detailed_hardware_profile():
     Builds a structured hardware profile object matching the backend schema.
     Uses registry and ctypes to prevent subprocess spawns, and anonymizes serial numbers.
     """
+    if sys.platform != "win32":
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            return plat.hardware_collector.get_detailed_hardware_profile()
+        except Exception:
+            return {}
+
     ram_total_bytes = get_total_ram_bytes()
     ram_total_kb = str(ram_total_bytes // 1024) if ram_total_bytes else "0"
 
@@ -2826,6 +2964,16 @@ def register_startup_registry():
 
     Tries HKLM first (requires admin) and falls back to HKCU when not elevated.
     """
+    if sys.platform != "win32":
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            plat.persistence_manager.install_autostart()
+            return
+        except Exception as e:
+            logging.warning("Linux autostart registration failed: %s", e)
+            return
+
     exe_path = get_exe_path()
 
     # Try HKLM (requires admin)
@@ -2877,6 +3025,8 @@ def register_task_scheduler():
       2) ONLOGON highest privilege
       3) ONLOGON limited privilege
     """
+    if sys.platform != "win32":
+        return True
     exe_path = get_exe_path()
     daemon_cmd = " ".join(_daemon_args())
     any_success = False
@@ -3717,6 +3867,18 @@ def _is_agent_active(zw_client):
 
 
 def _is_daemon_running():
+    if sys.platform != "win32":
+        lock_path = os.path.join(get_base_dir(), "state", "daemon.lock")
+        if os.path.exists(lock_path):
+            try:
+                with open(lock_path, "r") as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, 0)
+                return True
+            except (OSError, ValueError):
+                pass
+        return False
+
     probe = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
     err = ctypes.windll.kernel32.GetLastError()
     if probe:
@@ -3730,6 +3892,16 @@ def _spawn_daemon_process():
         daemon_cmd = [sys.executable, target_path, *_daemon_args()]
     else:
         daemon_cmd = [target_path, *_daemon_args()]
+
+    if sys.platform != "win32":
+        daemon_proc = subprocess.Popen(
+            daemon_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        time.sleep(1.5)
+        return daemon_proc.poll() is None, daemon_proc.pid
 
     DETACHED = 0x00000008
     NEW_GROUP = 0x00000200
@@ -4635,6 +4807,8 @@ def show_windows_notification(title, message):
 
 def hide_console():
     """Hides the console window so the agent runs invisibly."""
+    if sys.platform != "win32":
+        return
     whnd = ctypes.windll.kernel32.GetConsoleWindow()
     if whnd != 0:
         ctypes.windll.user32.ShowWindow(whnd, 0)  # SW_HIDE
@@ -5620,7 +5794,10 @@ class DashboardFrame(tk.Frame):
         def switch_page(page_name):
             if page_name == "settings":
                 try:
-                    is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+                    if sys.platform != "win32":
+                        is_admin = os.getuid() == 0
+                    else:
+                        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
                 except Exception:
                     is_admin = False
                 if not is_admin:
@@ -6393,18 +6570,19 @@ class UnifiedSentinelGUI(tk.Tk):
             _append_gui_log(get_base_dir(), f"GUI icon load failed: {e}")
 
         # Final Taskbar Icon Force (Windows OS level)
-        try:
-            icon_path = self._resolve_icon_path()
-            if icon_path:
-                from ctypes import windll
-                hwnd = windll.user32.GetParent(self.winfo_id())
-                # Load icon using shell32 to ensure it is handled as a proper HICON
-                hicon = windll.user32.LoadImageW(0, icon_path, 1, 0, 0, 0x00000010)
-                if hicon:
-                    windll.user32.SendMessageW(hwnd, 0x0080, 1, hicon) # ICON_BIG
-                    windll.user32.SendMessageW(hwnd, 0x0080, 0, hicon) # ICON_SMALL
-        except Exception:
-            pass
+        if sys.platform == "win32":
+            try:
+                icon_path = self._resolve_icon_path()
+                if icon_path:
+                    from ctypes import windll
+                    hwnd = windll.user32.GetParent(self.winfo_id())
+                    # Load icon using shell32 to ensure it is handled as a proper HICON
+                    hicon = windll.user32.LoadImageW(0, icon_path, 1, 0, 0, 0x00000010)
+                    if hicon:
+                        windll.user32.SendMessageW(hwnd, 0x0080, 1, hicon) # ICON_BIG
+                        windll.user32.SendMessageW(hwnd, 0x0080, 0, hicon) # ICON_SMALL
+            except Exception:
+                pass
 
         self.current_frame = None
         
@@ -6437,6 +6615,8 @@ class UnifiedSentinelGUI(tk.Tk):
             pass
 
     def _force_show_window(self):
+        if sys.platform != "win32":
+            return
         try:
             hwnd = self.winfo_id()
             ctypes.windll.user32.ShowWindow(hwnd, 9)
@@ -6568,6 +6748,18 @@ class UnifiedSentinelGUI(tk.Tk):
         self.current_frame.pack(fill=tk.BOTH, expand=True)
 
 def _is_daemon_running():
+    if sys.platform != "win32":
+        lock_path = os.path.join(get_base_dir(), "state", "daemon.lock")
+        if os.path.exists(lock_path):
+            try:
+                with open(lock_path, "r") as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, 0)
+                return True
+            except (OSError, ValueError):
+                pass
+        return False
+
     mutex = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
     err = ctypes.windll.kernel32.GetLastError()
     if mutex:
@@ -6585,6 +6777,15 @@ def _spawn_daemon_process():
     else:
         args = [sys.executable, exe_path] + _daemon_args()
     try:
+        if sys.platform != "win32":
+            p = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True, p.pid
+
         DETACHED = 0x00000008
         NEW_GROUP = 0x00000200
         p = subprocess.Popen(
@@ -6682,11 +6883,15 @@ def prompt_consent(base_dir, force_show=False):
 
 def run_interactive():
     """Redesigned interactive entry point."""
+    if tk is None:
+        print("Interactive GUI mode requires tkinter. Please install python3-tk on Linux (e.g., sudo apt install python3-tk).")
+        sys.exit(1)
     try:
         # Set AppUserModelID to ensure the taskbar icon matches the window icon
         # Use a unique but descriptive string
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ZeroWatch.SentinelAgent.v2")
+        if sys.platform == "win32":
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ZeroWatch.SentinelAgent.v2")
     except Exception:
         pass
 
@@ -6787,6 +6992,7 @@ def run_interactive():
         except Exception:
             pass
         logging.error(f"Failed to start interactive mode: {e}", exc_info=True)
+        print(f"Error starting interactive GUI mode: {e}", file=sys.stderr)
         # Show a message box if possible
         try:
             import ctypes
@@ -6852,7 +7058,12 @@ def main():
             logging.info("Daemon blocked: Consent not accepted yet.")
             sys.exit(0)
         logging.info("Starting background daemon agent.")
-        main_agent()
+        if sys.platform != "win32":
+            from sentinel_agent_linux import LinuxSentinelAgent
+            agent = LinuxSentinelAgent()
+            agent.run()
+        else:
+            main_agent()
         return
 
     # Default interactive routing
