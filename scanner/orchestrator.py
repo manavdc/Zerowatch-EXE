@@ -410,6 +410,12 @@ class ScanOrchestrator:
         """
         t0 = time.perf_counter()
 
+        # Check if this is a cold start (no filesystem scan has run yet)
+        is_cold = not bool(self._cache.get_meta("last_fs_scan_at"))
+        if is_cold:
+            logger.info("Cold start detected: forcing full filesystem scan for complete inventory.")
+            include_filesystem = True
+
         # ── Layer 0 (always synchronous) ───────────────────────────────────
         items = self._run_layer0()
 
@@ -417,6 +423,13 @@ class ScanOrchestrator:
         if include_filesystem:
             fs_new, _fs_removed = self._run_full_drive_scan()
             items.extend(fs_new)
+            # Mark filesystem scan as completed in cache
+            self._cache.set_meta("last_fs_scan_at", self._utc_now_iso())
+        else:
+            # On warm start, merge cached filesystem items with Layer 0 registry items
+            # so the full sync payload is complete and doesn't wipe them from the server.
+            cached_items = self._cache.all_cached_items()
+            items.extend(cached_items)
 
         # ── Deduplicate ────────────────────────────────────────────────────
         unique = self._deduplicate(items)

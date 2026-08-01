@@ -581,47 +581,58 @@ class EncryptedFileHandler(logging.Handler):
     def __init__(self, filepath):
         super().__init__()
         self.filepath = filepath
+        # PID-suffixed temp file so the GUI process and daemon process never
+        # collide on the same .tmp file when both write to the same log path.
+        self._temp_path = f"{self.filepath}.{os.getpid()}.tmp"
+        self._lock = threading.Lock()
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
 
     def emit(self, record):
         try:
             message = self.format(record) + "\n"
-            existing = b""
-            if os.path.exists(self.filepath):
-                with open(self.filepath, "rb") as handle:
-                    existing = handle.read()
-
-            plaintext = b""
-            if existing:
-                decrypted = decrypt_data(existing)
-                if decrypted:
-                    plaintext = decrypted
-                else:
+            with self._lock:
+                existing = b""
+                if os.path.exists(self.filepath):
                     try:
-                        plaintext = existing.decode("utf-8").encode("utf-8")
-                    except Exception:
-                        plaintext = b""
+                        with open(self.filepath, "rb") as handle:
+                            existing = handle.read()
+                    except OSError:
+                        existing = b""
 
-            combined = plaintext + message.encode("utf-8", errors="replace")
-            encrypted = encrypt_data(combined)
-            data_to_write = encrypted if encrypted else combined
-            temp_path = f"{self.filepath}.tmp"
-            with open(temp_path, "wb") as handle:
-                handle.write(data_to_write)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, self.filepath)
-            try:
-                subprocess.run(
-                    ["attrib", "+H", "+S", self.filepath],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                    startupinfo=_windows_hidden_startupinfo(),
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-            except Exception:
-                pass
+                plaintext = b""
+                if existing:
+                    decrypted = decrypt_data(existing)
+                    if decrypted:
+                        plaintext = decrypted
+                    else:
+                        try:
+                            plaintext = existing.decode("utf-8").encode("utf-8")
+                        except Exception:
+                            plaintext = b""
+
+                combined = plaintext + message.encode("utf-8", errors="replace")
+                encrypted = encrypt_data(combined)
+                data_to_write = encrypted if encrypted else combined
+                try:
+                    with open(self._temp_path, "wb") as handle:
+                        handle.write(data_to_write)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(self._temp_path, self.filepath)
+                except OSError:
+                    # Another process is mid-write; skip this record rather than crash.
+                    return
+                try:
+                    subprocess.run(
+                        ["attrib", "+H", "+S", self.filepath],
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                        startupinfo=_windows_hidden_startupinfo(),
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                except Exception:
+                    pass
         except Exception:
             self.handleError(record)
 
@@ -752,7 +763,7 @@ class ZeroWatchClient:
             self.sio.emit("join-agent", self.device_id)
 
         @self.sio.event
-        def disconnect():
+        def disconnect(*args, **kwargs):
             self.socket_connected = False
             logging.info("[WS] Disconnected from backend")
 
@@ -1293,6 +1304,14 @@ class ZeroWatchClient:
     def clear_local_state(self):
         _append_gui_log(self.base_dir, "clear_local_state() called - DELETING ALL PERSISTENT FILES")
         """Reset local auth/state files so the endpoint behaves like fresh install."""
+        # Signal the background daemon to release its SQLite locks immediately.
+        # The daemon polls this file every 2 seconds so it will close its cache
+        # connection well before we reach the db deletion block below.
+        try:
+            request_unlink_signal(self.base_dir)
+            time.sleep(2.5)  # Give the daemon one full poll cycle to close its connection
+        except Exception:
+            pass
         db_files = []
         for sdir in [
             os.path.join(os.environ.get("PROGRAMDATA", ""), "ZeroWatch", "state"),
@@ -3841,6 +3860,43 @@ def consume_shutdown_signal(base_dir):
     return payload
 
 
+# ── Unlink signal: GUI → Daemon IPC ─────────────────────────────────────────
+# The GUI writes this file atomically before calling clear_local_state() so the
+# background daemon can detect the unlink and release its SQLite locks within
+# the next polling tick (≤ 2 seconds) instead of waiting up to 30 seconds for
+# the heartbeat loop to run.
+
+def _unlink_signal_path(base_dir):
+    return _state_path(base_dir, "unlink.signal")
+
+
+def request_unlink_signal(base_dir):
+    """Write an unlink signal file so the daemon releases its cache locks fast."""
+    signal_path = _unlink_signal_path(base_dir)
+    try:
+        os.makedirs(os.path.dirname(signal_path), exist_ok=True)
+        temp_path = f"{signal_path}.tmp"
+        with open(temp_path, "wb") as handle:
+            handle.write(b"unlink")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, signal_path)
+    except Exception as _sig_err:
+        logging.warning("[UNLINK] Failed writing unlink signal: %s", _sig_err)
+
+
+def consume_unlink_signal(base_dir):
+    """Return True and delete the signal file if it exists, else False."""
+    signal_path = _unlink_signal_path(base_dir)
+    if os.path.exists(signal_path):
+        try:
+            os.remove(signal_path)
+        except Exception:
+            pass
+        return True
+    return False
+
+
 def _wait_for_enrollment(zw_client, base_dir):
     if zw_client.jwt:
         return True
@@ -4830,7 +4886,32 @@ def main_agent():
                     logging.info("[PINNING] Retrying connection after pin mismatch backoff...")
                     cert_pinning.PIN_MISMATCH_DETECTED = False
 
-            time.sleep(30)  # Base loop interval
+            # --- Responsive sleep: poll every 2 s for unlink/shutdown signals ---
+            # This replaces a single time.sleep(30) so the daemon can react to an
+            # unlink event within 2 seconds and release the SQLite file locks
+            # before the GUI's clear_local_state() tries to delete the db files.
+            _orchestrator_closed_for_unlink = False
+            for _tick in range(15):  # 15 × 2 s = 30 s total base interval
+                time.sleep(2)
+                # Fast-path: check for an unlink signal written by the GUI
+                if consume_unlink_signal(base_dir):
+                    logging.info("[MAIN] Unlink signal received: closing orchestrator to release db locks.")
+                    if _orchestrator is not None:
+                        try:
+                            _orchestrator.stop_periodic_scans()
+                            _orchestrator.close()
+                        except Exception as _ce:
+                            logging.warning("[MAIN] Error closing orchestrator: %s", _ce)
+                    _orchestrator_closed_for_unlink = True
+                    break
+                # Also respect shutdown signal mid-sleep
+                if consume_shutdown_signal(base_dir):
+                    logging.info("[MAIN] Shutdown signal detected mid-sleep. Exiting.")
+                    break
+            if _orchestrator_closed_for_unlink:
+                # Force the outer loop to reach the JWT-missing branch immediately
+                zw_client.jwt = None
+                continue
             now = time.time()
 
             if cert_pinning.PIN_MISMATCH_DETECTED:
@@ -4842,6 +4923,16 @@ def main_agent():
 
             # --- Dynamic JWT Reloading for Re-enrollment ---
             if not zw_client.jwt:
+                # If we were previously active and had the orchestrator open,
+                # close it to stop background scans and release the SQLite file locks.
+                if _orchestrator is not None:
+                    try:
+                        logging.info("[MAIN] Agent unlinked: stopping scans and closing cache connection.")
+                        _orchestrator.stop_periodic_scans()
+                        _orchestrator.close()
+                    except Exception as _close_err:
+                        logging.warning("[MAIN] Error closing orchestrator (non-fatal): %s", _close_err)
+
                 zw_client.jwt = zw_client._load_jwt()
                 if zw_client.jwt:
                     logging.info("[MAIN] Token dynamically re-loaded from disk. Re-enrolling agent.")
@@ -6426,10 +6517,13 @@ class UnifiedSentinelGUI(tk.Tk):
 
                     if payload_status == "approved":
                         # Ensure first inventory reaches backend immediately after admin approval.
-                        self.zw_client.trigger_approval_sync(
-                            reason="feed_ready_approved",
-                            min_interval=90,
-                        )
+                        if not _is_daemon_running():
+                            self.zw_client.trigger_approval_sync(
+                                reason="feed_ready_approved",
+                                min_interval=90,
+                            )
+                        else:
+                            logging.info("[GUI] Daemon is running; skipping trigger_approval_sync.")
                     
                     if now - last_refresh > 5:
                         self._last_notif_refresh = now
@@ -6437,10 +6531,13 @@ class UnifiedSentinelGUI(tk.Tk):
                         if isinstance(self.current_frame, EnrollmentFrame):
                             status = self.zw_client.refresh_join_status_once()
                             if status.get("status") == "approved" and self.zw_client.jwt:
-                                self.zw_client.trigger_approval_sync(
-                                    reason="enrollment_approved",
-                                    min_interval=90,
-                                )
+                                if not _is_daemon_running():
+                                    self.zw_client.trigger_approval_sync(
+                                        reason="enrollment_approved",
+                                        min_interval=90,
+                                    )
+                                else:
+                                    logging.info("[GUI] Daemon is running; skipping trigger_approval_sync.")
                                 self.show_dashboard()
                         elif isinstance(self.current_frame, DashboardFrame):
                             # Just refresh the dashboard data
