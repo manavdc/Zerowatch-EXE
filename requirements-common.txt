@@ -1,0 +1,6 @@
+# requirements-common.txt
+# Platform-independent runtime dependencies (Windows + Linux + macOS)
+requests>=2.31.0
+zstandard>=0.22.0
+python-socketio[client]>=5.11.0
+cryptography>=41.0.0

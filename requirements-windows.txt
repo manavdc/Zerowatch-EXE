@@ -1,0 +1,6 @@
+# requirements-windows.txt
+# Windows-only dependencies
+-r requirements-common.txt
+wmi>=1.5.1
+pywin32>=306
+nuitka>=2.0

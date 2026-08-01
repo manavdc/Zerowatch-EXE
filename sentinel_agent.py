@@ -1,5 +1,4 @@
 import requests
-import winreg
 import uuid
 import subprocess
 import json
@@ -13,14 +12,32 @@ import threading
 import hashlib
 import hmac
 import ctypes
-import ctypes.wintypes as wt
 import signal
 import logging
 import re
 import socket
 import socketio
 from urllib.parse import urlparse
-import requests
+import cert_pinning
+
+if sys.platform == "win32":
+    import winreg
+    import ctypes.wintypes as wt
+else:
+    winreg = None
+    wt = None
+
+from cert_pinning import (
+    PinError,
+    SPKIPinningAdapter,
+    build_pinning_adapter,
+    is_loopback,
+    is_pin_failure,
+    PinnedSession,
+    is_valid_sha256_base64
+)
+
+
 
 # === CRASH DIAGNOSTICS ===
 import traceback
@@ -31,6 +48,10 @@ def _global_crash_handler(exc_type, exc_value, exc_traceback):
         return
     
     msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    
+    # Print to stderr for visibility in CLI/daemon environments
+    sys.stderr.write(msg)
+    sys.stderr.flush()
     
     # Try to write to Desktop
     try:
@@ -193,9 +214,14 @@ def _setup_tcl_tk_paths():
 _setup_tcl_tk_paths()
 
 
-import tkinter as tk
-from tkinter import font as tkfont
-from tkinter import ttk
+try:
+    import tkinter as tk
+    from tkinter import font as tkfont
+    from tkinter import ttk
+except ImportError:
+    tk = None
+    tkfont = None
+    ttk = None
 
 import math
 
@@ -289,6 +315,41 @@ def run_hidden(args, timeout=None, shell=False):
     )
 
 
+def run_syft_deep_scan(base_dir, target_folder="C:\\"):
+    import sys
+    if hasattr(sys, '_MEIPASS'):
+        syft_path = os.path.join(sys._MEIPASS, "syft.exe")
+    else:
+        syft_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "syft.exe")
+    
+    if not os.path.exists(syft_path):
+        logging.error("syft.exe not found.")
+        return None
+        
+    try:
+        logging.info(f"Starting deep scan with syft on {target_folder}...")
+        si = _windows_hidden_startupinfo()
+        result = subprocess.run(
+            [syft_path, f"dir:{target_folder}", "--exclude", "**/AppData/**", "--exclude", "**/node_modules/**", "--exclude", "**/Windows/**", "-o", "json"],
+            capture_output=True,
+            text=True,
+            timeout=120,  # Hard limit: syft on C:\ would otherwise hang indefinitely
+            startupinfo=si,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+        else:
+            logging.error(f"Syft scan failed: {result.stderr}")
+            return None
+    except subprocess.TimeoutExpired:
+        logging.warning(f"Syft scan timed out after 120s on {target_folder}")
+        return None
+    except Exception as e:
+        logging.error(f"Exception during syft scan: {e}")
+        return None
+
+
 def check_backend_connectivity():
     """Checks if the configured backend endpoint is reachable before network operations."""
     try:
@@ -373,6 +434,74 @@ def _resolve_base_api_url():
 
 
 BASE_API_URL = _resolve_base_api_url()
+
+# Hardcoded SPKI Pins (SHA-256 hashes of the SubjectPublicKeyInfo in base64)
+# For production and demo environments, these should be updated to actual hashes.
+SPKI_PINS = {
+    "zerowatch.deepcytes.io": [
+        "PLACEHOLDER_PROD_PRIMARY_SPKI_HASH",
+        "PLACEHOLDER_PROD_BACKUP_SPKI_HASH"
+    ],
+    "zerowatch-testing.eastasia.cloudapp.azure.com": [
+        "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",
+        "EzSBE12fT2ZrphmumaBjrpdpXv9G71RhZQHMvuwszI4="
+    ]
+}
+
+def _load_pins_for_url(base_url: str) -> list[str]:
+    """Resolves and returns the list of allowed SPKI pin hashes for the target URL.
+    Checks hardcoded pins, followed by agent_config.json overrides, and loopback bypasses.
+    """
+    if is_loopback(base_url):
+        logging.info(f"Certificate pinning bypassed for loopback address: {base_url}")
+        return []
+
+    try:
+        parsed = urlparse(base_url)
+        hostname = parsed.hostname
+    except Exception as e:
+        logging.error(f"Failed to parse base URL for pinning: {e}")
+        hostname = None
+
+    if not hostname:
+        return []
+
+    # Check if dev mode is enabled via command-line arguments, environment variable, or if target is localhost
+    is_dev_mode = ("--dev" in sys.argv or os.environ.get("ZEROWATCH_DEV_MODE") == "1" or is_loopback(base_url))
+
+    # 1. Load custom pins from agent_config.json
+    custom_pins = []
+    try:
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "agent_config.json")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            raw_custom = cfg.get("custom_pins")
+            if isinstance(raw_custom, list):
+                custom_pins = [str(p) for p in raw_custom if is_valid_sha256_base64(str(p))]
+    except Exception as e:
+        logging.debug(f"Failed to load custom pins from agent_config.json: {e}")
+
+    # 2. Enforce hardcoded pins for official domains unless explicitly overridden in dev mode
+    if hostname in SPKI_PINS:
+        if is_dev_mode and custom_pins:
+            logging.warning(f"Development mode active. Overriding hardcoded pins for {hostname} with custom configuration pins.")
+            return custom_pins
+        return SPKI_PINS[hostname]
+
+    # 3. For custom staging/on-premise domains, return the configured custom pins
+    if custom_pins:
+        logging.info(f"Loaded {len(custom_pins)} valid custom pins from agent_config.json for host {hostname}")
+        return custom_pins
+
+    # 4. If HTTPS but no pins are defined, raise a fatal error to prevent unpinned connection.
+    if base_url.lower().startswith("https://"):
+        msg = f"Fatal: No certificate pins defined for secure host: {hostname}. Connection blocked."
+        logging.critical(msg)
+        raise RuntimeError(msg)
+
+    return []
+
 AGENT_API_URL = f"{BASE_API_URL}/agent"
 AUTH_API_URL = f"{BASE_API_URL}/auth"
 USER_API_URL = f"{BASE_API_URL}/user"
@@ -399,17 +528,15 @@ def _color(text, color):
     return f"{ANSI_COLORS.get(color, '')}{text}{ANSI_COLORS['reset']}"
 
 # --- DPAPI Cryptography ---
-def encrypt_data(data_bytes):
-    # Encrypts data using Windows DPAPI (LocalMachine for cross-user persistence)
-    flags = 0x4  # CRYPTPROTECT_LOCAL_MACHINE
+_in_crypto = threading.local()
 
+def _windows_dpapi_encrypt(data_bytes):
+    flags = 0x4  # CRYPTPROTECT_LOCAL_MACHINE
     class DATA_BLOB(ctypes.Structure):
         _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
-
     in_buffer = ctypes.create_string_buffer(data_bytes)
     in_blob = DATA_BLOB(len(data_bytes), ctypes.cast(in_buffer, ctypes.POINTER(ctypes.c_ubyte)))
     out_blob = DATA_BLOB()
-
     try:
         ok = ctypes.windll.crypt32.CryptProtectData(
             ctypes.byref(in_blob),
@@ -422,7 +549,6 @@ def encrypt_data(data_bytes):
         )
         if not ok:
             return None
-
         try:
             protected = ctypes.string_at(out_blob.pbData, out_blob.cbData)
             return protected
@@ -432,14 +558,12 @@ def encrypt_data(data_bytes):
         logging.error(f"DPAPI Encryption failed: {e}")
         return None
 
-def decrypt_data(encrypted_bytes):
+def _windows_dpapi_decrypt(encrypted_bytes):
     class DATA_BLOB(ctypes.Structure):
         _fields_ = [("cbData", wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
-
     in_buffer = ctypes.create_string_buffer(encrypted_bytes)
     in_blob = DATA_BLOB(len(encrypted_bytes), ctypes.cast(in_buffer, ctypes.POINTER(ctypes.c_ubyte)))
     out_blob = DATA_BLOB()
-
     try:
         ok = ctypes.windll.crypt32.CryptUnprotectData(
             ctypes.byref(in_blob),
@@ -452,7 +576,6 @@ def decrypt_data(encrypted_bytes):
         )
         if not ok:
             return None
-
         try:
             return ctypes.string_at(out_blob.pbData, out_blob.cbData)
         finally:
@@ -460,6 +583,42 @@ def decrypt_data(encrypted_bytes):
     except Exception as e:
         logging.error(f"DPAPI Decryption failed: {e}")
         return None
+
+def encrypt_data(data_bytes):
+    if sys.platform == "win32":
+        return _windows_dpapi_encrypt(data_bytes)
+
+    if getattr(_in_crypto, "active", False):
+        return None
+    _in_crypto.active = True
+    try:
+        from platforms import PlatformFactory
+        plat = PlatformFactory.create()
+        if plat and plat.secure_store:
+            return plat.secure_store.encrypt(data_bytes)
+    except Exception:
+        pass
+    finally:
+        _in_crypto.active = False
+    return None
+
+def decrypt_data(encrypted_bytes):
+    if sys.platform == "win32":
+        return _windows_dpapi_decrypt(encrypted_bytes)
+
+    if getattr(_in_crypto, "active", False):
+        return None
+    _in_crypto.active = True
+    try:
+        from platforms import PlatformFactory
+        plat = PlatformFactory.create()
+        if plat and plat.secure_store:
+            return plat.secure_store.decrypt(encrypted_bytes)
+    except Exception:
+        pass
+    finally:
+        _in_crypto.active = False
+    return None
 # --------------------------
 
 
@@ -467,47 +626,59 @@ class EncryptedFileHandler(logging.Handler):
     def __init__(self, filepath):
         super().__init__()
         self.filepath = filepath
+        # PID-suffixed temp file so the GUI process and daemon process never
+        # collide on the same .tmp file when both write to the same log path.
+        self._temp_path = f"{self.filepath}.{os.getpid()}.tmp"
+        self._lock = threading.RLock()
         os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
 
     def emit(self, record):
         try:
             message = self.format(record) + "\n"
-            existing = b""
-            if os.path.exists(self.filepath):
-                with open(self.filepath, "rb") as handle:
-                    existing = handle.read()
-
-            plaintext = b""
-            if existing:
-                decrypted = decrypt_data(existing)
-                if decrypted:
-                    plaintext = decrypted
-                else:
+            with self._lock:
+                existing = b""
+                if os.path.exists(self.filepath):
                     try:
-                        plaintext = existing.decode("utf-8").encode("utf-8")
-                    except Exception:
-                        plaintext = b""
+                        with open(self.filepath, "rb") as handle:
+                            existing = handle.read()
+                    except OSError:
+                        existing = b""
 
-            combined = plaintext + message.encode("utf-8", errors="replace")
-            encrypted = encrypt_data(combined)
-            data_to_write = encrypted if encrypted else combined
-            temp_path = f"{self.filepath}.tmp"
-            with open(temp_path, "wb") as handle:
-                handle.write(data_to_write)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp_path, self.filepath)
-            try:
-                subprocess.run(
-                    ["attrib", "+H", "+S", self.filepath],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                    startupinfo=_windows_hidden_startupinfo(),
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-            except Exception:
-                pass
+                plaintext = b""
+                if existing:
+                    decrypted = decrypt_data(existing)
+                    if decrypted:
+                        plaintext = decrypted
+                    else:
+                        try:
+                            plaintext = existing.decode("utf-8").encode("utf-8")
+                        except Exception:
+                            plaintext = b""
+
+                combined = plaintext + message.encode("utf-8", errors="replace")
+                encrypted = encrypt_data(combined)
+                data_to_write = encrypted if encrypted else combined
+                try:
+                    with open(self._temp_path, "wb") as handle:
+                        handle.write(data_to_write)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(self._temp_path, self.filepath)
+                except OSError:
+                    # Another process is mid-write; skip this record rather than crash.
+                    return
+                if sys.platform == "win32":
+                    try:
+                        subprocess.run(
+                            ["attrib", "+H", "+S", self.filepath],
+                            capture_output=True,
+                            text=True,
+                            timeout=3,
+                            startupinfo=_windows_hidden_startupinfo(),
+                            creationflags=subprocess.CREATE_NO_WINDOW,
+                        )
+                    except Exception:
+                        pass
         except Exception:
             self.handleError(record)
 
@@ -523,17 +694,31 @@ def _configure_logging():
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
     root_logger.setLevel(logging.INFO)
+    
+    # Encrypted file handler (always active)
     handler = EncryptedFileHandler(LOG_FILE)
-    handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S",
-        )
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
     )
+    handler.setFormatter(formatter)
     root_logger.addHandler(handler)
+
+    # Console stream handler (active when running as standard Python script from CLI)
+    if not str(sys.argv[0]).endswith('.exe'):
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+
+    # Silence noisy urllib3/socketio connectionpool retry warnings during long-polling
+    logging.getLogger("urllib3").setLevel(logging.ERROR)
+    logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
+    logging.getLogger("engineio").setLevel(logging.ERROR)
+    logging.getLogger("socketio").setLevel(logging.ERROR)
 
 
 _configure_logging()
+
 
 # ============================================================================
 # MODULE 0.5: ZERO-WATCH REST API CLIENT
@@ -581,8 +766,34 @@ class ZeroWatchClient:
         self.team_info = self._load_team_info_from_state()
         _purge_legacy_build_artifacts(self.base_dir)
 
+        self.session = PinnedSession()
+        pins = _load_pins_for_url(BASE_API_URL)
+        if pins:
+            self.session.mount("https://", build_pinning_adapter(pins))
+
+        # Configure retry logic for HTTP/HTTPS
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[502, 503, 504],
+            allowed_methods=["GET", "POST"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        if not pins:
+            self.session.mount("https://", adapter)
+
         # Real-time WebSocket support
-        self.sio = socketio.Client(reconnection=True, reconnection_attempts=0, logger=False, engineio_logger=False)
+        self.sio = socketio.Client(
+            reconnection=True,
+            reconnection_attempts=0,
+            logger=False,
+            engineio_logger=False,
+            http_session=self.session
+        )
         self.notification_queue = []
         self._last_approval_sync_at = 0.0
         self._approval_sync_in_flight = False
@@ -598,7 +809,7 @@ class ZeroWatchClient:
             self.sio.emit("join-agent", self.device_id)
 
         @self.sio.event
-        def disconnect():
+        def disconnect(*args, **kwargs):
             self.socket_connected = False
             logging.info("[WS] Disconnected from backend")
 
@@ -611,6 +822,11 @@ class ZeroWatchClient:
         def on_unlink(data):
             logging.info("[WS] Received unlink notification")
             self.notification_queue.append({"type": "unlink", "data": data})
+
+        @self.sio.on("deep_scan")
+        def on_deep_scan(data):
+            logging.info("[WS] Received deep_scan command")
+            self.notification_queue.append({"type": "deep_scan", "data": data})
 
     def is_enrolled(self):
         """Checks if this device is approved in the join state, independent of JWT."""
@@ -627,6 +843,18 @@ class ZeroWatchClient:
         logging.info(f"Enrollment check: status='{status}', team='{team_code}', match={device_id == self.device_id} => {is_ok}")
         return is_ok
 
+    def send_sbom(self, sbom_data):
+        if not self.jwt or not sbom_data: return False
+        try:
+            # Note: assuming _auth_headers() exists on client, we construct it:
+            headers = {"Authorization": f"Bearer {self.jwt}", "Content-Type": "application/json"}
+            url = f"{resolve_api_base_url()}/api/agent/sbom"
+            resp = self.session.post(url, headers=headers, json=sbom_data, timeout=120)
+            return resp.status_code == 200
+        except Exception as e:
+            logging.error(f"Failed to send SBOM: {e}")
+            return False
+
     def connect_socket(self):
         """Connect to WebSocket server in a separate thread if not already connected."""
         if self.socket_connected:
@@ -636,7 +864,7 @@ class ZeroWatchClient:
             try:
                 base_url = resolve_api_base_url()
                 # socketio expects the base URL (e.g. http://localhost:5000)
-                self.sio.connect(base_url, wait_timeout=10)
+                self.sio.connect(base_url, wait_timeout=10, transports=['polling'])
             except Exception as e:
                 logging.debug(f"[WS] Connection failed: {e}")
 
@@ -657,7 +885,7 @@ class ZeroWatchClient:
         try:
             url = f"{resolve_api_base_url()}/api/agent/notifications"
             headers = {"Authorization": f"Bearer {self.jwt}"}
-            resp = requests.get(url, headers=headers, timeout=5)
+            resp = self.session.get(url, headers=headers, timeout=5)
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("success") and data.get("notifications"):
@@ -677,7 +905,7 @@ class ZeroWatchClient:
         try:
             url = f"{resolve_api_base_url()}/api/agent/notifications/ack"
             headers = {"Authorization": f"Bearer {self.jwt}"}
-            requests.post(url, headers=headers, json={"notificationId": notif_id}, timeout=5)
+            self.session.post(url, headers=headers, json={"notificationId": notif_id}, timeout=5)
         except Exception:
             pass
 
@@ -859,6 +1087,21 @@ class ZeroWatchClient:
         self.join_state = None
         self.join_state_tampered = False
 
+    def cancel_join_request(self):
+        """Notifies the backend asynchronously to remove pending requests, and clears local state immediately."""
+        self.clear_join_state()
+
+        def _bg_cancel():
+            try:
+                url = f"{resolve_api_base_url()}/api/agent/join-request/cancel"
+                payload = {"device_id": self.device_id}
+                self.session.post(url, json=payload, timeout=5)
+                logging.info("Sent cancel join request signal to backend asynchronously")
+            except Exception as e:
+                logging.warning(f"Failed sending cancel join request to backend in background: {e}")
+
+        threading.Thread(target=_bg_cancel, daemon=True).start()
+
     def has_pending_join(self):
         current = self.join_state if isinstance(self.join_state, dict) else self._load_join_state()
         self.join_state = current
@@ -869,7 +1112,7 @@ class ZeroWatchClient:
     def refresh_join_status_once(self):
         """Refreshes join status from backend using deviceId and updates local secure join-state file."""
         try:
-            resp = requests.get(
+            resp = self.session.get(
                 f"{AGENT_API_URL}/join-status",
                 params={"deviceId": self.device_id},
                 timeout=10,
@@ -1122,6 +1365,24 @@ class ZeroWatchClient:
     def clear_local_state(self):
         _append_gui_log(self.base_dir, "clear_local_state() called - DELETING ALL PERSISTENT FILES")
         """Reset local auth/state files so the endpoint behaves like fresh install."""
+        # Signal the background daemon to release its SQLite locks immediately.
+        # The daemon polls this file every 2 seconds so it will close its cache
+        # connection well before we reach the db deletion block below.
+        try:
+            request_unlink_signal(self.base_dir)
+            time.sleep(2.5)  # Give the daemon one full poll cycle to close its connection
+        except Exception:
+            pass
+        db_files = []
+        for sdir in [
+            os.path.join(os.environ.get("PROGRAMDATA", ""), "ZeroWatch", "state"),
+            os.path.join(self.base_dir, "state"),
+        ]:
+            if os.path.exists(sdir):
+                for f in os.listdir(sdir):
+                    if f.startswith("scan_cache.db"):
+                        db_files.append(os.path.join(sdir, f))
+
         files_to_remove = [
             self.token_file,
             self.join_state_file,
@@ -1130,7 +1391,7 @@ class ZeroWatchClient:
             _state_path(self.base_dir, "products.csv"),
             _state_path(self.base_dir, "sentinel_agent.log"),
             _state_path(self.base_dir, "dashboard_cache.dat"),
-        ]
+        ] + db_files
 
         for file_path in files_to_remove:
             try:
@@ -1176,7 +1437,7 @@ class ZeroWatchClient:
                 team_code=team_code,
             )
             
-            resp = requests.post(
+            resp = self.session.post(
                 f"{AGENT_API_URL}/join-request",
                 json=payload,
                 timeout=10,
@@ -1225,7 +1486,7 @@ class ZeroWatchClient:
                 "fingerprint_json": self.fingerprint_data,
             }
             
-            resp = requests.post(
+            resp = self.session.post(
                 f"{AGENT_API_URL}/individual-enroll",
                 json=payload,
                 timeout=10,
@@ -1325,11 +1586,11 @@ class ZeroWatchClient:
         payload = item.get("payload")
 
         if method == "POST":
-            resp = requests.post(url, headers=self._auth_headers(), json=payload, timeout=15)
+            resp = self.session.post(url, headers=self._auth_headers(), json=payload, timeout=15)
         elif method == "GET":
-            resp = requests.get(url, headers=self._auth_headers(), timeout=10)
+            resp = self.session.get(url, headers=self._auth_headers(), timeout=10)
         elif method == "DELETE":
-            resp = requests.delete(url, headers=self._auth_headers(), timeout=10)
+            resp = self.session.delete(url, headers=self._auth_headers(), timeout=10)
         else:
             return False, None, f"unsupported method {method}"
 
@@ -1431,16 +1692,26 @@ class ZeroWatchClient:
             "hardware": hardware_info
         }
         try:
-            formatted_software = [{
-                "name": item.get("name"),
-                "version": item.get("version"),
-                "vendor": item.get("vendor"),
-                "install_date": item.get("install_date"),
-                "source": item.get("source")
-            } for item in software_list]
+            formatted_software = []
+            for item in (software_list or []):
+                if hasattr(item, "to_dict"):
+                    d = item.to_dict()
+                elif isinstance(item, dict):
+                    d = item
+                elif hasattr(item, "__dict__"):
+                    d = item.__dict__
+                else:
+                    d = {}
+                formatted_software.append({
+                    "name": d.get("name"),
+                    "version": d.get("version"),
+                    "vendor": d.get("vendor"),
+                    "install_date": d.get("install_date"),
+                    "source": d.get("source")
+                })
 
             payload["inventory"] = formatted_software
-            resp = requests.post(f"{AGENT_API_URL}/sync/full", headers=self._auth_headers(), json=payload, timeout=30)
+            resp = self.session.post(f"{AGENT_API_URL}/sync/full", headers=self._auth_headers(), json=payload, timeout=30)
             self.last_server_status = resp.status_code
             data = self._parse_server_payload(resp)
             if self._handle_unlinked_response(resp, data):
@@ -1462,22 +1733,32 @@ class ZeroWatchClient:
 
     def sync_delta(self, added, removed, added_hw=None, removed_hw=None, hardware_snapshot=None):
         if not self.jwt or not self.license_active: return False
+
+        def _to_dict(it):
+            if hasattr(it, "to_dict"): return it.to_dict()
+            if isinstance(it, dict): return it
+            if hasattr(it, "__dict__"): return it.__dict__
+            return {}
+
+        added_dicts = [_to_dict(x) for x in (added or [])]
+        removed_dicts = [_to_dict(x) for x in (removed or [])]
+
         payload = {
             "device_id": self.device_id,
             "username": self.operator_username,
-            "added": added,
-            "removed": removed
+            "added": added_dicts,
+            "removed": removed_dicts
         }
         try:
             if added_hw:
-                payload["added"] = added + [{"source": "hardware", **h} for h in added_hw]
+                payload["added"] = added_dicts + [{"source": "hardware", **h} for h in added_hw]
             if removed_hw:
-                payload["removed"] = removed + [{"source": "hardware", **h} for h in removed_hw]
+                payload["removed"] = removed_dicts + [{"source": "hardware", **h} for h in removed_hw]
 
             if hardware_snapshot and isinstance(hardware_snapshot, dict):
                 payload["hardware_snapshot"] = hardware_snapshot
 
-            resp = requests.post(f"{AGENT_API_URL}/sync/delta", headers=self._auth_headers(), json=payload, timeout=20)
+            resp = self.session.post(f"{AGENT_API_URL}/sync/delta", headers=self._auth_headers(), json=payload, timeout=20)
             self.last_server_status = resp.status_code
             data = self._parse_server_payload(resp)
             if self._handle_unlinked_response(resp, data):
@@ -1535,7 +1816,7 @@ class ZeroWatchClient:
         if not self.jwt:
             return False, "Device is not linked"
         try:
-            resp = requests.delete(f"{AGENT_API_URL}/unlink-self", headers=self._auth_headers(), timeout=10)
+            resp = self.session.delete(f"{AGENT_API_URL}/unlink-self", headers=self._auth_headers(), timeout=10)
             self.last_server_status = resp.status_code
             data = resp.json() if resp.content else {}
             if resp.ok and data.get("success"):
@@ -1560,7 +1841,7 @@ class ZeroWatchClient:
                 "username": self.operator_username,
                 "asset_name": self.asset_name,
             }
-            resp = requests.post(f"{AGENT_API_URL}/heartbeat", headers=self._auth_headers(), json=payload, timeout=5)
+            resp = self.session.post(f"{AGENT_API_URL}/heartbeat", headers=self._auth_headers(), json=payload, timeout=5)
             self.last_server_status = resp.status_code
             
             # 5xx = Server is down/restarting. Treat as "Offline" (None)
@@ -1591,7 +1872,7 @@ class ZeroWatchClient:
             return True
         try:
             logging.info("[LICENSE] Recheck sent (expired mode) via /license-status.")
-            resp = requests.get(
+            resp = self.session.get(
                 f"{AGENT_API_URL}/license-status",
                 headers=self._auth_headers(),
                 timeout=8,
@@ -1626,7 +1907,7 @@ class ZeroWatchClient:
             "details": details,
         }
         try:
-            resp = requests.post(f"{AGENT_API_URL}/log", headers=self._auth_headers(), json=payload, timeout=5)
+            resp = self.session.post(f"{AGENT_API_URL}/log", headers=self._auth_headers(), json=payload, timeout=5)
             self.last_server_status = resp.status_code
             data = self._parse_server_payload(resp)
             if self._handle_unlinked_response(resp, data):
@@ -1658,7 +1939,7 @@ class ZeroWatchClient:
             return password == KILL_PASSWORD
         try:
             payload = {"device_id": self.device_id, "password": password}
-            resp = requests.post(f"{AGENT_API_URL}/verify-kill", headers=self._auth_headers(), json=payload, timeout=10)
+            resp = self.session.post(f"{AGENT_API_URL}/verify-kill", headers=self._auth_headers(), json=payload, timeout=10)
             if resp.ok and resp.json().get("success"):
                 return True
             # Backend explicitly denied — also try local fallback password
@@ -1670,7 +1951,7 @@ class ZeroWatchClient:
     def get_dashboard_stats(self):
         if not self.jwt: return None
         try:
-            resp = requests.get(f"{AGENT_API_URL}/metrics", headers=self._auth_headers(), timeout=10)
+            resp = self.session.get(f"{AGENT_API_URL}/metrics", headers=self._auth_headers(), timeout=10)
             data = self._parse_json_payload(resp)
             if self._handle_unlinked_response(resp, data):
                 return "unlinked"
@@ -1690,7 +1971,7 @@ class ZeroWatchClient:
                 return data
             return None
         try:
-            resp = requests.get(f"{AGENT_API_URL}/info", headers=self._auth_headers(), timeout=10)
+            resp = self.session.get(f"{AGENT_API_URL}/info", headers=self._auth_headers(), timeout=10)
             data = self._parse_json_payload(resp)
             if self._handle_unlinked_response(resp, data):
                 return "unlinked"
@@ -1701,6 +1982,14 @@ class ZeroWatchClient:
                 return asset_data
             
             # Fallback to cache on server error
+            cached = self._load_dashboard_cache()
+            if cached:
+                data = cached.get("data", {})
+                data["from_cache"] = True
+                return data
+            return None
+        except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+            logging.warning(f"[TRANSIENT] Asset info fetch lost connection (will retry next cycle): {e}")
             cached = self._load_dashboard_cache()
             if cached:
                 data = cached.get("data", {})
@@ -1771,7 +2060,7 @@ class ZeroWatchClient:
         if not self.jwt: return None
         try:
             # We use the /metrics endpoint which returns the full stats object
-            resp = requests.get(f"{AGENT_API_URL}/metrics", headers=self._auth_headers(), timeout=10)
+            resp = self.session.get(f"{AGENT_API_URL}/metrics", headers=self._auth_headers(), timeout=10)
             data = self._parse_json_payload(resp)
             if self._handle_unlinked_response(resp, data):
                 return None
@@ -1825,9 +2114,23 @@ def get_exe_path():
 
 def enforce_single_instance():
     """
-    Claims a named Windows kernel mutex. If one already exists from another 
+    Claims a named Windows kernel mutex or POSIX lock file. If one already exists from another 
     running instance, this process exits silently.
     """
+    if sys.platform != "win32":
+        import fcntl
+        lock_path = os.path.join(get_base_dir(), "state", "daemon.lock")
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        try:
+            f = open(lock_path, "w")
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            f.write(str(os.getpid()))
+            f.flush()
+            return f
+        except (BlockingIOError, PermissionError):
+            logging.info("Another instance is already running. Exiting silently.")
+            sys.exit(0)
+
     mutex = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
     last_err = ctypes.windll.kernel32.GetLastError()
     if last_err == 183:  # ERROR_ALREADY_EXISTS
@@ -1840,8 +2143,12 @@ def enforce_single_instance():
 # MODULE 2: FINGERPRINT — Device Identity & UID Generation
 # ============================================================================
 
-def _read_reg_key(key_path, value_name, hive=winreg.HKEY_LOCAL_MACHINE):
+def _read_reg_key(key_path, value_name, hive=None):
     """Safely reads a string registry value. Spawns zero subprocesses."""
+    if winreg is None:
+        return None
+    if hive is None:
+        hive = winreg.HKEY_LOCAL_MACHINE
     try:
         key = winreg.OpenKey(hive, key_path, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
         value, _ = winreg.QueryValueEx(key, value_name)
@@ -1850,8 +2157,12 @@ def _read_reg_key(key_path, value_name, hive=winreg.HKEY_LOCAL_MACHINE):
     except Exception:
         return None
 
-def _read_reg_subkeys(key_path, hive=winreg.HKEY_LOCAL_MACHINE):
+def _read_reg_subkeys(key_path, hive=None):
     """Enumerates subkeys of a registry key. Spawns zero subprocesses."""
+    if winreg is None:
+        return []
+    if hive is None:
+        hive = winreg.HKEY_LOCAL_MACHINE
     subkeys = []
     try:
         key = winreg.OpenKey(hive, key_path, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
@@ -2053,6 +2364,32 @@ def collect_fingerprint():
     Collects a comprehensive device fingerprint from multiple hardware layers.
     Returns a dict with all hardware identifiers and a deterministic computed Device ID.
     """
+    if sys.platform != "win32":
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            fp = plat.hardware_collector.collect_fingerprint()
+            if isinstance(fp, dict) and "device_id" not in fp:
+                fp["device_id"] = plat.hardware_collector.generate_device_id(fp)
+            return fp
+        except Exception as exc:
+            logging.error(f"WSL/Linux fingerprint collection failed: {exc}")
+            return {
+                "bios_serial":        "UNAVAILABLE",
+                "bios_uuid":          "UNAVAILABLE",
+                "motherboard_serial": "UNAVAILABLE",
+                "motherboard_product": "UNAVAILABLE",
+                "cpu_id":             "UNAVAILABLE",
+                "os_serial":          "UNAVAILABLE",
+                "machine_guid":       "UNAVAILABLE",
+                "mac_address":        get_mac_address(),
+                "mac_addresses":      [get_mac_address()],
+                "disk_serial":        "UNAVAILABLE",
+                "collected_at":       datetime.datetime.now().isoformat(),
+                "agent_version":      AGENT_VERSION,
+                "device_id":          "0fea5a130097afd6ed65c3b02bfeac0104fe92fbfa5a0d596f7572d4c5a18ff1", # Fallback device id
+            }
+
     import wmi
     try:
         c = wmi.WMI()
@@ -2198,8 +2535,16 @@ def _parse_registry_install_date(raw_value):
 
 def get_installed_software_registry():
     """
-    Primary software scanner: reads the Windows Registry Uninstall keys.
+    Primary software scanner: reads the Windows Registry Uninstall keys or Linux package databases.
     """
+    if sys.platform != "win32":
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            return plat.software_collector.collect_software()
+        except Exception:
+            return []
+
     results = []
     registry_paths = [
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -2255,6 +2600,14 @@ def get_hardware_inventory():
     Each item is returned as a flat dict row for CSV export (legacy format).
     Spawns zero subprocesses and anonymizes serial numbers.
     """
+    if sys.platform != "win32":
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            return plat.hardware_collector.get_hardware_inventory()
+        except Exception:
+            return []
+
     results = []
 
     # 1. CPU
@@ -2423,6 +2776,14 @@ def get_detailed_hardware_profile():
     Builds a structured hardware profile object matching the backend schema.
     Uses registry and ctypes to prevent subprocess spawns, and anonymizes serial numbers.
     """
+    if sys.platform != "win32":
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            return plat.hardware_collector.get_detailed_hardware_profile()
+        except Exception:
+            return {}
+
     ram_total_bytes = get_total_ram_bytes()
     ram_total_kb = str(ram_total_bytes // 1024) if ram_total_bytes else "0"
 
@@ -2618,6 +2979,16 @@ def register_startup_registry():
 
     Tries HKLM first (requires admin) and falls back to HKCU when not elevated.
     """
+    if sys.platform != "win32":
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            plat.persistence_manager.install_autostart()
+            return
+        except Exception as e:
+            logging.warning("Linux autostart registration failed: %s", e)
+            return
+
     exe_path = get_exe_path()
 
     # Try HKLM (requires admin)
@@ -2669,6 +3040,8 @@ def register_task_scheduler():
       2) ONLOGON highest privilege
       3) ONLOGON limited privilege
     """
+    if sys.platform != "win32":
+        return True
     exe_path = get_exe_path()
     daemon_cmd = " ".join(_daemon_args())
     any_success = False
@@ -2972,75 +3345,115 @@ def set_auto_start_enabled(enabled):
 # MODULE 6: WATCHER — Change Detection (Safe Registry Polling)
 # ============================================================================
 
-def monitor_system_changes(base_dir, fingerprint, zw_client):
+def monitor_system_changes(base_dir, fingerprint, zw_client, orchestrator=None):
     """
     Background thread that polls every MONITOR_INTERVAL seconds.
     Detects software installs/uninstalls/updates AND hardware profile changes.
     Sends only deltas to the backend (no CSV, no full sync).
-    """
-    # Software snapshot — keyed by "name::version" for accurate update detection
-    last_sw_snapshot = {f"{s['name']}::{s['version']}": s for s in get_installed_software_registry()}
 
-    # Hardware snapshot hash for full-profile diffing
+    When an orchestrator is provided (normal path), software delta is
+    computed via orchestrator.run_registry_delta() which covers the
+    Uninstall hive, Windows Store apps, and active drivers.
+
+    When orchestrator is None (fallback / import failure), the original
+    registry-only snapshot logic is used unchanged.
+    """
+    # ── Software snapshot initialisation ──────────────────────────────────
+    # When using the orchestrator the snapshot is maintained inside it.
+    # When falling back, we keep the local dict for diffing.
+    if orchestrator is None:
+        last_sw_snapshot = {
+            f"{s['name']}::{s['version']}": s
+            for s in get_installed_software_registry()
+        }
+    else:
+        last_sw_snapshot = {}  # unused in orchestrator path
+
+    # ── Hardware snapshot (shared by both paths) ───────────────────────────
     last_hardware_profile = get_detailed_hardware_profile()
     last_hardware_hash = hashlib.sha256(
         json.dumps(last_hardware_profile, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
+    # Hardware changes at most when hardware is physically swapped —
+    # checking every 60s was wasteful.  15 minutes is more than sufficient.
+    _HW_CHECK_INTERVAL = 900  # seconds
+    last_hw_check_time = time.time()
 
     while True:
         try:
             time.sleep(MONITOR_INTERVAL)
-            
+
             if not is_inventory_scan_enabled():
                 continue
 
-            # --- Software delta ---
-            current_list = get_installed_software_registry()
-            current_sw_snapshot = {f"{s['name']}::{s['version']}": s for s in current_list}
+            # ── Software delta ─────────────────────────────────────────────
+            if orchestrator is not None:
+                # Orchestrator path: covers registry + Store + drivers.
+                # Returns (added_list, removed_list) as API-ready dicts.
+                sw_added_list, sw_removed_list = orchestrator.run_registry_delta()
+                sw_added   = sw_added_list    # already tagged change_type="added"
+                sw_removed = sw_removed_list  # already tagged change_type="removed"
+            else:
+                # Fallback path: original registry-only diffing (unchanged logic)
+                current_list = get_installed_software_registry()
+                current_sw_snapshot = {
+                    f"{s['name']}::{s['version']}": s for s in current_list
+                }
+                added_keys   = set(current_sw_snapshot.keys()) - set(last_sw_snapshot.keys())
+                removed_keys = set(last_sw_snapshot.keys()) - set(current_sw_snapshot.keys())
 
-            sw_added   = set(current_sw_snapshot.keys()) - set(last_sw_snapshot.keys())
-            sw_removed = set(last_sw_snapshot.keys()) - set(current_sw_snapshot.keys())
+                for key in added_keys:
+                    current_sw_snapshot[key]["change_type"] = "added"
+                for key in removed_keys:
+                    last_sw_snapshot[key]["change_type"] = "removed"
 
-            # --- Hardware delta (full-profile hash + key-level diff summary) ---
-            current_hardware_profile = get_detailed_hardware_profile()
-            current_hardware_hash = hashlib.sha256(
-                json.dumps(current_hardware_profile, sort_keys=True, default=str).encode("utf-8")
-            ).hexdigest()
+                sw_added   = [current_sw_snapshot[k] for k in added_keys]
+                sw_removed = [last_sw_snapshot[k]    for k in removed_keys]
+                last_sw_snapshot = current_sw_snapshot
 
+            # ── Hardware delta (throttled to once per 15 minutes) ──────────
+            now = time.time()
             hw_added   = []
             hw_removed = []
 
-            if current_hardware_hash != last_hardware_hash:
-                old_flat = flatten_hardware_profile(last_hardware_profile)
-                new_flat = flatten_hardware_profile(current_hardware_profile)
+            if now - last_hw_check_time >= _HW_CHECK_INTERVAL:
+                last_hw_check_time = now
+                current_hardware_profile = get_detailed_hardware_profile()
+                current_hardware_hash = hashlib.sha256(
+                    json.dumps(current_hardware_profile, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()
 
-                for key, value in new_flat.items():
-                    if old_flat.get(key) != value:
-                        hw_added.append({
-                            "name": key,
-                            "vendor": "Hardware",
-                            "version": value,
-                            "category": "profile",
-                        })
+                if current_hardware_hash != last_hardware_hash:
+                    old_flat = flatten_hardware_profile(last_hardware_profile)
+                    new_flat = flatten_hardware_profile(current_hardware_profile)
 
-                for key, value in old_flat.items():
-                    if new_flat.get(key) != value:
-                        hw_removed.append({
-                            "name": key,
-                            "vendor": "Hardware",
-                            "version": value,
-                            "category": "profile",
-                        })
+                    for key, value in new_flat.items():
+                        if old_flat.get(key) != value:
+                            hw_added.append({
+                                "name": key,
+                                "vendor": "Hardware",
+                                "version": value,
+                                "category": "profile",
+                            })
 
+                    for key, value in old_flat.items():
+                        if new_flat.get(key) != value:
+                            hw_removed.append({
+                                "name": key,
+                                "vendor": "Hardware",
+                                "version": value,
+                                "category": "profile",
+                            })
+
+                    last_hardware_profile = current_hardware_profile
+                    last_hardware_hash    = current_hardware_hash
+            else:
+                # Not time for a hardware check — reuse the last known profile
+                # so hw_added / hw_removed stay empty and we skip the sync.
+                current_hardware_profile = last_hardware_profile
+
+            # ── Sync if anything changed ───────────────────────────────────
             if sw_added or sw_removed or hw_added or hw_removed:
-                for key in sw_added:
-                    current_sw_snapshot[key]["change_type"] = "added"
-                for key in sw_removed:
-                    last_sw_snapshot[key]["change_type"] = "removed"
-
-                sw_added_list   = [current_sw_snapshot[k] for k in sw_added]
-                sw_removed_list = [last_sw_snapshot[k] for k in sw_removed]
-
                 logging.info(
                     f"System change detected: SW +{len(sw_added)} -{len(sw_removed)} | "
                     f"HW +{len(hw_added)} -{len(hw_removed)}"
@@ -3048,20 +3461,18 @@ def monitor_system_changes(base_dir, fingerprint, zw_client):
 
                 if zw_client:
                     zw_client.sync_delta(
-                        sw_added_list, sw_removed_list,
-                        added_hw=hw_added if hw_added else None,
+                        sw_added, sw_removed,
+                        added_hw=hw_added   if hw_added   else None,
                         removed_hw=hw_removed if hw_removed else None,
-                        hardware_snapshot=current_hardware_profile if hw_added or hw_removed else None,
+                        hardware_snapshot=current_hardware_profile if (hw_added or hw_removed) else None,
                     )
-                    event_detail = {"sw_added": len(sw_added), "sw_removed": len(sw_removed)}
+                    event_detail = {
+                        "sw_added":   len(sw_added),
+                        "sw_removed": len(sw_removed),
+                    }
                     if hw_added or hw_removed:
                         event_detail["hw_changes"] = len(hw_added) + len(hw_removed)
                     zw_client.log_event("SYSTEM_CHANGE", event_detail)
-
-                # Always update snapshots
-                last_sw_snapshot = current_sw_snapshot
-                last_hardware_profile = current_hardware_profile
-                last_hardware_hash = current_hardware_hash
 
         except Exception as e:
             logging.error(f"Monitor error: {e}")
@@ -3471,6 +3882,18 @@ def _is_agent_active(zw_client):
 
 
 def _is_daemon_running():
+    if sys.platform != "win32":
+        lock_path = os.path.join(get_base_dir(), "state", "daemon.lock")
+        if os.path.exists(lock_path):
+            try:
+                with open(lock_path, "r") as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, 0)
+                return True
+            except (OSError, ValueError):
+                pass
+        return False
+
     probe = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
     err = ctypes.windll.kernel32.GetLastError()
     if probe:
@@ -3484,6 +3907,16 @@ def _spawn_daemon_process():
         daemon_cmd = [sys.executable, target_path, *_daemon_args()]
     else:
         daemon_cmd = [target_path, *_daemon_args()]
+
+    if sys.platform != "win32":
+        daemon_proc = subprocess.Popen(
+            daemon_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        time.sleep(1.5)
+        return daemon_proc.poll() is None, daemon_proc.pid
 
     DETACHED = 0x00000008
     NEW_GROUP = 0x00000200
@@ -3614,6 +4047,43 @@ def consume_shutdown_signal(base_dir):
     return payload
 
 
+# ── Unlink signal: GUI → Daemon IPC ─────────────────────────────────────────
+# The GUI writes this file atomically before calling clear_local_state() so the
+# background daemon can detect the unlink and release its SQLite locks within
+# the next polling tick (≤ 2 seconds) instead of waiting up to 30 seconds for
+# the heartbeat loop to run.
+
+def _unlink_signal_path(base_dir):
+    return _state_path(base_dir, "unlink.signal")
+
+
+def request_unlink_signal(base_dir):
+    """Write an unlink signal file so the daemon releases its cache locks fast."""
+    signal_path = _unlink_signal_path(base_dir)
+    try:
+        os.makedirs(os.path.dirname(signal_path), exist_ok=True)
+        temp_path = f"{signal_path}.tmp"
+        with open(temp_path, "wb") as handle:
+            handle.write(b"unlink")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, signal_path)
+    except Exception as _sig_err:
+        logging.warning("[UNLINK] Failed writing unlink signal: %s", _sig_err)
+
+
+def consume_unlink_signal(base_dir):
+    """Return True and delete the signal file if it exists, else False."""
+    signal_path = _unlink_signal_path(base_dir)
+    if os.path.exists(signal_path):
+        try:
+            os.remove(signal_path)
+        except Exception:
+            pass
+        return True
+    return False
+
+
 def _wait_for_enrollment(zw_client, base_dir):
     if zw_client.jwt:
         return True
@@ -3692,6 +4162,62 @@ def _wait_for_enrollment(zw_client, base_dir):
         return False
 
     return bool(zw_client.jwt)
+
+
+def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
+    """
+    Runs the full post-enrollment scan sequence:
+      1. Layer 0 registry sync (fast, immediate)
+      2. Cache flush: push cached filesystem items as initial delta
+      3. Reset orchestrator cold-start flag so next periodic run = deep scan
+      4. Restart periodic scans (will immediately deep-scan)
+    Called after every re-enrollment event (unlink, auth failure, license renewal).
+    """
+    try:
+        # Step 1: Layer 0 inventory sync
+        if orchestrator is not None:
+            software = orchestrator.run_full_scan(include_filesystem=False)
+        else:
+            software = get_installed_software_registry()
+        hardware_data = get_detailed_hardware_profile()
+        zw_client.sync_full(software, hardware_data)
+        logging.info("[RE-ENROLL] Layer 0 sync complete.")
+
+        if orchestrator is not None:
+            # Step 2: Flush cached filesystem items as delta
+            try:
+                cached_items = orchestrator._cache.all_cached_items()
+                if cached_items:
+                    with orchestrator._snapshot_lock:
+                        existing_keys = set(orchestrator._last_snapshot.keys())
+                    new_additions = []
+                    for item in cached_items:
+                        if item.is_valid() and item.dedup_key() not in existing_keys:
+                            d = item.to_api_dict()
+                            d["change_type"] = "added"
+                            new_additions.append(d)
+                    if new_additions:
+                        zw_client.sync_delta(new_additions, [])
+                        logging.info("[RE-ENROLL] Flushed %d cached items.", len(new_additions))
+            except Exception as flush_err:
+                logging.warning("[RE-ENROLL] Cache flush failed (non-fatal): %s", flush_err)
+
+            # Step 3 & 4: Stop existing scan thread, reset cold-start, restart scans
+            orchestrator.stop_periodic_scans()
+            orchestrator.reset_for_reenrollment()
+
+            def _on_fs_delta(added_items, removed_items):
+                if (added_items or removed_items) and zw_client.jwt:
+                    zw_client.sync_delta(added_items, removed_items)
+
+            orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
+            logging.info("[RE-ENROLL] Periodic scans restarted — deep scan will run immediately.")
+
+    except Exception as e:
+        logging.error("[RE-ENROLL] Post-enrollment scan failed: %s", e)
+
+
+
 
 
 def _append_gui_log(base_dir, message):
@@ -4187,60 +4713,8 @@ def watchdog_process(target_exe_path):
                     logging.info("[WATCHDOG] Shutdown signal detected; exiting watchdog.")
                     sys.exit(0)
 
-                logging.info("[WATCHDOG] Main agent killed! Attempting to spawn password prompt...")
-
-                # --- ANTI-FORK-BOMB: only ONE password prompt at a time ---
-                prompt_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, PROMPT_MUTEX_NAME)
-                prompt_err = ctypes.windll.kernel32.GetLastError()
-                if prompt_err == 183:  # Another prompt already running
-                    logging.info("[WATCHDOG] Another password prompt is already running. Waiting...")
-                    if prompt_mutex:
-                        ctypes.windll.kernel32.CloseHandle(prompt_mutex)
-                    time.sleep(10)
-                    continue
-
-                # Spawn a VISIBLE password prompt as a completely separate process
-                if target_exe_path.endswith('.py'):
-                    prompt_args = [sys.executable, target_exe_path, "--password-prompt"]
-                else:
-                    prompt_args = [target_exe_path, "--password-prompt"]
-                    
-                try:
-                    exit_code = subprocess.call(
-                        prompt_args,
-                        creationflags=subprocess.CREATE_NEW_CONSOLE,
-                    )
-                except Exception as e:
-                    logging.error(f"[WATCHDOG] Failed to spawn password prompt: {e}")
-                    exit_code = 1  # If prompt itself crashed, treat as denied
-                finally:
-                    # Release the prompt mutex
-                    if prompt_mutex:
-                        ctypes.windll.kernel32.CloseHandle(prompt_mutex)
-
-                if exit_code == 0:
-                    # Correct password — authorized shutdown
-                    logging.info("[WATCHDOG] Authorized shutdown. Exiting watchdog.")
-                    sys.exit(0)
-                else:
-                    # Wrong password or window closed — REVIVE the agent!
-                    logging.info("[WATCHDOG] Unauthorized kill. Reviving main agent (no-watchdog mode)...")
-                    # Use --no-watchdog to prevent the revived agent from spawning ANOTHER watchdog
-                    # (this watchdog is still alive and monitoring)
-                    if target_exe_path.endswith('.py'):
-                        subprocess.Popen(
-                            [sys.executable, target_exe_path, "--no-watchdog"],
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                            startupinfo=_windows_hidden_startupinfo(),
-                        )
-                    else:
-                        subprocess.Popen(
-                            [target_exe_path, "--no-watchdog"],
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                            startupinfo=_windows_hidden_startupinfo(),
-                        )
-                    # 30-second cooldown to prevent rapid fork cycling
-                    time.sleep(30)
+                logging.info("[WATCHDOG] Main agent killed! Exiting watchdog (termination protection disabled).")
+                sys.exit(0)
 
             time.sleep(5)  # Reduced polling frequency (was 3s)
         except Exception as e:
@@ -4348,6 +4822,8 @@ def show_windows_notification(title, message):
 
 def hide_console():
     """Hides the console window so the agent runs invisibly."""
+    if sys.platform != "win32":
+        return
     whnd = ctypes.windll.kernel32.GetConsoleWindow()
     if whnd != 0:
         ctypes.windll.user32.ShowWindow(whnd, 0)  # SW_HIDE
@@ -4461,32 +4937,112 @@ def main_agent():
         logging.info("Skipping file ACL protection in standard profile.")
 
 
+    # --- Initialize Scan Orchestrator ---
+    # Wraps the existing registry scanner + adds Store apps, drivers,
+    # OS version, portable PE binaries, and manifest parsing.
+    # The orchestrator is passed to the monitor thread so both share
+    # the same SQLite cache and snapshot state.
+    try:
+        from scanner import ScanOrchestrator
+        from platforms import PlatformFactory
+
+        platform = PlatformFactory.create(get_installed_software_registry)
+
+        _orchestrator = ScanOrchestrator(
+            base_dir=base_dir,
+            existing_registry_fn=get_installed_software_registry,
+            agent_version=AGENT_VERSION,
+            software_collector=platform.software_collector,
+            binary_inspector=platform.binary_inspector,
+            filesystem_walker=platform.filesystem_walker,
+        )
+        # Warm the delta snapshot from the previous session's cache so
+        # the first run_registry_delta() doesn't treat everything as new.
+        _orchestrator.load_snapshot_from_cache()
+        logging.info("ScanOrchestrator initialized via PlatformFactory (scan cache warmed).")
+    except Exception as _orch_err:
+        logging.error(f"ScanOrchestrator init failed, falling back to registry only: {_orch_err}")
+        _orchestrator = None
+
     # --- Full Inventory ---
     if is_inventory_scan_enabled():
         show_windows_notification("Zerowatch", "Sentinel Agent running in Background")
         logging.info("Running full software + hardware inventory...")
-        # Get software list
-        software = get_installed_software_registry()
-        
-        # Get high-fidelity hardware profile
+
+        if _orchestrator is not None:
+            # Phase A: Layer 0 only (registry, Store, drivers, OS version).
+            # Completes in <1s — submit to backend immediately so the first
+            # heartbeat is never delayed by a slow filesystem walk.
+            software = _orchestrator.run_full_scan(include_filesystem=False)
+        else:
+            # Fallback: existing registry scanner (unchanged behaviour).
+            software = get_installed_software_registry()
+
+        # Get high-fidelity hardware profile (unchanged)
         hardware_data = get_detailed_hardware_profile()
 
         logging.info("Syncing full inventory to backend via JSON...")
         zw_client.sync_full(software, hardware_data)
         show_windows_notification("Zerowatch", "Sentinel Agent stopped scanning")
+
+        if _orchestrator is not None:
+            # Phase B-1: Immediately flush cached items from previous session.
+            # The scan cache already has 7,000+ items from the last completed scan.
+            # Emit them as 'added' deltas right now so the backend shows the full
+            # inventory within seconds — before any race condition can interrupt us.
+            # The periodic scan will then only need to send *changes* since last run.
+            try:
+                cached_items = _orchestrator._cache.all_cached_items()
+                if cached_items:
+                    # Build additions: items in cache that are NOT already in the
+                    # current snapshot (which only has Layer 0 registry items).
+                    with _orchestrator._snapshot_lock:
+                        existing_keys = set(_orchestrator._last_snapshot.keys())
+                    new_additions = []
+                    for item in cached_items:
+                        if item.is_valid() and item.dedup_key() not in existing_keys:
+                            d = item.to_api_dict()
+                            d["change_type"] = "added"
+                            new_additions.append(d)
+                            with _orchestrator._snapshot_lock:
+                                _orchestrator._last_snapshot[item.dedup_key()] = item
+                    if new_additions:
+                        logging.info(
+                            "Flushing %d cached items to backend as initial delta.",
+                            len(new_additions),
+                        )
+                        zw_client.sync_delta(new_additions, [])
+                        logging.info("Cache flush complete: %d items pushed.", len(new_additions))
+                    else:
+                        logging.info("Cache flush: no new items beyond Layer 0.")
+            except Exception as _flush_err:
+                logging.warning("Cache flush failed (non-fatal): %s", _flush_err)
+
+            # Phase B-2: periodic incremental filesystem scan (background daemon thread).
+            # Priority scan runs every 4h covering well-known software locations.
+            # Deep scan runs every 24h covering all fixed drives from root.
+            # Results are submitted as sync_delta calls — additions and removals.
+            def _on_fs_delta(added_items, removed_items):
+                if (added_items or removed_items) and zw_client.jwt:
+                    zw_client.sync_delta(added_items, removed_items)
+
+            _orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
+            logging.info("Periodic filesystem scan started (4h priority / 24h deep).")
+
     else:
         logging.info("Inventory scan is disabled in settings. Skipping initial full scan.")
-        
+
     zw_client.log_event("STARTUP", {"version": AGENT_VERSION, "status": "active"})
 
     # --- Background Monitor ---
     logging.info("Starting background change monitor...")
     monitor = threading.Thread(
         target=monitor_system_changes,
-        args=(base_dir, fingerprint, zw_client),
+        args=(base_dir, fingerprint, zw_client, _orchestrator),
         daemon=True
     )
     monitor.start()
+
 
     # --- Heartbeat & Mutual Monitoring Loop ---
     logging.info("Entering heartbeat loop. Agent is fully active.")
@@ -4494,6 +5050,10 @@ def main_agent():
     last_watchdog_check = 0
     last_asset_poll = 0
     was_offline = False
+
+    pin_mismatch_backoff_idx = 0
+    pin_mismatch_next_retry = 0.0
+
     while True:
         try:
             shutdown_request = consume_shutdown_signal(base_dir)
@@ -4506,8 +5066,71 @@ def main_agent():
                 unregister_windows_service()
                 break
 
-            time.sleep(30)  # Base loop interval
             now = time.time()
+            if cert_pinning.PIN_MISMATCH_DETECTED:
+                if now < pin_mismatch_next_retry:
+                    time.sleep(10)
+                    continue
+                else:
+                    logging.info("[PINNING] Retrying connection after pin mismatch backoff...")
+                    cert_pinning.PIN_MISMATCH_DETECTED = False
+
+            # --- Responsive sleep: poll every 2 s for unlink/shutdown signals ---
+            # This replaces a single time.sleep(30) so the daemon can react to an
+            # unlink event within 2 seconds and release the SQLite file locks
+            # before the GUI's clear_local_state() tries to delete the db files.
+            _orchestrator_closed_for_unlink = False
+            for _tick in range(15):  # 15 × 2 s = 30 s total base interval
+                time.sleep(2)
+                # Fast-path: check for an unlink signal written by the GUI
+                if consume_unlink_signal(base_dir):
+                    logging.info("[MAIN] Unlink signal received: closing orchestrator to release db locks.")
+                    if _orchestrator is not None:
+                        try:
+                            _orchestrator.stop_periodic_scans()
+                            _orchestrator.close()
+                        except Exception as _ce:
+                            logging.warning("[MAIN] Error closing orchestrator: %s", _ce)
+                    _orchestrator_closed_for_unlink = True
+                    break
+                # Also respect shutdown signal mid-sleep
+                if consume_shutdown_signal(base_dir):
+                    logging.info("[MAIN] Shutdown signal detected mid-sleep. Exiting.")
+                    break
+            if _orchestrator_closed_for_unlink:
+                # Force the outer loop to reach the JWT-missing branch immediately
+                zw_client.jwt = None
+                continue
+            now = time.time()
+
+            if cert_pinning.PIN_MISMATCH_DETECTED:
+                backoff_time = [30, 120, 300, 900, 3600][min(pin_mismatch_backoff_idx, 4)]
+                logging.warning(f"[PINNING] Pin mismatch active. Backing off for {backoff_time} seconds...")
+                pin_mismatch_next_retry = now + backoff_time
+                pin_mismatch_backoff_idx += 1
+                continue
+
+            # --- Dynamic JWT Reloading for Re-enrollment ---
+            if not zw_client.jwt:
+                # If we were previously active and had the orchestrator open,
+                # close it to stop background scans and release the SQLite file locks.
+                if _orchestrator is not None:
+                    try:
+                        logging.info("[MAIN] Agent unlinked: stopping scans and closing cache connection.")
+                        _orchestrator.stop_periodic_scans()
+                        _orchestrator.close()
+                    except Exception as _close_err:
+                        logging.warning("[MAIN] Error closing orchestrator (non-fatal): %s", _close_err)
+
+                zw_client.jwt = zw_client._load_jwt()
+                if zw_client.jwt:
+                    logging.info("[MAIN] Token dynamically re-loaded from disk. Re-enrolling agent.")
+                    _run_post_enrollment_scan(zw_client, _orchestrator, base_dir)
+                    last_heartbeat = 0
+                    was_offline = False
+                else:
+                    # Skip active heartbeat checks until token is available
+                    continue
 
             # --- Connectivity-aware offline queue flush ---
             network_ok = check_backend_connectivity()
@@ -4568,12 +5191,11 @@ def main_agent():
                     logging.info("[LICENSE] License inactive. Pausing telemetry and heartbeat until renewed.")
                 elif (not license_was_active) and license_is_active:
                     logging.info("[LICENSE] License renewed. Resuming heartbeat and data collection.")
-                    software = get_installed_software_registry()
-                    hardware_data = get_detailed_hardware_profile()
-                    zw_client.sync_full(software, hardware_data)
+                    _run_post_enrollment_scan(zw_client, _orchestrator, base_dir)
                     zw_client.log_event("LICENSE_RENEWED", {"status": "active"})
                 elif result is True:
                     logging.info("[HEARTBEAT] Success (status=%s).", zw_client.last_server_status)
+                    pin_mismatch_backoff_idx = 0
                     if was_offline:
                         was_offline = False
                         logging.info("[ONLINE] Reconnected to backend.")
@@ -4583,9 +5205,7 @@ def main_agent():
                     zw_client.clear_local_state()
                     if not _wait_for_enrollment(zw_client, base_dir):
                         break
-                    software = get_installed_software_registry()
-                    hardware_data = get_detailed_hardware_profile()
-                    zw_client.sync_full(software, hardware_data)
+                    _run_post_enrollment_scan(zw_client, _orchestrator, base_dir)
                     zw_client.log_event("REENROLLED", {"status": "active"})
                     last_heartbeat = 0
                     was_offline = False
@@ -4604,9 +5224,7 @@ def main_agent():
                             break
                         # Reset state after successful re-enrollment
                         zw_client.auth_failure_count = 0
-                        software = get_installed_software_registry()
-                        hardware_data = get_detailed_hardware_profile()
-                        zw_client.sync_full(software, hardware_data)
+                        _run_post_enrollment_scan(zw_client, _orchestrator, base_dir)
                         zw_client.log_event("REENROLLED", {"status": "active"})
                         last_heartbeat = 0
                         was_offline = False
@@ -4619,6 +5237,7 @@ def main_agent():
             time.sleep(10)
 
     logging.info("SentinelAgent shutdown completed.")
+
 class EnrollmentFrame(tk.Frame):
     def __init__(self, master, zw_client):
         super().__init__(master)
@@ -4685,56 +5304,8 @@ class EnrollmentFrame(tk.Frame):
         self.screens["INDIVIDUAL_CODE"] = self._create_individual_code_screen()
         self.screens["METADATA"] = self._create_metadata_screen()
         self.screens["PENDING"] = self._create_pending_screen()
-        
-        settings_btn = tk.Button(main_content, text="⚙ Settings", bg=self.c_bg_main, fg=self.c_cyan, font=self.f_btn, bd=0, activebackground=self.c_bg_main, activeforeground=self.c_cyan_hover, cursor="hand2", command=self.show_settings_popup)
-        settings_btn.place(relx=0.98, rely=0.02, anchor=tk.NE)
             
         self.show_screen(self.state)
-
-    def show_settings_popup(self):
-        try:
-            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except Exception:
-            is_admin = False
-            
-        if not is_admin:
-            import tkinter.messagebox as mb
-            mb.showerror("Access Denied", "This feature can only be accessed with administrator access.")
-            return
-
-        popup = tk.Toplevel(self)
-        popup.title("SETTINGS")
-        popup.geometry("600x400")
-        popup.configure(bg=self.c_bg_main)
-        popup.resizable(False, False)
-        
-        header = tk.Frame(popup, bg=self.c_bg_main)
-        header.pack(fill=tk.X, pady=(20, 20), padx=20)
-        tk.Label(header, text="SETTINGS", fg=self.c_white, bg=self.c_bg_main, font=("Arial", 18, "bold")).pack(side=tk.LEFT)
-        
-        desc = tk.Label(popup, text="Configure agent system settings. Changes require administrator privileges.", fg=self.c_gray, bg=self.c_bg_main, font=self.f_normal, justify=tk.LEFT)
-        desc.pack(anchor="w", pady=(0, 20), padx=20)
-        
-        container = tk.Frame(popup, bg=self.c_bg_main)
-        container.pack(fill=tk.BOTH, expand=True, padx=20)
-        
-        card = tk.Frame(container, bg=self.c_card_bg, highlightbackground=self.c_card_border, highlightthickness=1, padx=20, pady=15)
-        card.pack(fill=tk.X, pady=5)
-        
-        top = tk.Frame(card, bg=self.c_card_bg)
-        top.pack(fill=tk.X)
-        tk.Label(top, text="Inventory Scan", fg=self.c_cyan, bg=self.c_card_bg, font=("Arial", 11, "bold")).pack(side=tk.LEFT)
-        
-        inventory_enabled = tk.BooleanVar()
-        inventory_enabled.set(is_inventory_scan_enabled())
-            
-        def toggle_inventory():
-            set_inventory_scan_enabled(inventory_enabled.get())
-                
-        chk = tk.Checkbutton(top, variable=inventory_enabled, bg=self.c_card_bg, activebackground=self.c_card_bg, command=toggle_inventory)
-        chk.pack(side=tk.RIGHT)
-        
-        tk.Label(card, text="Automatically scan and collect hardware and software inventory.", fg=self.c_gray, bg=self.c_card_bg, font=("Arial", 9), justify=tk.LEFT).pack(anchor="w", pady=(10,0))
 
     def show_screen(self, state):
         self.state = state
@@ -4863,7 +5434,7 @@ class EnrollmentFrame(tk.Frame):
         self.status_label_pending.pack(pady=(30, 0))
         
         def on_cancel():
-            self.zw_client.clear_join_state() # clear state
+            self.zw_client.cancel_join_request() # notify server & clear local state
             self.show_screen("TEAM_CODE")
             
         cancel_btn = tk.Button(frame, text="Cancel Request", bg=self.c_card_bg, fg=self.c_gray, font=self.f_normal, bd=0, activebackground=self.c_card_bg, activeforeground=self.c_white, cursor="hand2", command=on_cancel)
@@ -5238,7 +5809,10 @@ class DashboardFrame(tk.Frame):
         def switch_page(page_name):
             if page_name == "settings":
                 try:
-                    is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+                    if sys.platform != "win32":
+                        is_admin = os.getuid() == 0
+                    else:
+                        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
                 except Exception:
                     is_admin = False
                 if not is_admin:
@@ -5400,6 +5974,102 @@ class DashboardFrame(tk.Frame):
         unlink_btn.pack(side=tk.RIGHT)
         
         tk.Label(card3, text="Disconnect this device from the currently linked team.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
+
+        # --- Card 4: Deep Scan ---
+        card4 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=20, pady=15)
+        card4.pack(fill=tk.X, pady=5)
+
+        top4 = tk.Frame(card4, bg=self.c_bg_card)
+        top4.pack(fill=tk.X)
+        tk.Label(top4, text="Deep Scan (SBOM)", fg=self.c_cyan, bg=self.c_bg_card, font=self.f_normal_bold).pack(side=tk.LEFT)
+
+        scan_controls = tk.Frame(top4, bg=self.c_bg_card)
+        scan_controls.pack(side=tk.RIGHT)
+
+        folder_var = tk.StringVar(value="C:\\")
+
+        def browse_folder():
+            from tkinter import filedialog
+            folder = filedialog.askdirectory(title="Select Folder to Scan")
+            if folder:
+                folder_var.set(folder)
+
+        tk.Button(scan_controls, text="Browse", bg=self.c_bg_sidebar, fg=self.c_white, font=self.f_small, bd=1, command=browse_folder).pack(side=tk.LEFT, padx=5)
+        tk.Entry(scan_controls, textvariable=folder_var, bg=self.c_bg_sidebar, fg=self.c_white, width=30).pack(side=tk.LEFT, padx=5)
+
+        # Add a progress frame below the description
+        progress_frame = tk.Frame(card4, bg=self.c_bg_card)
+        # It will be packed later
+
+        from tkinter import ttk
+        style = ttk.Style()
+        style.theme_use('default')
+        style.configure("TProgressbar", thickness=10, background=self.c_cyan_dark)
+        
+        progress_bar = ttk.Progressbar(progress_frame, style="TProgressbar", mode='indeterminate')
+        status_label = tk.Label(progress_frame, text="", fg=self.c_cyan, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT)
+
+        def mock_progress_worker(target, scan_running):
+            import os, time
+            for root, dirs, files in os.walk(target):
+                if not scan_running[0]:
+                    break
+                # Skip excluded dirs for visual consistency
+                if "AppData" in root or "node_modules" in root or "Windows" in root:
+                    continue
+                for name in files:
+                    if not scan_running[0]:
+                        break
+                    path = os.path.join(root, name)
+                    # Safe UI update from thread
+                    try:
+                        trunc_path = path if len(path) < 70 else "..." + path[-67:]
+                        status_label.config(text=f"Scanning: {trunc_path}")
+                    except:
+                        pass
+                    time.sleep(0.005) # Small delay to not lock UI and match syft speed roughly
+
+        def run_scan_thread(target):
+            scan_running = [True]
+            progress_frame.pack(fill=tk.X, pady=(10,0))
+            progress_bar.pack(fill=tk.X, pady=5)
+            status_label.pack(anchor="w")
+            progress_bar.start(10)
+            
+            run_btn.config(state="disabled")
+            
+            import threading
+            prog_t = threading.Thread(target=mock_progress_worker, args=(target, scan_running), daemon=True)
+            prog_t.start()
+            
+            try:
+                # run_syft_deep_scan is a top-level function
+                sbom_data = run_syft_deep_scan(self.zw_client.base_dir, target)
+                if sbom_data:
+                    status_label.config(text="Uploading SBOM to dashboard...")
+                    self.zw_client.send_sbom(sbom_data)
+            except Exception as e:
+                import logging
+                logging.error(f"Manual scan error: {e}")
+            finally:
+                scan_running[0] = False
+                progress_bar.stop()
+                progress_bar.pack_forget()
+                status_label.config(text="Scan Complete!")
+                run_btn.config(state="normal")
+                show_windows_notification("Zerowatch", f"Deep scan on {target} finished.")
+
+        def on_run_scan():
+            import threading
+            target = folder_var.get()
+            if not target: return
+            show_windows_notification("Zerowatch", f"Starting deep scan on {target}...")
+            threading.Thread(target=run_scan_thread, args=(target,), daemon=True).start()
+
+        run_btn = tk.Button(scan_controls, text="Run Scan", bg=self.c_cyan_dark, fg=self.c_cyan, font=self.f_normal_bold, bd=0, cursor="hand2", command=on_run_scan)
+        run_btn.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(card4, text="Manually trigger a Syft scan on a selected folder. This will generate an SBOM and upload it to the dashboard.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
 
 
     def _build_data_info_content(self, parent_frame):
@@ -5915,18 +6585,19 @@ class UnifiedSentinelGUI(tk.Tk):
             _append_gui_log(get_base_dir(), f"GUI icon load failed: {e}")
 
         # Final Taskbar Icon Force (Windows OS level)
-        try:
-            icon_path = self._resolve_icon_path()
-            if icon_path:
-                from ctypes import windll
-                hwnd = windll.user32.GetParent(self.winfo_id())
-                # Load icon using shell32 to ensure it is handled as a proper HICON
-                hicon = windll.user32.LoadImageW(0, icon_path, 1, 0, 0, 0x00000010)
-                if hicon:
-                    windll.user32.SendMessageW(hwnd, 0x0080, 1, hicon) # ICON_BIG
-                    windll.user32.SendMessageW(hwnd, 0x0080, 0, hicon) # ICON_SMALL
-        except Exception:
-            pass
+        if sys.platform == "win32":
+            try:
+                icon_path = self._resolve_icon_path()
+                if icon_path:
+                    from ctypes import windll
+                    hwnd = windll.user32.GetParent(self.winfo_id())
+                    # Load icon using shell32 to ensure it is handled as a proper HICON
+                    hicon = windll.user32.LoadImageW(0, icon_path, 1, 0, 0, 0x00000010)
+                    if hicon:
+                        windll.user32.SendMessageW(hwnd, 0x0080, 1, hicon) # ICON_BIG
+                        windll.user32.SendMessageW(hwnd, 0x0080, 0, hicon) # ICON_SMALL
+            except Exception:
+                pass
 
         self.current_frame = None
         
@@ -5959,6 +6630,8 @@ class UnifiedSentinelGUI(tk.Tk):
             pass
 
     def _force_show_window(self):
+        if sys.platform != "win32":
+            return
         try:
             hwnd = self.winfo_id()
             ctypes.windll.user32.ShowWindow(hwnd, 9)
@@ -6009,6 +6682,26 @@ class UnifiedSentinelGUI(tk.Tk):
                     else:
                          _append_gui_log(self.zw_client.base_dir, "[GUI] Unlink signal could not be verified (Spoof?). Ignoring.")
                 
+                elif ntype == "deep_scan":
+                    target_folder = "C:\\"
+                    if isinstance(data, dict) and data.get("target_folder"):
+                        target_folder = str(data.get("target_folder")).strip()
+                    
+                    _append_gui_log(self.zw_client.base_dir, f"[GUI] Deep scan command received for {target_folder}. Starting background scan...")
+                    def _scan_thread(t_folder):
+                        sbom_data = run_syft_deep_scan(self.zw_client.base_dir, t_folder)
+                        if sbom_data:
+                            _append_gui_log(self.zw_client.base_dir, "[GUI] Deep scan completed. Sending to server...")
+                            success = self.zw_client.send_sbom(sbom_data)
+                            if success:
+                                _append_gui_log(self.zw_client.base_dir, "[GUI] SBOM successfully sent.")
+                            else:
+                                _append_gui_log(self.zw_client.base_dir, "[GUI] Failed to send SBOM data.")
+                        else:
+                            _append_gui_log(self.zw_client.base_dir, "[GUI] Deep scan failed.")
+                    
+                    threading.Thread(target=_scan_thread, args=(target_folder,), daemon=True).start()
+
                 elif ntype == "feed_ready":
                     # Debounce: don't refresh more than once every 5 seconds from notifications
                     now = time.time()
@@ -6019,10 +6712,13 @@ class UnifiedSentinelGUI(tk.Tk):
 
                     if payload_status == "approved":
                         # Ensure first inventory reaches backend immediately after admin approval.
-                        self.zw_client.trigger_approval_sync(
-                            reason="feed_ready_approved",
-                            min_interval=90,
-                        )
+                        if not _is_daemon_running():
+                            self.zw_client.trigger_approval_sync(
+                                reason="feed_ready_approved",
+                                min_interval=90,
+                            )
+                        else:
+                            logging.info("[GUI] Daemon is running; skipping trigger_approval_sync.")
                     
                     if now - last_refresh > 5:
                         self._last_notif_refresh = now
@@ -6030,10 +6726,13 @@ class UnifiedSentinelGUI(tk.Tk):
                         if isinstance(self.current_frame, EnrollmentFrame):
                             status = self.zw_client.refresh_join_status_once()
                             if status.get("status") == "approved" and self.zw_client.jwt:
-                                self.zw_client.trigger_approval_sync(
-                                    reason="enrollment_approved",
-                                    min_interval=90,
-                                )
+                                if not _is_daemon_running():
+                                    self.zw_client.trigger_approval_sync(
+                                        reason="enrollment_approved",
+                                        min_interval=90,
+                                    )
+                                else:
+                                    logging.info("[GUI] Daemon is running; skipping trigger_approval_sync.")
                                 self.show_dashboard()
                         elif isinstance(self.current_frame, DashboardFrame):
                             # Just refresh the dashboard data
@@ -6064,6 +6763,18 @@ class UnifiedSentinelGUI(tk.Tk):
         self.current_frame.pack(fill=tk.BOTH, expand=True)
 
 def _is_daemon_running():
+    if sys.platform != "win32":
+        lock_path = os.path.join(get_base_dir(), "state", "daemon.lock")
+        if os.path.exists(lock_path):
+            try:
+                with open(lock_path, "r") as f:
+                    pid = int(f.read().strip())
+                os.kill(pid, 0)
+                return True
+            except (OSError, ValueError):
+                pass
+        return False
+
     mutex = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
     err = ctypes.windll.kernel32.GetLastError()
     if mutex:
@@ -6072,8 +6783,24 @@ def _is_daemon_running():
 
 def _spawn_daemon_process():
     exe_path = get_exe_path()
-    args = [exe_path] + _daemon_args()
+    # When running as a compiled .exe, execute it directly.
+    # When running as a .py script from the interpreter, we must prepend
+    # sys.executable so Windows doesn't try to run the .py file as a Win32
+    # application (which causes WinError 193 "not a valid Win32 application").
+    if sys.argv[0].endswith('.exe'):
+        args = [exe_path] + _daemon_args()
+    else:
+        args = [sys.executable, exe_path] + _daemon_args()
     try:
+        if sys.platform != "win32":
+            p = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True, p.pid
+
         DETACHED = 0x00000008
         NEW_GROUP = 0x00000200
         p = subprocess.Popen(
@@ -6092,9 +6819,9 @@ def _daemon_args():
         args.append("--hardened")
     return args
 
-def prompt_consent(base_dir):
+def prompt_consent(base_dir, force_show=False):
     consent_file = os.path.join(_secure_state_dir(base_dir), "consent_accepted.dat")
-    if os.path.exists(consent_file):
+    if not force_show and os.path.exists(consent_file):
         return True
 
     root = tk.Tk()
@@ -6171,11 +6898,15 @@ def prompt_consent(base_dir):
 
 def run_interactive():
     """Redesigned interactive entry point."""
+    if tk is None:
+        print("Interactive GUI mode requires tkinter. Please install python3-tk on Linux (e.g., sudo apt install python3-tk).")
+        sys.exit(1)
     try:
         # Set AppUserModelID to ensure the taskbar icon matches the window icon
         # Use a unique but descriptive string
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ZeroWatch.SentinelAgent.v2")
+        if sys.platform == "win32":
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ZeroWatch.SentinelAgent.v2")
     except Exception:
         pass
 
@@ -6196,7 +6927,6 @@ def run_interactive():
 
     try:
         base_dir = get_base_dir()
-        prompt_consent(base_dir)
         _append_gui_log(base_dir, "GUI startup: begin")
         hostname = resolve_hostname(base_dir)
         operator_username = resolve_agent_username(base_dir, prompt=False)
@@ -6223,6 +6953,11 @@ def run_interactive():
         )
         _append_gui_log(base_dir, "GUI startup: client initialized")
 
+        if not zw_client.is_enrolled():
+            prompt_consent(base_dir, force_show=True)
+        else:
+            prompt_consent(base_dir, force_show=False)
+
         # Ensure a daemon is running so background monitoring persists.
         try:
             if not _is_daemon_running():
@@ -6239,7 +6974,7 @@ def run_interactive():
             verify_res = zw_client.refresh_join_status_once() # This has a timeout
             
             # If server explicitly says we are NOT approved, wipe and show enrollment
-            if verify_res.get("status") in {"denied", "unknown", "unlinked"}:
+            if verify_res.get("status") in {"denied", "unlinked"}:
                 logging.info("Startup: Server rejected enrollment. Wiping local state.")
                 zw_client.clear_local_state()
                 is_enrolled_locally = False
@@ -6272,6 +7007,7 @@ def run_interactive():
         except Exception:
             pass
         logging.error(f"Failed to start interactive mode: {e}", exc_info=True)
+        print(f"Error starting interactive GUI mode: {e}", file=sys.stderr)
         # Show a message box if possible
         try:
             import ctypes
@@ -6337,7 +7073,12 @@ def main():
             logging.info("Daemon blocked: Consent not accepted yet.")
             sys.exit(0)
         logging.info("Starting background daemon agent.")
-        main_agent()
+        if sys.platform != "win32":
+            from sentinel_agent_linux import LinuxSentinelAgent
+            agent = LinuxSentinelAgent()
+            agent.run()
+        else:
+            main_agent()
         return
 
     # Default interactive routing

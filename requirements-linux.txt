@@ -1,0 +1,21 @@
+# requirements-linux.txt
+# Linux-only dependencies
+-r requirements-common.txt
+nuitka>=2.0
+
+# Optional: inotify-based file change monitoring
+# If not installed, LinuxFileWatcher falls back to polling (60s interval)
+# Install on Ubuntu/Debian: sudo apt install python3-inotify
+# pip install inotify_simple
+# inotify_simple>=1.3.5
+
+# Optional: Secret Service / GNOME Keyring secure credential storage
+# If not installed, LinuxSecureStore uses AES-256-GCM file vault fallback
+# Recommended for desktop installations, NOT required for servers
+# Install: sudo apt install python3-secretstorage  OR  pip install secretstorage
+# secretstorage>=3.3.0
+
+# Optional: systemd journal Python bindings
+# If not installed, LinuxEventLogger uses syslog fallback
+# Install: sudo apt install python3-systemd  OR  pip install systemd-python
+# systemd-python>=234
