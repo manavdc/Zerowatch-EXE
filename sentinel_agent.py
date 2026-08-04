@@ -62,16 +62,17 @@ def _global_crash_handler(exc_type, exc_value, exc_traceback):
     except Exception:
         pass
         
-    # Show MessageBox
-    try:
-        ctypes.windll.user32.MessageBoxW(
-            0,
-            f"Failed to start Sentinel Agent:\n{exc_value}\n\nCheck Desktop\\SentinelAgent_crash.log for details.",
-            "Error",
-            0x10,
-        )
-    except Exception:
-        pass
+    # Show MessageBox (Windows only)
+    if sys.platform == "win32" and hasattr(ctypes, "windll"):
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                f"Failed to start Sentinel Agent:\n{exc_value}\n\nCheck Desktop\\SentinelAgent_crash.log for details.",
+                "Error",
+                0x10,
+            )
+        except Exception:
+            pass
     
     sys.exit(1)
 
@@ -270,9 +271,19 @@ def _sanitize_organization_name(value, fallback="Unknown"):
 
 
 def _secure_state_dir(base_dir):
-    program_data = str(os.environ.get("PROGRAMDATA") or "").strip()
-    if program_data:
-        return os.path.join(program_data, "ZeroWatch", "state")
+    if sys.platform == "win32":
+        program_data = str(os.environ.get("PROGRAMDATA") or "").strip()
+        if program_data:
+            return os.path.join(program_data, "ZeroWatch", "state")
+    elif sys.platform == "darwin":
+        is_root = (os.geteuid() == 0) if hasattr(os, "geteuid") else False
+        if is_root:
+            return "/Library/Application Support/ZeroWatch/state"
+        return os.path.expanduser("~/Library/Application Support/ZeroWatch/state")
+    elif sys.platform.startswith("linux"):
+        is_root = (os.geteuid() == 0) if hasattr(os, "geteuid") else False
+        if is_root:
+            return "/var/lib/zerowatch/state"
     return os.path.join(base_dir, "state")
 
 
@@ -667,16 +678,9 @@ class EncryptedFileHandler(logging.Handler):
                 except OSError:
                     # Another process is mid-write; skip this record rather than crash.
                     return
-                if sys.platform == "win32":
+                if sys.platform == "win32" and hasattr(ctypes, "windll"):
                     try:
-                        subprocess.run(
-                            ["attrib", "+H", "+S", self.filepath],
-                            capture_output=True,
-                            text=True,
-                            timeout=3,
-                            startupinfo=_windows_hidden_startupinfo(),
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                        )
+                        ctypes.windll.kernel32.SetFileAttributesW(self.filepath, 0x02 | 0x04)
                     except Exception:
                         pass
         except Exception:
@@ -4789,6 +4793,8 @@ def export_products_csv(base_dir, inventory):
 
 def show_windows_notification(title, message):
     """Shows a native Windows toast notification."""
+    if sys.platform != "win32":
+        return
     try:
         temp_dir = os.environ.get('TEMP', 'C:\\Windows\\Temp')
         ps_script = (
@@ -6072,7 +6078,9 @@ class DashboardFrame(tk.Frame):
         tk.Label(card4, text="Manually trigger a Syft scan on a selected folder. This will generate an SBOM and upload it to the dashboard.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
 
 
-    def _build_data_info_content(self, parent_frame):
+    def _build_data_info_content(self, 
+    
+    parent_frame):
         header = tk.Frame(parent_frame, bg=self.c_bg_base)
         header.pack(fill=tk.X, pady=(0, 20))
         tk.Label(header, text="COLLECTED DATA", fg=self.c_white, bg=self.c_bg_base, font=("Arial", 18, "bold")).pack(side=tk.LEFT)
@@ -7008,12 +7016,13 @@ def run_interactive():
             pass
         logging.error(f"Failed to start interactive mode: {e}", exc_info=True)
         print(f"Error starting interactive GUI mode: {e}", file=sys.stderr)
-        # Show a message box if possible
-        try:
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(0, f"Failed to start Sentinel Agent:\n{e}\n\nCheck logs for details.", "Error", 0x10)
-        except Exception:
-            pass
+        # Show a message box if possible (Windows only)
+        if sys.platform == "win32" and hasattr(ctypes, "windll"):
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(0, f"Failed to start Sentinel Agent:\n{e}\n\nCheck logs for details.", "Error", 0x10)
+            except Exception:
+                pass
         sys.exit(1)
 
 def main():
