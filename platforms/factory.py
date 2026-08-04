@@ -47,12 +47,10 @@ class PlatformFactory:
             return LinuxPlatform(reg_fn)
 
         elif plat == "darwin":
-            # Extension point: MacPlatform implementation (Phase 5)
-            logger.error("MacPlatform selected but not yet implemented.")
-            raise NotImplementedError(
-                "macOS platform support is scheduled for Phase 5. "
-                "MacPlatform implementation pending."
-            )
+            from macos.platform import MacOSPlatform
+            reg_fn = existing_registry_fn or (lambda: [])
+            logger.info("Initializing MacOSPlatform for darwin host...")
+            return MacOSPlatform(reg_fn)
 
         else:
             raise NotImplementedError(f"Unsupported operating system platform: {plat}")

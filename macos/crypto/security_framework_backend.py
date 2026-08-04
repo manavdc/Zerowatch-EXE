@@ -394,23 +394,34 @@ class _NativeSecurityBindings:
         c = self._constants
         cf = self._cf
 
-        # Create mutable dict (capacity=0 → automatic)
-        d = cf.CFDictionaryCreateMutable(None, 0, c["kSecClass"], c["kSecClass"])
-        # Note: using kSecClass pointer as kDictionaryKeyCallbacks/ValueCallbacks
-        # is incorrect for general use, but Security.framework dictionaries are
-        # not general CFDictionaries. The correct approach for SecItem* calls
-        # is to use CFDictionaryCreateMutable with kCFTypeDictionaryKeyCallBacks
-        # and kCFTypeDictionaryValueCallBacks.
-        # We use the standard approach instead:
-        cf.CFRelease(d)
+    def _cf_dict_callbacks(self) -> tuple[ctypes.c_void_p, ctypes.c_void_p]:
+        """
+        Return pointers (&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks).
 
-        # Correct: use kCFTypeDictionaryKeyCallBacks / kCFTypeDictionaryValueCallBacks
-        # These are globals in CoreFoundation.
-        key_cbs = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks").value
-        val_cbs = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks").value
-        d = cf.CFDictionaryCreateMutable(None, 0,
-                                          ctypes.c_void_p(key_cbs),
-                                          ctypes.c_void_p(val_cbs))
+        kCFTypeDictionaryKeyCallBacks and kCFTypeDictionaryValueCallBacks are struct
+        globals in CoreFoundation (not pointer variables). We use ctypes.addressof()
+        to pass their memory addresses to CFDictionaryCreateMutable.
+        """
+        key_ref = ctypes.c_void_p.in_dll(self._cf, "kCFTypeDictionaryKeyCallBacks")
+        val_ref = ctypes.c_void_p.in_dll(self._cf, "kCFTypeDictionaryValueCallBacks")
+        return ctypes.c_void_p(ctypes.addressof(key_ref)), ctypes.c_void_p(ctypes.addressof(val_ref))
+
+    def _build_query(self, service: str, account: str) -> int:
+        """
+        Build a CFMutableDictionaryRef query for service+account lookup.
+
+        Keys:
+          kSecClass             = kSecClassGenericPassword
+          kSecAttrService       = service string
+          kSecAttrAccount       = account string
+
+        Caller is responsible for CFRelease on the returned dictionary.
+        """
+        c = self._constants
+        cf = self._cf
+
+        key_cbs, val_cbs = self._cf_dict_callbacks()
+        d = cf.CFDictionaryCreateMutable(None, 0, key_cbs, val_cbs)
         if not d:
             raise RuntimeError("CFDictionaryCreateMutable failed")
 
@@ -513,11 +524,8 @@ class _NativeSecurityBindings:
         query = self._build_query(service, account)
         data_ref = self._cf_data(data)
 
-        key_cbs = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryKeyCallBacks").value
-        val_cbs = ctypes.c_void_p.in_dll(cf, "kCFTypeDictionaryValueCallBacks").value
-        attrs = cf.CFDictionaryCreateMutable(None, 0,
-                                              ctypes.c_void_p(key_cbs),
-                                              ctypes.c_void_p(val_cbs))
+        key_cbs, val_cbs = self._cf_dict_callbacks()
+        attrs = cf.CFDictionaryCreateMutable(None, 0, key_cbs, val_cbs)
         if not attrs:
             cf.CFRelease(ctypes.c_void_p(query))
             cf.CFRelease(ctypes.c_void_p(data_ref))
