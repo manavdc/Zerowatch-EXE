@@ -4,18 +4,30 @@ macos/platform.py
 macOS Platform composition implementation.
 Instantiates macOS implementations of abstract interfaces.
 
-Phase 6B Status:
-  ✅ software_collector  — functional (app bundles, pkgutil, Homebrew, MacPorts, OS)
-  ✅ hardware_collector  — functional (sysctl, platform.mac_ver, system_profiler GPU)
-  ❌ binary_inspector    — future (Mach-O / pkgutil --file-info)
-  ❌ filesystem_walker   — future (APFS volume traversal)
-  ❌ secure_store        — future (macOS Keychain)
-  ❌ persistence_manager — future (launchd plist)
-  ❌ process_guard       — future (POSIX signals on Darwin)
-  ❌ event_logger        — future (macOS Unified Logging / os_log)
+Phase 6E Status:
+  ✅ software_collector   — functional (app bundles, pkgutil, Homebrew, MacPorts, OS)
+  ✅ hardware_collector   — functional (sysctl, platform.mac_ver, system_profiler GPU)
+  ✅ binary_inspector     — functional (Mach-O static inspection, ownership hierarchy)
+  ✅ filesystem_walker    — functional (curated roots, Mach-O detection, symlink safety)
+  ✅ persistence_manager  — functional (launchd LaunchDaemon plist, bootstrap/bootout)
+  ✅ process_guard        — functional (POSIX SIGTERM/SIGINT/SIGHUP, shutdown event)
+  ✅ event_logger         — functional (Python logging + syslog/ASL, injection safety)
+  ✅ secure_store         — implementation complete (Keychain tagged-reference design)
+                            ❗ NATIVE VALIDATION REQUIRED before production use
 
-NOTE: PlatformFactory darwin branch remains DISABLED (raises NotImplementedError)
-until all capabilities required by normal ZeroWatch agent startup are implemented.
+NOTE: PlatformFactory darwin branch remains DISABLED (raises NotImplementedError).
+      Implementation complete ≠ production ready.
+      All capabilities must be validated on real macOS hardware before activation.
+
+NATIVE VALIDATION NOT PERFORMED:
+  - launchctl bootstrap/bootout
+  - launchd Keychain access (LaunchDaemon context)
+  - System keychain accessibility and unlock behavior
+  - syslog/ASL routing on macOS Ventura/Sonoma
+  - POSIX signal delivery under launchd
+  - Keychain UI prompt behavior
+  - SIP/TCC filesystem permissions
+  All will be validated during Phase 6F (Native macOS Validation).
 """
 
 from __future__ import annotations
@@ -36,21 +48,22 @@ class MacOSPlatform(Platform):
     """
     macOS implementation of the Platform container interface.
 
-    Phase 6B wires software_collector and hardware_collector as functional.
-    All other components remain NotImplementedError stubs.
+    Phase 6E: All components are now implemented.
+    secure_store uses the tagged-reference Keychain design.
+    All components require native macOS hardware validation before production.
     """
 
     def __init__(
         self,
         existing_registry_fn: Optional[Callable[[], List[dict]]] = None,
     ):
-        # existing_registry_fn is Windows-only; accepted here for interface
+        # existing_registry_fn is Windows-only; accepted for interface
         # compatibility with PlatformFactory.create() signature but unused on macOS.
         self.software_collector  = MacOSSoftwareCollector()
         self.binary_inspector    = MacOSBinaryInspector()
         self.filesystem_walker   = MacOSFilesystemWalker()
         self.hardware_collector  = MacOSHardwareCollector()
-        self.secure_store        = MacOSSecureStore()
-        self.persistence_manager = MacOSPersistenceManager()
-        self.process_guard       = MacOSProcessGuard()
-        self.event_logger        = MacOSEventLogger()
+        self.secure_store        = MacOSSecureStore()          # ✅ Phase 6E
+        self.persistence_manager = MacOSPersistenceManager()   # ✅ Phase 6D
+        self.process_guard       = MacOSProcessGuard()         # ✅ Phase 6D
+        self.event_logger        = MacOSEventLogger()          # ✅ Phase 6D
