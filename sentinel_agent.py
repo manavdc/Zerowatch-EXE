@@ -678,16 +678,9 @@ class EncryptedFileHandler(logging.Handler):
                 except OSError:
                     # Another process is mid-write; skip this record rather than crash.
                     return
-                if sys.platform == "win32":
+                if sys.platform == "win32" and hasattr(ctypes, "windll"):
                     try:
-                        subprocess.run(
-                            ["attrib", "+H", "+S", self.filepath],
-                            capture_output=True,
-                            text=True,
-                            timeout=3,
-                            startupinfo=_windows_hidden_startupinfo(),
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                        )
+                        ctypes.windll.kernel32.SetFileAttributesW(self.filepath, 0x02 | 0x04)
                     except Exception:
                         pass
         except Exception:
