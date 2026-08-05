@@ -1,0 +1,418 @@
+name: "SentinelAgent — Release Build & Sign"
+
+# Triggers on version tags: v1.0.0, v1.2.3-rc1, etc.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release Version (e.g. 1.2.0)"
+        required: true
+        default: "1.2.0"
+
+# Permissions required to create/upload Release assets
+permissions:
+  contents: write
+
+# ---------------------------------------------------------------------------
+# Environment: shared across jobs
+# ---------------------------------------------------------------------------
+env:
+  PYTHON_VERSION: "3.11"
+  BINARY_BASENAME: "SentinelAgent"
+
+# ===========================================================================
+# JOB 1: Windows — Nuitka onefile build
+# ===========================================================================
+jobs:
+  build-windows:
+    name: "Build Windows (x64)"
+    runs-on: windows-latest
+    outputs:
+      binary-name: ${{ steps.set-names.outputs.binary }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Windows dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-windows.txt
+          pip install nuitka>=2.0 ordered-set zstandard
+
+      - name: Set binary name
+        id: set-names
+        shell: bash
+        run: echo "binary=SentinelAgent-windows-x64.exe" >> "$GITHUB_OUTPUT"
+
+      - name: Write build-time server config (production)
+        shell: python
+        run: |
+          with open("agent_build_config.py", "w") as f:
+              f.write('FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"\n')
+
+      - name: Build with Nuitka (onefile)
+        shell: cmd
+        run: |
+          python -m nuitka ^
+            --standalone ^
+            --onefile ^
+            --enable-plugin=tk-inter ^
+            --output-dir=dist\windows ^
+            --output-filename=SentinelAgent-windows-x64.exe ^
+            --include-package=common ^
+            --include-package=windows ^
+            --include-package=platforms ^
+            --include-package=scanner ^
+            --include-module=cert_pinning ^
+            --include-data-dir=resources=resources ^
+            --windows-icon-from-ico=resources\favicon.ico ^
+            --assume-yes-for-downloads ^
+            --remove-output ^
+            --python-flag=no_site ^
+            sentinel_agent.py
+
+      - name: Upload Windows binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-windows
+          path: dist/windows/SentinelAgent-windows-x64.exe
+          retention-days: 1
+
+  # ===========================================================================
+  # JOB 2: Linux — Nuitka onefile build
+  # ===========================================================================
+  build-linux:
+    name: "Build Linux (x64)"
+    runs-on: ubuntu-latest
+    outputs:
+      binary-name: ${{ steps.set-names.outputs.binary }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install system dependencies (tkinter + patchelf)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-tk patchelf ccache
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-linux.txt
+          pip install nuitka>=2.0 ordered-set zstandard
+
+      - name: Set binary name
+        id: set-names
+        run: echo "binary=SentinelAgent-linux-x64" >> "$GITHUB_OUTPUT"
+
+      - name: Write build-time server config (production)
+        run: |
+          echo 'FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"' > agent_build_config.py
+
+      - name: Build with Nuitka (onefile)
+        run: |
+          python -m nuitka \
+            --standalone \
+            --onefile \
+            --enable-plugin=tk-inter \
+            --output-dir=dist/linux \
+            --output-filename=SentinelAgent-linux-x64 \
+            --include-package=common \
+            --include-package=linux \
+            --include-package=platforms \
+            --include-package=scanner \
+            --include-module=cert_pinning \
+            --include-data-dir=resources=resources \
+            --assume-yes-for-downloads \
+            --remove-output \
+            --python-flag=no_site \
+            sentinel_agent.py
+
+      - name: Set executable permissions
+        run: chmod +x dist/linux/SentinelAgent-linux-x64
+
+      - name: Upload Linux binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-linux
+          path: dist/linux/SentinelAgent-linux-x64
+          retention-days: 1
+
+  # ===========================================================================
+  # JOB 3: macOS — Nuitka onefile build
+  # ===========================================================================
+  build-macos:
+    name: "Build macOS (Universal)"
+    runs-on: macos-latest
+    outputs:
+      binary-name: ${{ steps.set-names.outputs.binary }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-linux.txt
+          pip install nuitka>=2.0 ordered-set zstandard
+
+      - name: Set binary name
+        id: set-names
+        run: echo "binary=SentinelAgent-macos-universal" >> "$GITHUB_OUTPUT"
+
+      - name: Write build-time server config (production)
+        run: |
+          echo 'FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"' > agent_build_config.py
+
+      - name: Build with Nuitka (onefile)
+        run: |
+          python -m nuitka \
+            --standalone \
+            --onefile \
+            --enable-plugin=tk-inter \
+            --output-dir=dist/macos \
+            --output-filename=SentinelAgent-macos-universal \
+            --include-package=common \
+            --include-package=macos \
+            --include-package=platforms \
+            --include-package=scanner \
+            --include-module=cert_pinning \
+            --include-data-dir=resources=resources \
+            --assume-yes-for-downloads \
+            --remove-output \
+            --python-flag=no_site \
+            sentinel_agent.py
+
+      - name: Set executable permissions
+        run: chmod +x dist/macos/SentinelAgent-macos-universal
+
+      - name: Upload macOS binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-macos
+          path: dist/macos/SentinelAgent-macos-universal
+          retention-days: 1
+
+  # ===========================================================================
+  # JOB 4: Sign & Release
+  # Depends on all 3 build jobs.
+  # Generates cryptographically signed release-manifest.json and creates
+  # the GitHub Release with all assets.
+  # ===========================================================================
+  sign-and-release:
+    name: "Sign Manifest & Publish Release"
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-linux, build-macos]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install signing dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install cryptography
+
+      - name: Download all platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Resolve tag version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VER="${{ github.event.inputs.version }}"
+            TAG="v${VER}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            VER="${TAG#v}"
+          fi
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release-manifest.json + snapshot hash + Ed25519 signature
+        env:
+          OTA_SIGNING_KEY_HEX: ${{ secrets.OTA_SIGNING_KEY_HEX }}
+        run: |
+          python - <<'PYEOF'
+          import base64, hashlib, json, os, sys, datetime
+
+          # ── Load signing key from GitHub secret ──────────────────────────────
+          # Secret stores the 64-hex-char raw Ed25519 private key bytes.
+          signing_key_hex = os.environ.get("OTA_SIGNING_KEY_HEX", "")
+          if not signing_key_hex or len(signing_key_hex) != 64:
+              print("ERROR: OTA_SIGNING_KEY_HEX secret missing or wrong length (must be 64 hex chars).")
+              sys.exit(1)
+
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+          private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(signing_key_hex))
+
+          # ── Extract version from environment ─────────────────────────────────
+          version = os.environ.get("RELEASE_VERSION", "0.0.0")
+          repo    = os.environ.get("GITHUB_REPO", "manavdc/Zerowatch-EXE")
+
+          # ── Per-platform binary paths ─────────────────────────────────────────
+          BINARIES = {
+              "win32":  ("dist/binary-windows/SentinelAgent-windows-x64.exe", "SentinelAgent-windows-x64.exe"),
+              "linux":  ("dist/binary-linux/SentinelAgent-linux-x64",          "SentinelAgent-linux-x64"),
+              "darwin": ("dist/binary-macos/SentinelAgent-macos-universal",    "SentinelAgent-macos-universal"),
+          }
+
+          def sha256_file(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(65536), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def sign_file_bytes(key, data: bytes) -> str:
+              """Sign raw bytes with Ed25519 private key; return hex-encoded signature."""
+              sig = key.sign(data)
+              return sig.hex()
+
+          # ── Build targets dict ────────────────────────────────────────────────
+          targets = {}
+          canonical_for_snapshot = {}
+
+          for platform_key, (path, filename) in BINARIES.items():
+              if not os.path.exists(path):
+                  print(f"WARNING: Binary not found for {platform_key}: {path}")
+                  continue
+              file_size   = os.path.getsize(path)
+              sha256_hash = sha256_file(path)
+
+              # Per-binary Ed25519 signature (signed over the raw binary bytes)
+              with open(path, "rb") as bf:
+                  binary_bytes = bf.read()
+              binary_sig = sign_file_bytes(private_key, binary_bytes)
+
+              targets[platform_key] = {
+                  "filename":    filename,
+                  "sha256":      sha256_hash,
+                  "ed25519_sig": binary_sig,
+                  "size":        file_size,
+              }
+              # Canonical form for Snapshot binding (excludes ed25519_sig)
+              canonical_for_snapshot[platform_key] = {
+                  "filename": filename,
+                  "sha256":   sha256_hash,
+                  "size":     file_size,
+              }
+
+          # ── Snapshot hash (TUF Snapshot layer) ──────────────────────────────
+          snapshot_payload = json.dumps(canonical_for_snapshot, sort_keys=True, separators=(",", ":"))
+          snapshot_hash = hashlib.sha256(snapshot_payload.encode("utf-8")).hexdigest()
+
+          # ── Assemble manifest ────────────────────────────────────────────────
+          manifest = {
+              "version":              version,
+              "released_at":          datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "min_required_version": "1.0.0",
+              "snapshot_hash":        snapshot_hash,
+              "targets":              targets,
+          }
+
+          manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+
+          # Write manifest
+          with open("release-manifest.json", "wb") as f:
+              f.write(manifest_bytes)
+          print("release-manifest.json written.")
+
+          # ── Ed25519 signature over entire manifest (TUF Root layer) ──────────
+          manifest_sig = private_key.sign(manifest_bytes)
+          with open("release-manifest.json.sig", "wb") as f:
+              f.write(manifest_sig)
+          print(f"release-manifest.json.sig written ({len(manifest_sig)} bytes).")
+
+          # ── Emit public key for verification reference ────────────────────────
+          pub_b64 = base64.b64encode(private_key.public_key().public_bytes_raw()).decode()
+          print(f"Public key (embed in cert_pinning.py): {pub_b64}")
+
+          PYEOF
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          GITHUB_REPO: manavdc/Zerowatch-EXE
+
+      - name: Verify manifest signature (self-test)
+        run: |
+          python - <<'PYEOF'
+          import base64, json, sys, os
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+          from cryptography.exceptions import InvalidSignature
+
+          signing_key_hex = os.environ.get("OTA_SIGNING_KEY_HEX", "")
+          private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(signing_key_hex))
+          pub_key = private_key.public_key()
+
+          with open("release-manifest.json", "rb") as f:
+              manifest_bytes = f.read()
+          with open("release-manifest.json.sig", "rb") as f:
+              sig_bytes = f.read()
+
+          try:
+              pub_key.verify(sig_bytes, manifest_bytes)
+              print("[SELF-TEST] Manifest signature verification PASSED.")
+          except InvalidSignature:
+              print("[SELF-TEST] FAILED — signature mismatch!")
+              sys.exit(1)
+          PYEOF
+        env:
+          OTA_SIGNING_KEY_HEX: ${{ secrets.OTA_SIGNING_KEY_HEX }}
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "SentinelAgent v${{ steps.version.outputs.version }}"
+          body: |
+            ## SentinelAgent v${{ steps.version.outputs.version }}
+
+            ### Security Verification
+            All binaries in this release are cryptographically signed:
+            - **Manifest**: Ed25519 detached signature in `release-manifest.json.sig`
+            - **Binaries**: Per-binary Ed25519 signatures embedded in `release-manifest.json`
+            - **Integrity**: SHA-256 hash for each platform binary
+
+            ### Automatic Updates
+            Enrolled SentinelAgent instances will detect and apply this release
+            automatically within 4 hours via the OTA update engine.
+
+            ### Manual Download
+            | Platform | Binary |
+            |---|---|
+            | Windows x64 | `SentinelAgent-windows-x64.exe` |
+            | Linux x64   | `SentinelAgent-linux-x64` |
+            | macOS Universal | `SentinelAgent-macos-universal` |
+          draft: false
+          prerelease: false
+          files: |
+            dist/binary-windows/SentinelAgent-windows-x64.exe
+            dist/binary-linux/SentinelAgent-linux-x64
+            dist/binary-macos/SentinelAgent-macos-universal
+            release-manifest.json
+            release-manifest.json.sig

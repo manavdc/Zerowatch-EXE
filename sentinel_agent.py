@@ -20,6 +20,19 @@ import socketio
 from urllib.parse import urlparse
 import cert_pinning
 
+# ── OTA Update Engine (lazy import — non-blocking, safe to skip if unavailable) ──
+try:
+    from common import updater as _ota_updater
+    from common.updater import UpdateInfo as _OTA_UpdateInfo
+    _OTA_AVAILABLE = True
+except ImportError:
+    _ota_updater   = None
+    _OTA_UpdateInfo = None
+    _OTA_AVAILABLE = False
+
+# Module-level background monitor instance (started in main_agent / run_interactive)
+_ota_background_monitor = None
+
 if sys.platform == "win32":
     import winreg
     import ctypes.wintypes as wt
@@ -4522,7 +4535,140 @@ def invoke_disable_cli(zw_client):
     time.sleep(2)
 
 
+def _run_cli_update(zw_client, version_str):
+    """
+    CLI option 4: download and apply the verified OTA update.
+
+    Implements Section 5.2 of the OTA spec:
+      - Renders progress indicator in terminal
+      - Triggers detached restart cleanly via native service manager
+    """
+    if not _OTA_AVAILABLE:
+        _print_banner()
+        _top("UPDATE UNAVAILABLE")
+        _blank()
+        _row(f"  {C.ERROR}OTA update module not available in this build.{C.R}")
+        _blank()
+        _bot()
+        time.sleep(2)
+        return
+
+    _print_banner()
+    _top(f"UPDATE AGENT TO v{version_str}")
+    _blank()
+    _row(f"  {C.CYAN}Verifying update package...{C.R}")
+    _blank()
+    _bot()
+    print()
+
+    try:
+        # Re-run full verification pipeline before downloading
+        checker = _ota_updater.UpdateChecker(AGENT_VERSION)
+        info    = checker.check_for_update(force=True)
+
+        if info is None:
+            _print_banner()
+            _top("ALREADY UP TO DATE")
+            _blank()
+            _row(f"  {C.SUCCESS}Running latest version v{AGENT_VERSION}.{C.R}")
+            _blank()
+            _bot()
+            time.sleep(2)
+            return
+
+        import tempfile
+        tmp_dir  = tempfile.mkdtemp(prefix="sentinel_ota_")
+        dest     = os.path.join(tmp_dir, info.target.filename)
+        total_mb = info.target.size / (1024 * 1024)
+
+        # Terminal progress renderer
+        _last_pct = [-1]
+        def _cli_progress(done, total):
+            pct = int(done * 100 / total) if total > 0 else 0
+            if pct != _last_pct[0]:
+                _last_pct[0] = pct
+                bar_len = 30
+                filled  = int(bar_len * pct / 100)
+                bar     = "█" * filled + "░" * (bar_len - filled)
+                done_mb = done / (1024 * 1024)
+                print(
+                    f"\r  {C.CYAN}[{bar}] {pct:3d}%  "
+                    f"{done_mb:.1f}/{total_mb:.1f} MB{C.R}",
+                    end="", flush=True
+                )
+
+        print(f"  {C.CYAN}Downloading v{info.version} ({total_mb:.1f} MB)...{C.R}")
+        downloader = _ota_updater.BinaryDownloader()
+        downloader.download(info.target, dest, progress_cb=_cli_progress)
+        print()  # newline after progress bar
+
+        _print_banner()
+        _top("APPLYING UPDATE")
+        _blank()
+        _row(f"  {C.CYAN}SHA-256 and Ed25519 verified. Staging new binary...{C.R}")
+        _blank()
+        _bot()
+        print()
+
+        from common.os_replacer import perform_update
+        perform_update(dest, get_exe_path(), zw_client=zw_client)
+
+        _print_banner()
+        _top("UPDATE COMPLETE")
+        _blank()
+        _row(f"  {C.SUCCESS}v{info.version} installed. Agent will restart via service manager.{C.R}")
+        _blank()
+        _bot()
+        time.sleep(3)
+
+        # On Windows: os_replacer already spawned --post-update-check + the swap
+        # happened inline. On Linux/macOS: systemctl/launchctl restart was called.
+        # Exit the CLI so the process exits cleanly.
+        sys.exit(0)
+
+    except _ota_updater.IntegrityError as exc:
+        _print_banner()
+        _top("INTEGRITY FAILURE")
+        _blank()
+        _row(f"  {C.ERROR}Binary tampered or corrupt. Download purged.{C.R}")
+        _row(f"  {C.MUTED}{exc}{C.R}")
+        _blank()
+        _bot()
+        time.sleep(3)
+
+    except _ota_updater.BinarySignatureError as exc:
+        _print_banner()
+        _top("SIGNATURE FAILURE")
+        _blank()
+        _row(f"  {C.ERROR}Per-binary Ed25519 signature verification failed.{C.R}")
+        _row(f"  {C.MUTED}{exc}{C.R}")
+        _blank()
+        _bot()
+        time.sleep(3)
+
+    except _ota_updater.ManifestVerificationError as exc:
+        _print_banner()
+        _top("MANIFEST VERIFICATION FAILED")
+        _blank()
+        _row(f"  {C.ERROR}Manifest signature invalid \u2014 possible tampering.{C.R}")
+        _row(f"  {C.MUTED}{exc}{C.R}")
+        _blank()
+        _bot()
+        time.sleep(3)
+
+    except Exception as exc:
+        _print_banner()
+        _top("UPDATE FAILED")
+        _blank()
+        _row(f"  {C.ERROR}Update error: {exc}{C.R}")
+        _blank()
+        _bot()
+        logging.error("CLI OTA update failed: %s", exc, exc_info=True)
+        time.sleep(3)
+
+
 def main_cli(zw_client):
+
     """Activated flow: status, start daemon, and disable controls."""
     _enable_ansi()
     while True:
@@ -4548,11 +4694,24 @@ def main_cli(zw_client):
         _menu_item("1", "View agent status")
         _menu_item("2", "Start background daemon")
         _menu_item("3", "Disable agent", danger=True)
+        # Option 4: shown only when a verified update is detected
+        _ota_available_version = None
+        if _OTA_AVAILABLE:
+            try:
+                _checker = _ota_updater.UpdateChecker(AGENT_VERSION)
+                # Use cached result only (no blocking network call in menu render)
+                _cached = _checker._cached_result
+                if _cached is not None:
+                    _ota_available_version = _cached.version
+                    _menu_item("4", f"Update Agent to v{_ota_available_version}")
+            except Exception:
+                pass
         _blank()
         _bot()
         print()
 
-        choice = input(f"{C.CYAN}Select option (1-3, Q to exit): {C.R}").strip().lower()
+        _opt_max = "4" if _ota_available_version else "3"
+        choice = input(f"{C.CYAN}Select option (1-{_opt_max}, Q to exit): {C.R}").strip().lower()
         if choice == "1":
             _show_status_screen(zw_client)
             continue
@@ -4593,6 +4752,9 @@ def main_cli(zw_client):
             continue
         if choice == "3":
             invoke_disable_cli(zw_client)
+            continue
+        if choice == "4" and _ota_available_version and _OTA_AVAILABLE:
+            _run_cli_update(zw_client, _ota_available_version)
             continue
         if choice in ("q", "quit", "x", "exit"):
             break
@@ -6013,6 +6175,245 @@ class DashboardFrame(tk.Frame):
 
         tk.Label(card4, text="Manually trigger a Syft scan on a selected folder. This will generate an SBOM and upload it to the dashboard.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
 
+        # ── Card 5: Software Update ───────────────────────────────────────────────
+        if _OTA_AVAILABLE:
+            self._build_update_card(container)
+
+    def _build_update_card(self, container):
+        """OTA Software Update card for the Settings page.
+
+        Implements Section 5.1 of the OTA spec:
+          - Background 4-hour check (driven by BackgroundUpdateMonitor)
+          - Manual 'Check for Updates' button
+          - Cyan banner: '⚡ New version vX.Y.Z available!'
+          - 'Update Now' button with determinate progress bar
+          - Restart prompt on completion
+        """
+        card5 = tk.Frame(container, bg=self.c_bg_card,
+                         highlightbackground=self.c_border, highlightthickness=1,
+                         padx=20, pady=15)
+        card5.pack(fill=tk.X, pady=5)
+
+        top5 = tk.Frame(card5, bg=self.c_bg_card)
+        top5.pack(fill=tk.X)
+        tk.Label(top5, text="Software Update", fg=self.c_cyan,
+                 bg=self.c_bg_card, font=self.f_normal_bold).pack(side=tk.LEFT)
+
+        # Control row: version badge + buttons
+        ctrl_frame = tk.Frame(top5, bg=self.c_bg_card)
+        ctrl_frame.pack(side=tk.RIGHT)
+
+        self._ota_update_info = None       # holds UpdateInfo when available
+        self._ota_download_active = False  # prevents concurrent downloads
+
+        version_lbl = tk.Label(
+            ctrl_frame, text=f"v{AGENT_VERSION}",
+            fg=self.c_gray, bg=self.c_bg_card, font=self.f_small
+        )
+        version_lbl.pack(side=tk.LEFT, padx=(0, 8))
+
+        # Update Now button (hidden until update detected)
+        update_now_btn = tk.Button(
+            ctrl_frame, text="⚡ Update Now",
+            bg="#00c4db", fg="black", font=self.f_normal_bold, bd=0,
+            cursor="hand2", state="disabled", pady=4, padx=8,
+        )
+        update_now_btn.pack(side=tk.LEFT, padx=4)
+
+        check_btn = tk.Button(
+            ctrl_frame, text="Check for Updates",
+            bg=self.c_bg_sidebar, fg=self.c_white, font=self.f_small, bd=1,
+            cursor="hand2", pady=4, padx=8,
+        )
+        check_btn.pack(side=tk.LEFT, padx=4)
+
+        # Status / banner row
+        status_frame = tk.Frame(card5, bg=self.c_bg_card)
+        status_frame.pack(fill=tk.X, pady=(8, 0))
+
+        banner_lbl = tk.Label(
+            status_frame, text="",
+            fg=self.c_cyan, bg=self.c_bg_card,
+            font=self.f_normal_bold, justify=tk.LEFT
+        )
+        banner_lbl.pack(anchor="w")
+
+        # Progress bar (hidden by default)
+        from tkinter import ttk as _ttk2
+        _style2 = _ttk2.Style()
+        _style2.configure("OTA.Horizontal.TProgressbar", thickness=8, background=self.c_cyan)
+        ota_progress = _ttk2.Progressbar(
+            card5, style="OTA.Horizontal.TProgressbar",
+            orient="horizontal", mode='determinate', maximum=100
+        )
+        ota_progress_lbl = tk.Label(
+            card5, text="", fg=self.c_gray,
+            bg=self.c_bg_card, font=self.f_small
+        )
+
+        # Description
+        tk.Label(
+            card5,
+            text="Automatically checks for verified updates every 4 hours. "
+                 "Updates are cryptographically signed and integrity-verified before installation.",
+            fg=self.c_gray, bg=self.c_bg_card,
+            font=self.f_small, justify=tk.LEFT
+        ).pack(anchor="w", pady=(10, 0))
+
+        # ── Callbacks ──────────────────────────────────────────────────────────
+
+        def _on_update_detected(info):
+            """Called from the background monitor thread — must schedule GUI update."""
+            self._ota_update_info = info
+            self.after(0, lambda: _show_update_banner(info))
+
+        def _show_update_banner(info):
+            banner_lbl.config(
+                text=f"⚡ New version v{info.version} available! "
+                     f"({info.target.size / (1024*1024):.1f} MB)"
+            )
+            update_now_btn.config(state="normal")
+
+        def _do_check():
+            """Manual 'Check for Updates' — runs in background thread."""
+            if self._ota_download_active:
+                return
+            check_btn.config(state="disabled", text="Checking...")
+            banner_lbl.config(text="")
+
+            def _worker():
+                try:
+                    monitor = getattr(_ota_updater, 'BackgroundUpdateMonitor', None)
+                    checker = _ota_updater.UpdateChecker(AGENT_VERSION)
+                    info = checker.check_for_update(force=True)
+                    if info:
+                        self._ota_update_info = info
+                        self.after(0, lambda: _show_update_banner(info))
+                    else:
+                        self.after(0, lambda: banner_lbl.config(
+                            text=f"✓ You are running the latest version (v{AGENT_VERSION}).",
+                            fg=self.c_green
+                        ))
+                except _ota_updater.RollbackRejectedError:
+                    self.after(0, lambda: banner_lbl.config(
+                        text=f"✓ Already on latest version (v{AGENT_VERSION}).",
+                        fg=self.c_green
+                    ))
+                except _ota_updater.TimestampExpiredError as exc:
+                    self.after(0, lambda e=exc: banner_lbl.config(
+                        text=f"⚠ Manifest expired — freeze attack guard triggered. ({e})",
+                        fg=self.c_orange
+                    ))
+                except _ota_updater.OTAError as exc:
+                    self.after(0, lambda e=exc: banner_lbl.config(
+                        text=f"✗ Update check failed: {e}",
+                        fg=self.c_red
+                    ))
+                except Exception as exc:
+                    self.after(0, lambda e=exc: banner_lbl.config(
+                        text=f"✗ Network error: {e}",
+                        fg=self.c_red
+                    ))
+                finally:
+                    self.after(0, lambda: check_btn.config(
+                        state="normal", text="Check for Updates"
+                    ))
+
+            threading.Thread(target=_worker, daemon=True, name="ota-check").start()
+
+        def _do_update_now():
+            """Download, verify, and apply the update. Runs in background thread."""
+            if self._ota_download_active or self._ota_update_info is None:
+                return
+
+            self._ota_download_active = True
+            update_now_btn.config(state="disabled")
+            check_btn.config(state="disabled")
+
+            info = self._ota_update_info
+            ota_progress.config(value=0)
+            ota_progress.pack(fill=tk.X, pady=(8, 0))
+            ota_progress_lbl.config(text=f"Preparing download of v{info.version}...")
+            ota_progress_lbl.pack(anchor="w", pady=(2, 0))
+
+            def _progress_cb(done, total):
+                pct = int(done * 100 / total) if total > 0 else 0
+                label_text = (
+                    f"Downloading v{info.version}: {pct}% "
+                    f"({done // (1024*1024):.1f} / {total // (1024*1024):.1f} MB)"
+                )
+                self.after(0, lambda p=pct, t=label_text: (
+                    ota_progress.config(value=p),
+                    ota_progress_lbl.config(text=t)
+                ))
+
+            def _worker():
+                import tempfile
+                try:
+                    downloader = _ota_updater.BinaryDownloader()
+                    tmp_dir    = tempfile.mkdtemp(prefix="sentinel_ota_")
+                    dest       = os.path.join(tmp_dir, info.target.filename)
+
+                    downloader.download(info.target, dest, progress_cb=_progress_cb)
+
+                    self.after(0, lambda: ota_progress_lbl.config(
+                        text=f"Verified. Applying update v{info.version}..."
+                    ))
+
+                    from common.os_replacer import perform_update
+                    current_exe = get_exe_path()
+                    perform_update(dest, current_exe, zw_client=self.zw_client)
+
+                    self.after(0, _show_restart_prompt)
+
+                except _ota_updater.IntegrityError as exc:
+                    self.after(0, lambda e=exc: banner_lbl.config(
+                        text=f"✗ INTEGRITY FAILURE — binary tampered or corrupt: {e}",
+                        fg=self.c_red
+                    ))
+                except _ota_updater.BinarySignatureError as exc:
+                    self.after(0, lambda e=exc: banner_lbl.config(
+                        text=f"✗ SIGNATURE FAILURE — per-binary Ed25519 check failed: {e}",
+                        fg=self.c_red
+                    ))
+                except Exception as exc:
+                    self.after(0, lambda e=exc: banner_lbl.config(
+                        text=f"✗ Update failed: {e}",
+                        fg=self.c_red
+                    ))
+                    logging.error("OTA update failed: %s", exc, exc_info=True)
+                finally:
+                    self._ota_download_active = False
+                    self.after(0, lambda: ota_progress.pack_forget())
+                    self.after(0, lambda: ota_progress_lbl.pack_forget())
+                    self.after(0, lambda: check_btn.config(state="normal"))
+
+            threading.Thread(target=_worker, daemon=True, name="ota-download").start()
+
+        def _show_restart_prompt():
+            from tkinter import messagebox
+            banner_lbl.config(
+                text=f"✓ Update v{self._ota_update_info.version} downloaded and verified.",
+                fg=self.c_green
+            )
+            if messagebox.askyesno(
+                "Restart SentinelAgent",
+                f"Update v{self._ota_update_info.version} is ready.\n\n"
+                "Restart SentinelAgent now to apply the update?"
+            ):
+                # On Windows the swap already happened; just exit so SCM restarts
+                logging.info("[OTA] User confirmed restart — exiting for SCM restart.")
+                sys.exit(0)
+
+        check_btn.config(command=_do_check)
+        update_now_btn.config(command=_do_update_now)
+
+        # Wire up the background monitor callback to this card's banner
+        global _ota_background_monitor
+        if _ota_background_monitor is not None:
+            # Re-register callback so this card picks up background detections
+            _ota_background_monitor._callback = _on_update_detected
+
 
     def _build_data_info_content(self, 
     
@@ -7048,7 +7449,17 @@ def main():
         password_kill_cli()
         return
 
-    # 4. Internal watchdog
+    # 4. Post-Update Health Watchdog (spawned by os_replacer after Windows swap)
+    if "--post-update-check" in sys.argv:
+        try:
+            from common.os_replacer import PostUpdateWatchdog
+            logging.info("[OTA] --post-update-check: starting 120s liveness watchdog.")
+            PostUpdateWatchdog().run()
+        except Exception as exc:
+            logging.error("[OTA] PostUpdateWatchdog error: %s", exc)
+        return
+
+    # 5. Internal anti-kill watchdog
     if "--watchdog" in sys.argv:
         wd_idx = sys.argv.index("--watchdog")
         target_exe = sys.argv[wd_idx + 1] if len(sys.argv) > wd_idx + 1 else sys.executable
