@@ -1,3 +1,6 @@
+
+
+
 # ZeroWatch SentinelAgent
 
 SentinelAgent is a self-protecting, persistent Windows endpoint sensor designed for the ZeroWatch platform. It fingerprints the host, inventories installed software and hardware, and synchronizes that information to a ZeroWatch backend over a REST API.
@@ -19,6 +22,8 @@ SentinelAgent is a self-protecting, persistent Windows endpoint sensor designed 
 - `agent.py`: A legacy prototype script kept for reference purposes.
 - `build_agent.bat`: Nuitka build pipeline script to compile the agent into a standalone executable.
 - `AGENT_DOCUMENTATION.md`: Comprehensive internal documentation detailing the architecture, API client, and module breakdown.
+
+https://github.com/user-attachments/assets/77a62549-01ed-4cab-a0dd-2f37109f0a86
 
 ## Prerequisites
 
