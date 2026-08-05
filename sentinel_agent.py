@@ -1499,7 +1499,7 @@ class ZeroWatchClient:
                 "hostname": self.hostname,
                 "username": self.operator_username,
                 "asset_name": self.asset_name,
-                "os_info": f"Windows ({AGENT_VERSION})",
+                "os_info": f"{'macOS' if sys.platform == 'darwin' else 'Linux' if sys.platform.startswith('linux') else 'Windows'} ({AGENT_VERSION})",
                 "fingerprint_json": self.fingerprint_data,
             }
             

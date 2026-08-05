@@ -168,6 +168,28 @@ def _get_os_info() -> Dict[str, str]:
     }
 
 
+# ── System Firmware (expensive — system_profiler) ─────────────────────────────
+
+def _get_system_firmware() -> str:
+    """
+    Get Boot ROM / System Firmware Version via system_profiler SPHardwareDataType -json.
+    Only called from get_detailed_hardware_profile().
+    """
+    sp = shutil.which("system_profiler") or "/usr/sbin/system_profiler"
+    raw = _run([sp, "SPHardwareDataType", "-json"], timeout=20)
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+        hardware = data.get("SPHardwareDataType", [])
+        if hardware:
+            fw = hardware[0].get("boot_rom_version") or hardware[0].get("system_firmware_version") or ""
+            return fw.strip()
+    except Exception as exc:
+        logger.debug("system_profiler SPHardwareDataType parse failed: %s", exc)
+    return ""
+
+
 # ── GPU (expensive — system_profiler) ─────────────────────────────────────────
 
 def _get_gpus() -> List[str]:
@@ -316,7 +338,7 @@ class MacOSHardwareCollector(HardwareCollector):
             },
             "bios": {
                 "manufacturer": "Apple Inc.",
-                "version": "",
+                "version": _get_system_firmware(),
                 "release_date": "",
             },
             "os_info": {
