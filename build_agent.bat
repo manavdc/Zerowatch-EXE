@@ -122,7 +122,11 @@ echo [Server] EXE will be pinned to: %BASE_API_URL%
 echo.
 
 echo [1/5] Installing build dependencies...
-py -3.11 -m pip install nuitka wmi requests zstandard "python-socketio[client]"
+py -3.11 -m pip install -r requirements-windows.txt
+if errorlevel 1 (
+    echo [WARN] requirements-windows.txt install had issues, installing core deps directly...
+    py -3.11 -m pip install nuitka wmi requests zstandard "python-socketio[client]" cryptography
+)
 if errorlevel 1 (
     set "LAST_ERROR_MSG=Failed to install build dependencies."
     goto build_failed
@@ -167,7 +171,9 @@ echo.
 echo [4/5] Compiling sentinel_agent.py
 echo       This may take several minutes (Python -> C -> binary)
 echo.
-set "BASE_FLAGS=--assume-yes-for-downloads --zig --windows-console-mode=disable --output-dir=build --output-filename=%OUTPUT_NAME% %ICON_FLAG% --include-data-file=%ICON_PATH%=favicon.ico"
+set "PACKAGE_FLAGS=--include-package=common --include-package=scanner --include-package=platforms --include-package=windows --include-package=linux"
+set "DATA_FLAGS=--include-data-dir=resources=resources"
+set "BASE_FLAGS=--assume-yes-for-downloads --zig --windows-console-mode=disable --output-dir=build --output-filename=%OUTPUT_NAME% %ICON_FLAG% --include-data-file=%ICON_PATH%=favicon.ico %PACKAGE_FLAGS% %DATA_FLAGS%"
 
 if /I "%BUILD_STYLE%"=="onefile" (
     for /f "delims=" %%i in ('py -3.11 -c "import sys; print(sys.prefix)"') do set "PYTHON_PREFIX=%%i"
@@ -189,7 +195,7 @@ if not "%BUILD_EXIT%"=="0" (
     echo [WARN] Zig build failed with exit code %BUILD_EXIT%. Retrying without --zig...
     if exist "build\sentinel_agent.build" rd /s /q "build\sentinel_agent.build"
     if exist "build\sentinel_agent.onefile-build" rd /s /q "build\sentinel_agent.onefile-build"
-    set "BASE_FLAGS=--assume-yes-for-downloads --windows-console-mode=disable --output-dir=build --output-filename=%OUTPUT_NAME% %ICON_FLAG% --include-data-file=%ICON_PATH%=favicon.ico"
+    set "BASE_FLAGS=--assume-yes-for-downloads --windows-console-mode=disable --output-dir=build --output-filename=%OUTPUT_NAME% %ICON_FLAG% --include-data-file=%ICON_PATH%=favicon.ico %PACKAGE_FLAGS% %DATA_FLAGS%"
     call :run_compile
     set "BUILD_EXIT=%ERRORLEVEL%"
 )

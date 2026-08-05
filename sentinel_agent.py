@@ -1085,6 +1085,12 @@ class ZeroWatchClient:
     def clear_join_state(self):
         try:
             if os.path.exists(self.join_state_file):
+                if sys.platform == "win32":
+                    try:
+                        import ctypes
+                        ctypes.windll.kernel32.SetFileAttributesW(self.join_state_file, 0x80)
+                    except Exception as attr_err:
+                        logging.debug(f"Failed to clear file attributes: {attr_err}")
                 os.remove(self.join_state_file)
         except Exception as e:
             logging.warning(f"Failed to remove join state file {self.join_state_file}: {e}")
@@ -1097,7 +1103,7 @@ class ZeroWatchClient:
 
         def _bg_cancel():
             try:
-                url = f"{resolve_api_base_url()}/api/agent/join-request/cancel"
+                url = f"{AGENT_API_URL}/join-request/cancel"
                 payload = {"device_id": self.device_id}
                 self.session.post(url, json=payload, timeout=5)
                 logging.info("Sent cancel join request signal to backend asynchronously")
@@ -1378,10 +1384,11 @@ class ZeroWatchClient:
         except Exception:
             pass
         db_files = []
-        for sdir in [
-            os.path.join(os.environ.get("PROGRAMDATA", ""), "ZeroWatch", "state"),
+        candidate_dirs = [
+            _secure_state_dir(self.base_dir),
             os.path.join(self.base_dir, "state"),
-        ]:
+        ]
+        for sdir in dict.fromkeys(candidate_dirs):  # deduplicate while preserving order
             if os.path.exists(sdir):
                 for f in os.listdir(sdir):
                     if f.startswith("scan_cache.db"):
@@ -1400,6 +1407,12 @@ class ZeroWatchClient:
         for file_path in files_to_remove:
             try:
                 if file_path and os.path.exists(file_path):
+                    if sys.platform == "win32":
+                        try:
+                            import ctypes
+                            ctypes.windll.kernel32.SetFileAttributesW(file_path, 0x80)
+                        except Exception:
+                            pass
                     os.remove(file_path)
                     _append_gui_log(self.base_dir, f"Cleared file: {os.path.basename(file_path)}")
             except Exception as e:
@@ -1417,13 +1430,13 @@ class ZeroWatchClient:
         if not team_code:
             return {"success": False, "message": "Team code required"}
 
-        if self.has_pending_join():
-            return {
-                "success": True,
-                "status": "pending",
-                "requestId": (self.join_state or {}).get("requestId"),
-                "message": "Pending join request already exists for this device.",
-            }
+        # NOTE: Do NOT short-circuit on has_pending_join() here.
+        # After an admin unlinks the device, the local join_state.json may still
+        # hold status="pending" from the previous enrollment.  Blocking on that
+        # stale local state means the re-enrollment request is never sent to the
+        # server and the device never appears in the Requests tab again.
+        # Always clear stale state and send a fresh request to the server.
+        self.clear_join_state()
 
         try:
             payload = {
@@ -1432,7 +1445,7 @@ class ZeroWatchClient:
                 "hostname": self.hostname,
                 "username": self.operator_username,
                 "asset_name": self.asset_name,
-                "os_info": f"Windows ({AGENT_VERSION})",
+                "os_info": f"{'macOS' if sys.platform == 'darwin' else 'Linux' if sys.platform.startswith('linux') else 'Windows'} ({AGENT_VERSION})",
                 "fingerprint_json": self.fingerprint_data,
             }
             # Optimistically save state as pending to maintain state across restarts
@@ -2083,8 +2096,10 @@ class ZeroWatchClient:
 # For --onefile, sys.executable points to the .exe, but we can also check sys.argv[0]
 # ---------------------------------------------------------------------------
 def get_base_dir():
-    """Returns the directory where the .exe (or .py script) lives on disk."""
-    if sys.argv[0].endswith('.exe'):
+    """Returns the directory where the executable (or .py script) lives on disk."""
+    if "__compiled__" in globals():
+        return os.path.dirname(os.path.abspath(sys.executable))
+    if sys.argv[0].endswith('.exe') or not sys.argv[0].endswith('.py'):
         return os.path.dirname(os.path.abspath(sys.argv[0]))
     return os.path.dirname(os.path.abspath(__file__))
 
@@ -2092,7 +2107,9 @@ def get_base_dir():
 
 def get_exe_path():
     """Returns the absolute path to the current executable."""
-    if sys.argv[0].endswith('.exe'):
+    if "__compiled__" in globals():
+        return os.path.abspath(sys.executable)
+    if sys.argv[0].endswith('.exe') or not sys.argv[0].endswith('.py'):
         return os.path.abspath(sys.argv[0])
     return os.path.abspath(__file__)
 
@@ -2987,7 +3004,7 @@ def register_startup_registry():
         try:
             from platforms import PlatformFactory
             plat = PlatformFactory.create()
-            plat.persistence_manager.install_autostart()
+            plat.persistence_manager.register_startup(get_exe_path())
             return
         except Exception as e:
             logging.warning("Linux autostart registration failed: %s", e)
@@ -3938,6 +3955,16 @@ def unregister_startup_registry():
 
     Tries both HKLM and HKCU to match whatever was created.
     """
+    if sys.platform != "win32":
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            plat.persistence_manager.unregister_startup()
+            return
+        except Exception as e:
+            logging.warning("Linux autostart removal failed: %s", e)
+            return
+
     # HKLM
     try:
         key = winreg.OpenKey(
@@ -5440,6 +5467,8 @@ class EnrollmentFrame(tk.Frame):
         self.status_label_pending.pack(pady=(30, 0))
         
         def on_cancel():
+            self._stop_event.set()
+            self._polling_active = False
             self.zw_client.cancel_join_request() # notify server & clear local state
             self.show_screen("TEAM_CODE")
             
@@ -6563,28 +6592,51 @@ class UnifiedSentinelGUI(tk.Tk):
             import sys
             
             # Possible locations for the icon file
-            possible_icon_paths = [
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.ico"),
-                os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "favicon.ico"),
-                os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "favicon.ico"),
-                os.path.join(get_base_dir(), "favicon.ico"),
-            ]
+            if sys.platform == "win32":
+                possible_icon_paths = [
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.ico"),
+                    os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "favicon.ico"),
+                    os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "favicon.ico"),
+                    os.path.join(get_base_dir(), "favicon.ico"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "favicon.ico"),
+                    os.path.join(get_base_dir(), "resources", "favicon.ico"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "favicon.png"),
+                    os.path.join(get_base_dir(), "resources", "favicon.png"),
+                ]
+            else:
+                possible_icon_paths = [
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "favicon.png"),
+                    os.path.join(get_base_dir(), "resources", "favicon.png"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.png"),
+                    os.path.join(get_base_dir(), "favicon.png"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.ico"),
+                    os.path.join(get_base_dir(), "favicon.ico"),
+                ]
             
             icon_loaded = False
             for icon_path in possible_icon_paths:
                 if os.path.exists(icon_path):
                     try:
-                        # Try iconbitmap first for taskbar grouping
-                        self.iconbitmap(icon_path)
-                        # Also set iconphoto for broader support
-                        img = tk.PhotoImage(file=icon_path)
-                        self.iconphoto(True, img)
-                        icon_loaded = True
-                        break
+                        if icon_path.endswith(".png"):
+                            img = tk.PhotoImage(file=icon_path)
+                            self.iconphoto(True, img)
+                            self._icon_image = img  # Keep reference to prevent GC!
+                            icon_loaded = True
+                            break
+                        else:
+                            # Try iconbitmap first for taskbar grouping
+                            if sys.platform == "win32":
+                                self.iconbitmap(icon_path)
+                            img = tk.PhotoImage(file=icon_path)
+                            self.iconphoto(True, img)
+                            self._icon_image = img  # Keep reference to prevent GC!
+                            icon_loaded = True
+                            break
                     except Exception:
                         try:
                             img = tk.PhotoImage(file=icon_path)
                             self.iconphoto(True, img)
+                            self._icon_image = img  # Keep reference to prevent GC!
                             icon_loaded = True
                             break
                         except Exception:
@@ -6884,15 +6936,37 @@ def prompt_consent(base_dir, force_show=False):
 
     # Load icon if possible
     try:
-        possible_icon_paths = [
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.ico"),
-            os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "favicon.ico"),
-            os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "favicon.ico"),
-            os.path.join(base_dir, "favicon.ico"),
-        ]
+        if sys.platform == "win32":
+            possible_icon_paths = [
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.ico"),
+                os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "favicon.ico"),
+                os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "favicon.ico"),
+                os.path.join(base_dir, "favicon.ico"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "favicon.png"),
+                os.path.join(base_dir, "resources", "favicon.png"),
+            ]
+        else:
+            possible_icon_paths = [
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources", "favicon.png"),
+                os.path.join(base_dir, "resources", "favicon.png"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.png"),
+                os.path.join(base_dir, "favicon.png"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "favicon.ico"),
+                os.path.join(base_dir, "favicon.ico"),
+            ]
         for icon_path in possible_icon_paths:
             if os.path.exists(icon_path):
-                root.iconbitmap(icon_path)
+                if icon_path.endswith(".png"):
+                    img = tk.PhotoImage(file=icon_path)
+                    root.iconphoto(True, img)
+                    root._icon_image = img  # Keep reference to prevent GC!
+                else:
+                    if sys.platform == "win32":
+                        root.iconbitmap(icon_path)
+                    else:
+                        img = tk.PhotoImage(file=icon_path)
+                        root.iconphoto(True, img)
+                        root._icon_image = img  # Keep reference to prevent GC!
                 break
     except:
         pass
