@@ -22,3 +22,7 @@ agent_build_config.py
 # Python caches
 __pycache__/
 *.pyc
+
+# Local build scripts
+build_agent_pyinstaller_enc.bat
+
