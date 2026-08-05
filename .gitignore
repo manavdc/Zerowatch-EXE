@@ -1,8 +1,13 @@
-# Nuitka build directories
-build/
+# Nuitka build directories (root level output)
+/build/
+/dist/
 *.build/
 *.dist/
 *.onefile-build/
+
+# Do not ignore build scripts inside platform folders
+!linux/build/
+!macos/build/
 
 # Dynamic build-time config
 agent_build_config.py
