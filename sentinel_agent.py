@@ -4598,108 +4598,7 @@ def main_cli(zw_client):
             break
 
 
-def run_interactive():
-    """Entry point for EXE double-click: strict conditional flow."""
-    ensure_interactive_console()
-    base_dir = get_base_dir()
-    operator_username = resolve_agent_username(base_dir, prompt=False)
-    hostname = resolve_hostname(base_dir)
-    asset_name = resolve_asset_name(base_dir, prompt=False, default_hostname=hostname)
-    identity = _load_identity_from_fingerprint(base_dir)
-    fingerprint = collect_fingerprint()
-    export_fingerprint_json(
-        base_dir,
-        fingerprint,
-        username=operator_username,
-        asset_name=asset_name,
-        hostname=hostname,
-        organization_name=identity.get("organization_name"),
-    )
-    zw_client = ZeroWatchClient(
-        base_dir,
-        fingerprint['device_id'],
-        hostname,
-        fingerprint_data=fingerprint,
-        operator_username=operator_username,
-        asset_name=asset_name,
-    )
 
-    # If backend rejects local token (unlinked/revoked), wipe state and re-enroll.
-    if zw_client.jwt:
-        hb = zw_client.heartbeat()
-        if hb is False and zw_client.last_server_status in (401, 403, 404) and zw_client.license_active:
-            logging.info(
-                "Stored local token rejected by backend (%s). Resetting local state.",
-                zw_client.last_server_status,
-            )
-            zw_client.clear_local_state()
-
-    if not _is_agent_active(zw_client):
-        enrolled = enrollment_cli(zw_client)
-        if not enrolled:
-            return
-
-        # ── Immediate post-enrollment sync ──────────────────────────
-        # Run a full inventory scan and heartbeat NOW so the dashboard
-        # shows the device immediately instead of waiting for the daemon.
-        _print_banner()
-        _top("INITIALIZING PROTECTION")
-        _blank()
-        _row(f"  {C.CYAN}Running initial inventory scan...{C.R}")
-        _blank()
-        _bot()
-        print()
-
-        try:
-            software = get_installed_software_registry()
-            hardware_data = get_detailed_hardware_profile()
-            _spinner("Scanning software inventory...", duration=0.5)
-            _spinner("Scanning hardware profile...", duration=0.5)
-
-            sync_ok = zw_client.sync_full(software, hardware_data)
-            if sync_ok:
-                _spinner("Synced inventory to server", duration=0.3)
-            else:
-                _spinner("Inventory queued (will sync when daemon starts)", duration=0.3)
-
-            zw_client.heartbeat()
-            zw_client.log_event("STARTUP", {
-                "version": AGENT_VERSION,
-                "status": "active",
-                "trigger": "post-enrollment",
-                "software_count": len(software),
-            })
-        except Exception as e:
-            logging.warning(f"Post-enrollment sync error (non-fatal): {e}")
-
-        # ── Spawn background daemon ─────────────────────────────────
-        started, pid = _spawn_daemon_process()
-        _print_banner()
-        _top("PROTECTION ACTIVE")
-        _blank()
-        if started:
-            _row(f"  {C.SUCCESS}SentinelAgent is running in background (PID {pid}).{C.R}")
-        else:
-            _row(f"  {C.WARN}Agent was enrolled, but daemon is not running yet.{C.R}")
-        _row(f"  {C.MUTED}You may close this window safely.{C.R}")
-        _blank()
-        _bot()
-        print()
-        time.sleep(3)
-        return
-
-    # Enrolled endpoints should auto-heal daemon state for operator convenience.
-    if not _is_daemon_running():
-        try:
-            started, pid = _spawn_daemon_process()
-            if started:
-                logging.info("Interactive launch auto-started daemon (pid=%s).", pid)
-            else:
-                logging.warning("Interactive launch attempted daemon auto-start but process did not stay alive.")
-        except Exception as exc:
-            logging.warning("Interactive launch failed to auto-start daemon: %s", exc)
-
-    main_cli(zw_client)
 
 
 # ============================================================================
@@ -4879,47 +4778,55 @@ def main_agent():
         "enabled (--hardened)" if hardened_mode else "standard (default)",
     )
 
-    # --- Self-Protection ---
-    ctrl_handler_ref = install_ctrl_handler()
-    if hardened_mode:
-        dacl_ok = harden_process_acl()
-    else:
-        dacl_ok = False
-        logging.info("Skipping process ACL hardening in standard profile.")
-
-    # --- Spawn Watchdog (unless --no-watchdog flag is set) ---
-    skip_watchdog = "--no-watchdog" in sys.argv
-    
-    def spawn_watchdog():
-        exe_path = get_exe_path()
-        if exe_path.endswith('.py'):
-            watchdog_args = [sys.executable, exe_path, "--watchdog", exe_path]
+    # --- Self-Protection & Watchdog ---
+    if sys.platform == "win32":
+        ctrl_handler_ref = install_ctrl_handler()
+        if hardened_mode:
+            dacl_ok = harden_process_acl()
         else:
-            watchdog_args = [exe_path, "--watchdog", exe_path]
-        DETACHED = 0x00000008
-        NEW_GROUP = 0x00000200
-        subprocess.Popen(
-            watchdog_args,
-            creationflags=DETACHED | NEW_GROUP | subprocess.CREATE_NO_WINDOW,
-            startupinfo=_windows_hidden_startupinfo(),
-        )
-        logging.info("Watchdog guardian spawned as detached process.")
+            dacl_ok = False
+            logging.info("Skipping process ACL hardening in standard profile.")
 
-    if not skip_watchdog:
-        spawn_watchdog()
+        skip_watchdog = "--no-watchdog" in sys.argv
+        
+        def spawn_watchdog():
+            exe_path = get_exe_path()
+            if exe_path.endswith('.py'):
+                watchdog_args = [sys.executable, exe_path, "--watchdog", exe_path]
+            else:
+                watchdog_args = [exe_path, "--watchdog", exe_path]
+            DETACHED = 0x00000008
+            NEW_GROUP = 0x00000200
+            subprocess.Popen(
+                watchdog_args,
+                creationflags=DETACHED | NEW_GROUP | subprocess.CREATE_NO_WINDOW,
+                startupinfo=_windows_hidden_startupinfo(),
+            )
+            logging.info("Watchdog guardian spawned as detached process.")
+
+        if not skip_watchdog:
+            spawn_watchdog()
+        else:
+            logging.info("Skipping watchdog spawn (--no-watchdog mode, existing watchdog is monitoring).")
+
+        # --- Persistence ---
+        task_ok = register_task_scheduler()
+        if not task_ok:
+            logging.warning("Scheduled task setup failed, falling back to Run-key startup registration.")
+            register_startup_registry()
+
+        if hardened_mode:
+            register_windows_service()
+        else:
+            logging.info("Skipping Windows service persistence in standard profile.")
     else:
-        logging.info("Skipping watchdog spawn (--no-watchdog mode, existing watchdog is monitoring).")
-
-    # --- Persistence ---
-    task_ok = register_task_scheduler()
-    if not task_ok:
-        logging.warning("Scheduled task setup failed, falling back to Run-key startup registration.")
-        register_startup_registry()
-
-    if hardened_mode:
-        register_windows_service()
-    else:
-        logging.info("Skipping Windows service persistence in standard profile.")
+        try:
+            from platforms import PlatformFactory
+            plat = PlatformFactory.create()
+            if hasattr(plat, "persistence_manager") and hasattr(plat.persistence_manager, "register_startup"):
+                plat.persistence_manager.register_startup(get_exe_path())
+        except Exception as _p_err:
+            logging.debug("Non-Windows persistence setup: %s", _p_err)
 
     # --- Working directory for output files ---
     base_dir = get_base_dir()
@@ -7156,7 +7063,7 @@ def main():
             logging.info("Daemon blocked: Consent not accepted yet.")
             sys.exit(0)
         logging.info("Starting background daemon agent.")
-        if sys.platform != "win32":
+        if sys.platform.startswith("linux"):
             from sentinel_agent_linux import LinuxSentinelAgent
             agent = LinuxSentinelAgent()
             agent.run()
