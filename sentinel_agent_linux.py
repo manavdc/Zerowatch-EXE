@@ -570,6 +570,9 @@ class LinuxAgent:
         return 0
 
 
+# Alias for import compatibility from sentinel_agent.py
+LinuxSentinelAgent = LinuxAgent
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> int:

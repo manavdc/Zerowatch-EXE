@@ -1,11 +1,15 @@
-import winreg
+import sys
+if sys.platform == "win32":
+    import winreg
+else:
+    winreg = None
+
 import uuid
 import subprocess
 import json
 import datetime
 import os
 import csv
-import sys
 import time
 import threading
 from multiprocessing import Process, freeze_support
@@ -298,6 +302,11 @@ def main():
     """
     Entry point resolver.
     """
+    if sys.platform != "win32":
+        import sentinel_agent
+        sentinel_agent.main()
+        return
+
     freeze_support() # Required for multiprocessing in compiled Windows EXEs
     
     # 1. Did we get invoked to show the password prompt?
