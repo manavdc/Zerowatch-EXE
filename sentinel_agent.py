@@ -224,6 +224,11 @@ except ImportError:
     tkfont = None
     ttk = None
 
+# Avoid import-time crashes when tkinter is missing.
+# GUI entry points still check `tk is None` before use.
+_TkFrameBase = tk.Frame if tk is not None else object
+_TkRootBase = tk.Tk if tk is not None else object
+
 import math
 
 AGENT_VERSION = "1.1.1"
@@ -5178,7 +5183,7 @@ def main_agent():
 
     logging.info("SentinelAgent shutdown completed.")
 
-class EnrollmentFrame(tk.Frame):
+class EnrollmentFrame(_TkFrameBase):
     def __init__(self, master, zw_client):
         super().__init__(master)
         self.zw_client = zw_client
@@ -5585,7 +5590,7 @@ class EnrollmentFrame(tk.Frame):
         self.show_screen("TEAM_CODE")
         self.status_label_team.config(text=f"Denied: {reason}", fg="#f87171")
 
-class DashboardFrame(tk.Frame):
+class DashboardFrame(_TkFrameBase):
     def __init__(self, master, zw_client):
         super().__init__(master)
         self.zw_client = zw_client
@@ -6469,7 +6474,7 @@ class DashboardFrame(tk.Frame):
         self.cve_tables[key] = rows
         return card
 
-class UnifiedSentinelGUI(tk.Tk):
+class UnifiedSentinelGUI(_TkRootBase):
     def __init__(self, zw_client, force_frame=None):
         try:
             import os
@@ -6888,7 +6893,22 @@ def prompt_consent(base_dir, force_show=False):
 def run_interactive():
     """Redesigned interactive entry point."""
     if tk is None:
-        print("Interactive GUI mode requires tkinter. Please install python3-tk on Linux (e.g., sudo apt install python3-tk).")
+        if sys.platform == "darwin":
+            print(
+                "Interactive GUI mode requires tkinter. On macOS, install a Python build with Tk support "
+                "(for Homebrew Python, try: brew install python-tk)."
+            )
+        elif sys.platform.startswith("linux"):
+            print(
+                "Interactive GUI mode requires tkinter. Please install python3-tk "
+                "(e.g., sudo apt install python3-tk)."
+            )
+        elif sys.platform == "win32":
+            print(
+                "Interactive GUI mode requires tkinter. Reinstall Python and ensure the Tcl/Tk feature is included."
+            )
+        else:
+            print("Interactive GUI mode requires tkinter. Install Tcl/Tk support for your Python interpreter.")
         sys.exit(1)
     try:
         # Set AppUserModelID to ensure the taskbar icon matches the window icon
