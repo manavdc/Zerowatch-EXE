@@ -257,6 +257,8 @@ jobs:
       - name: Generate release-manifest.json + snapshot hash + Ed25519 signature
         env:
           OTA_SIGNING_KEY_HEX: ${{ secrets.OTA_SIGNING_KEY_HEX }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          GITHUB_REPO: manavdc/Zerowatch-EXE
         run: |
           python - <<'PYEOF'
           import base64, hashlib, json, os, sys, datetime
@@ -354,9 +356,6 @@ jobs:
           print(f"Public key (embed in cert_pinning.py): {pub_b64}")
 
           PYEOF
-        env:
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
-          GITHUB_REPO: manavdc/Zerowatch-EXE
 
       - name: Verify manifest signature (self-test)
         run: |
