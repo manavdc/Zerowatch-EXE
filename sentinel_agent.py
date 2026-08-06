@@ -6297,8 +6297,13 @@ class DashboardFrame(tk.Frame):
                 f"Update v{self._ota_update_info.version} is ready.\n\n"
                 "Restart SentinelAgent now to apply the update?"
             ):
-                # On Windows the swap already happened; just exit so SCM restarts
-                logging.info("[OTA] User confirmed restart — exiting for SCM restart.")
+                # _swap_windows already re-launched the new binary via _relaunch_detached().
+                # Just close this (old) window and exit so the new process takes over.
+                logging.info("[OTA] User confirmed restart — closing old instance.")
+                try:
+                    self.destroy()
+                except Exception:
+                    pass
                 sys.exit(0)
 
         check_btn.config(command=_do_check)

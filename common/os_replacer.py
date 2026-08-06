@@ -127,26 +127,29 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
 
     logger.info("[WIN SWAP] Staging new binary: %s → %s", new_binary, staging_path)
 
-    # Stage: copy new binary to .new (keeps the download temp separate from
-    # the in-use executable directory in case they are on different volumes)
+    # Stage: copy new binary to .new
     try:
         shutil.copy2(new_binary, staging_path)
     except OSError as exc:
         raise SwapError(f"Failed to stage new binary to {staging_path}: {exc}") from exc
 
     # Backup: rename current .exe → .exe.bak
-    # Windows allows renaming a currently-executing binary.
+    # If the .bak already exists (stale from a previous update that didn't clean up),
+    # try to delete it first.  If deletion fails (e.g. still locked), fall back to a
+    # timestamped backup name so the rename can always succeed.
     if os.path.exists(bak_path):
         try:
             os.remove(bak_path)
+            logger.info("[WIN SWAP] Removed stale backup: %s", bak_path)
         except OSError as exc:
-            logger.warning("[WIN SWAP] Could not remove stale .bak: %s", exc)
+            logger.warning("[WIN SWAP] Could not remove stale .bak (%s) — using timestamped backup", exc)
+            ts = int(time.time())
+            bak_path = current_exe + f".{ts}.bak"
 
     try:
         os.rename(current_exe, bak_path)
         logger.info("[WIN SWAP] Renamed %s → %s", current_exe, bak_path)
     except OSError as exc:
-        # Clean up staging if rename fails
         try:
             os.remove(staging_path)
         except OSError:
@@ -155,13 +158,12 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
             f"Cannot rename running exe to .bak — admin rights required? {exc}"
         ) from exc
 
-    # Install: move .new → original path
+    # Install: copy .new → original path
     try:
         shutil.copy2(staging_path, current_exe)
         os.remove(staging_path)
         logger.info("[WIN SWAP] Installed new binary: %s", current_exe)
     except OSError as exc:
-        # Rollback the rename immediately
         logger.error("[WIN SWAP] Install failed — restoring .bak: %s", exc)
         try:
             os.rename(bak_path, current_exe)
@@ -169,14 +171,40 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
             logger.critical("[WIN SWAP] Rollback also failed: %s", rb_exc)
         raise SwapError(f"Failed to copy new binary into place: {exc}") from exc
 
-    # Spawn detached post-update-check child
-    _spawn_post_update_check(current_exe)
+    # Re-launch the new binary as a detached process so the app restarts even
+    # when NOT running as a Windows Service (interactive / tray mode).
+    _relaunch_detached(current_exe)
 
     logger.info(
-        "[WIN SWAP] Swap complete. Post-update watchdog spawned. "
-        "Main process will exit to release SCM hooks."
+        "[WIN SWAP] Swap complete. New binary re-launched. "
+        "Main process will exit."
     )
     return True
+
+
+def _relaunch_detached(current_exe: str) -> None:
+    """
+    Re-launch the (already-swapped) binary as a fully detached process.
+    This is the restart mechanism when the agent is NOT registered as a
+    Windows Service — e.g. interactive desktop / tray mode.
+    """
+    DETACHED  = 0x00000008
+    NEW_GROUP = 0x00000200
+
+    try:
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 1  # SW_SHOWNORMAL — show the new window
+
+        subprocess.Popen(
+            [current_exe],
+            creationflags = DETACHED | NEW_GROUP,
+            startupinfo   = si,
+            close_fds     = True,
+        )
+        logger.info("[WIN SWAP] New binary re-launched: %s", current_exe)
+    except Exception as exc:
+        logger.warning("[WIN SWAP] Failed to re-launch new binary: %s", exc)
 
 
 def _spawn_post_update_check(current_exe: str) -> None:
@@ -186,7 +214,6 @@ def _spawn_post_update_check(current_exe: str) -> None:
     The child runs PostUpdateWatchdog which monitors liveness for 120 seconds
     and rolls back if the agent fails to heartbeat.
     """
-    import ctypes
     DETACHED    = 0x00000008
     NEW_GROUP   = 0x00000200
 
