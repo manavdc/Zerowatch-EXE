@@ -435,8 +435,8 @@ BASE_API_URL = _resolve_base_api_url()
 # For production and demo environments, these should be updated to actual hashes.
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
-        "PLACEHOLDER_PROD_PRIMARY_SPKI_HASH",
-        "PLACEHOLDER_PROD_BACKUP_SPKI_HASH"
+        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
+        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4="
     ],
     "zerowatch-testing.eastasia.cloudapp.azure.com": [
         "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",
@@ -1249,14 +1249,6 @@ class ZeroWatchClient:
                 unlink_detected = True
 
         if unlink_detected:
-            # Proactively verify with a fresh heartbeat if this was just a status code trigger
-            if not data or not data.get("unlinked"):
-                 _append_gui_log(self.base_dir, "[SECURITY] Verifying unconfirmed unlink signal...")
-                 res = self.heartbeat()
-                 if res is not None and res != "unlinked":
-                     _append_gui_log(self.base_dir, "[SECURITY] Unlink signal was false positive. Staying linked.")
-                     return False
-            
             _append_gui_log(self.base_dir, f"[SECURITY] Explicit unlink confirmed: {message}")
             self.clear_local_state()
             return True

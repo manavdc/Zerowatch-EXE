@@ -100,11 +100,12 @@ if "localhost" in BASE_API_URL or "127.0.0.1" in BASE_API_URL:
 # ── SPKI pins (identical to Windows agent) ────────────────────────────────────
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
-        "PLACEHOLDER_REPLACE_WITH_REAL_SPKI_PIN_PROD_1",
-        "PLACEHOLDER_REPLACE_WITH_REAL_SPKI_PIN_PROD_2",
+        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
+        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4="
     ],
     "zerowatch-testing.eastasia.cloudapp.azure.com": [
-        "PLACEHOLDER_REPLACE_WITH_REAL_SPKI_PIN_DEMO_1",
+        "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",
+        "EzSBE12fT2ZrphmumaBjrpdpXv9G71RhZQHMvuwszI4="
     ],
 }
 
