@@ -672,10 +672,31 @@ class PostUpdateWatchdog:
         """Resolve the path of the current executable."""
         if "SENTINEL_EXE_PATH" in os.environ:
             return os.environ["SENTINEL_EXE_PATH"]
-        if sys.argv[0] and (sys.argv[0].endswith('.exe') or not sys.argv[0].endswith('.py')):
-            return os.path.abspath(sys.argv[0])
+
+        # 1. Try Nuitka's original argv0 first (most robust for onefile)
+        try:
+            import sys
+            main_mod = sys.modules.get('__main__')
+            compiled_obj = getattr(main_mod, '__compiled__', None)
+            if compiled_obj:
+                orig = getattr(compiled_obj, "original_argv0", None)
+                if orig:
+                    return os.path.abspath(orig)
+        except Exception:
+            pass
+
+        # 2. Fallback to sys.argv[0] if it looks like an executable (and is NOT the temp extraction folder)
+        if sys.argv[0]:
+            argv0_abs = os.path.abspath(sys.argv[0])
+            is_temp = "ZeroWatch/extracted" in argv0_abs.replace("\\", "/") or "ZeroWatch\\extracted" in argv0_abs
+            if (argv0_abs.endswith('.exe') or not argv0_abs.endswith('.py')) and not is_temp:
+                return argv0_abs
+
+        # 3. Fallback to sys.executable if compiled/frozen
         if getattr(sys, "frozen", False) or "__compiled__" in dir(sys.modules.get("__main__", None)):
             return os.path.abspath(sys.executable)
+
+        # 4. Ultimate fallback to sys.argv[0]
         return os.path.abspath(sys.argv[0])
 
     @staticmethod

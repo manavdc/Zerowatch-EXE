@@ -2063,23 +2063,58 @@ class ZeroWatchClient:
 # Nuitka does NOT set sys.frozen — it uses __compiled__ at module level.
 # For --onefile, sys.executable points to the .exe, but we can also check sys.argv[0]
 # ---------------------------------------------------------------------------
-def get_base_dir():
-    """Returns the directory where the executable (or .py script) lives on disk."""
-    if sys.argv[0] and (sys.argv[0].endswith('.exe') or not sys.argv[0].endswith('.py')):
-        return os.path.dirname(os.path.abspath(sys.argv[0]))
-    if "__compiled__" in globals():
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-
 def get_exe_path():
     """Returns the absolute path to the current executable."""
-    if sys.argv[0] and (sys.argv[0].endswith('.exe') or not sys.argv[0].endswith('.py')):
-        return os.path.abspath(sys.argv[0])
+    # 1. Try Nuitka's original argv0 first (most robust for onefile)
+    try:
+        if "__compiled__" in globals():
+            orig = getattr(__compiled__, "original_argv0", None)
+            if orig:
+                return os.path.abspath(orig)
+    except Exception:
+        pass
+
+    # 2. Try sys.modules['__main__'] __compiled__ original_argv0
+    try:
+        import sys
+        main_mod = sys.modules.get('__main__')
+        compiled_obj = getattr(main_mod, '__compiled__', None)
+        if compiled_obj:
+            orig = getattr(compiled_obj, "original_argv0", None)
+            if orig:
+                return os.path.abspath(orig)
+    except Exception:
+        pass
+
+    # 3. Fallback to sys.argv[0] if it looks like an executable (and is NOT the temp extraction folder)
+    if sys.argv[0]:
+        argv0_abs = os.path.abspath(sys.argv[0])
+        # Make sure it's not the temp extraction directory python.exe
+        is_temp_path = "ZeroWatch/extracted" in argv0_abs.replace("\\", "/") or "ZeroWatch\\extracted" in argv0_abs
+        if (argv0_abs.endswith('.exe') or not argv0_abs.endswith('.py')) and not is_temp_path:
+            return argv0_abs
+
+    # 4. Fallback to sys.executable if compiled
     if "__compiled__" in globals():
         return os.path.abspath(sys.executable)
+
+    # 5. Ultimate fallback to __file__
     return os.path.abspath(__file__)
+
+
+def get_base_dir():
+    """Returns the directory where the executable (or .py script) lives on disk."""
+    exe_path = get_exe_path()
+    is_temp_path = "ZeroWatch/extracted" in exe_path.replace("\\", "/") or "ZeroWatch\\extracted" in exe_path
+    if is_temp_path:
+        # Fallback to sys.argv[0] dir
+        if sys.argv[0]:
+            argv0_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+            if "ZeroWatch/extracted" not in argv0_dir.replace("\\", "/") and "ZeroWatch\\extracted" not in argv0_dir:
+                return argv0_dir
+        # Fallback to current working directory
+        return os.getcwd()
+    return os.path.dirname(exe_path)
 
 # LOG_FILE is initialized in _configure_logging() during module import.
 
