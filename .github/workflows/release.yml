@@ -125,15 +125,14 @@ jobs:
         run: echo "binary=SentinelAgent-linux-x64" >> "$GITHUB_OUTPUT"
 
       - name: Write build-time server config (production)
+        shell: python
         run: |
-          python3 -c "
-import os, re
-ref = os.environ.get('GITHUB_REF_NAME', '')
-version = re.sub(r'^v', '', ref) if re.match(r'^v\\d+\\.\\d+\\.\\d+', ref) else '0.0.0'
-with open('agent_build_config.py', 'w') as f:
-    f.write(f'FORCED_BASE_API_URL = \"https://zerowatch.deepcytes.io/api\"\\n')
-    f.write(f'FORCED_AGENT_VERSION = \"{version}\"\\n')
-"
+          import os, re
+          ref = os.environ.get("GITHUB_REF_NAME", "")
+          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+\.\d+\.\d+", ref) else "0.0.0"
+          with open("agent_build_config.py", "w") as f:
+              f.write(f'FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"\n')
+              f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
 
       - name: Build with Nuitka (onefile)
         run: |
@@ -192,15 +191,14 @@ with open('agent_build_config.py', 'w') as f:
         run: echo "binary=SentinelAgent-macos-universal" >> "$GITHUB_OUTPUT"
 
       - name: Write build-time server config (production)
+        shell: python
         run: |
-          python3 -c "
-import os, re
-ref = os.environ.get('GITHUB_REF_NAME', '')
-version = re.sub(r'^v', '', ref) if re.match(r'^v\\d+\\.\\d+\\.\\d+', ref) else '0.0.0'
-with open('agent_build_config.py', 'w') as f:
-    f.write(f'FORCED_BASE_API_URL = \"https://zerowatch.deepcytes.io/api\"\\n')
-    f.write(f'FORCED_AGENT_VERSION = \"{version}\"\\n')
-"
+          import os, re
+          ref = os.environ.get("GITHUB_REF_NAME", "")
+          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+\.\d+\.\d+", ref) else "0.0.0"
+          with open("agent_build_config.py", "w") as f:
+              f.write(f'FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"\n')
+              f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
 
       - name: Build with Nuitka (onefile)
         run: |
