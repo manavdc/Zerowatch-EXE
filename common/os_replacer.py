@@ -672,6 +672,8 @@ class PostUpdateWatchdog:
         """Resolve the path of the current executable."""
         if "SENTINEL_EXE_PATH" in os.environ:
             return os.environ["SENTINEL_EXE_PATH"]
+        if sys.argv[0] and (sys.argv[0].endswith('.exe') or not sys.argv[0].endswith('.py')):
+            return os.path.abspath(sys.argv[0])
         if getattr(sys, "frozen", False) or "__compiled__" in dir(sys.modules.get("__main__", None)):
             return os.path.abspath(sys.executable)
         return os.path.abspath(sys.argv[0])

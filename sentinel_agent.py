@@ -2110,20 +2110,20 @@ class ZeroWatchClient:
 # ---------------------------------------------------------------------------
 def get_base_dir():
     """Returns the directory where the executable (or .py script) lives on disk."""
+    if sys.argv[0] and (sys.argv[0].endswith('.exe') or not sys.argv[0].endswith('.py')):
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
     if "__compiled__" in globals():
         return os.path.dirname(os.path.abspath(sys.executable))
-    if sys.argv[0].endswith('.exe') or not sys.argv[0].endswith('.py'):
-        return os.path.dirname(os.path.abspath(sys.argv[0]))
     return os.path.dirname(os.path.abspath(__file__))
 
 
 
 def get_exe_path():
     """Returns the absolute path to the current executable."""
+    if sys.argv[0] and (sys.argv[0].endswith('.exe') or not sys.argv[0].endswith('.py')):
+        return os.path.abspath(sys.argv[0])
     if "__compiled__" in globals():
         return os.path.abspath(sys.executable)
-    if sys.argv[0].endswith('.exe') or not sys.argv[0].endswith('.py'):
-        return os.path.abspath(sys.argv[0])
     return os.path.abspath(__file__)
 
 # LOG_FILE is initialized in _configure_logging() during module import.
