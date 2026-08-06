@@ -55,8 +55,13 @@ jobs:
       - name: Write build-time server config (production)
         shell: python
         run: |
+          import os, re
+          ref = os.environ.get("GITHUB_REF_NAME", "")
+          # Strip leading "v" — "v1.2.2" → "1.2.2"; keep as-is if no match
+          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+\.\d+\.\d+", ref) else "0.0.0"
           with open("agent_build_config.py", "w") as f:
-              f.write('FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"\n')
+              f.write(f'FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"\n')
+              f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
 
       - name: Build with Nuitka (onefile)
         shell: cmd
@@ -64,6 +69,7 @@ jobs:
           python -m nuitka ^
             --standalone ^
             --onefile ^
+            --onefile-tempdir-spec={CACHE_DIR}/ZeroWatch/extracted ^
             --enable-plugin=tk-inter ^
             --output-dir=dist\windows ^
             --output-filename=SentinelAgent-windows-x64.exe ^
@@ -120,7 +126,14 @@ jobs:
 
       - name: Write build-time server config (production)
         run: |
-          echo 'FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"' > agent_build_config.py
+          python3 -c "
+import os, re
+ref = os.environ.get('GITHUB_REF_NAME', '')
+version = re.sub(r'^v', '', ref) if re.match(r'^v\\d+\\.\\d+\\.\\d+', ref) else '0.0.0'
+with open('agent_build_config.py', 'w') as f:
+    f.write(f'FORCED_BASE_API_URL = \"https://zerowatch.deepcytes.io/api\"\\n')
+    f.write(f'FORCED_AGENT_VERSION = \"{version}\"\\n')
+"
 
       - name: Build with Nuitka (onefile)
         run: |
@@ -180,7 +193,14 @@ jobs:
 
       - name: Write build-time server config (production)
         run: |
-          echo 'FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"' > agent_build_config.py
+          python3 -c "
+import os, re
+ref = os.environ.get('GITHUB_REF_NAME', '')
+version = re.sub(r'^v', '', ref) if re.match(r'^v\\d+\\.\\d+\\.\\d+', ref) else '0.0.0'
+with open('agent_build_config.py', 'w') as f:
+    f.write(f'FORCED_BASE_API_URL = \"https://zerowatch.deepcytes.io/api\"\\n')
+    f.write(f'FORCED_AGENT_VERSION = \"{version}\"\\n')
+"
 
       - name: Build with Nuitka (onefile)
         run: |

@@ -239,7 +239,11 @@ except ImportError:
 
 import math
 
-AGENT_VERSION = "1.1.1"
+try:
+    from agent_build_config import FORCED_AGENT_VERSION as AGENT_VERSION  # injected by CI
+except (ImportError, AttributeError):
+    AGENT_VERSION = "1.1.1"  # fallback for local dev builds
+
 KILL_PASSWORD = "Pass@123" # Fallback offline password
 MUTEX_NAME = "Global\\SentinelAgent_ZeroWatch_4F9A2E1B"
 WATCHDOG_MUTEX_NAME = "Global\\SentinelAgent_Watchdog_4F9A2E1B"
@@ -6256,11 +6260,11 @@ class DashboardFrame(tk.Frame):
                         text=f"Verified. Applying update v{info.version}..."
                     ))
 
-                    from common.os_replacer import perform_update
+                    from common.os_replacer import perform_update, _relaunch_detached
                     current_exe = get_exe_path()
                     perform_update(dest, current_exe, zw_client=self.zw_client)
 
-                    self.after(0, _show_restart_prompt)
+                    self.after(0, lambda exe=current_exe: _show_restart_prompt(exe))
 
                 except _ota_updater.IntegrityError as exc:
                     self.after(0, lambda e=exc: banner_lbl.config(
@@ -6286,10 +6290,11 @@ class DashboardFrame(tk.Frame):
 
             threading.Thread(target=_worker, daemon=True, name="ota-download").start()
 
-        def _show_restart_prompt():
+        def _show_restart_prompt(current_exe: str):
             from tkinter import messagebox
+            from common.os_replacer import _relaunch_detached
             banner_lbl.config(
-                text=f"✓ Update v{self._ota_update_info.version} downloaded and verified.",
+                text=f"✓ Update v{self._ota_update_info.version} applied. Restart to run the new version.",
                 fg=self.c_green
             )
             if messagebox.askyesno(
@@ -6297,9 +6302,10 @@ class DashboardFrame(tk.Frame):
                 f"Update v{self._ota_update_info.version} is ready.\n\n"
                 "Restart SentinelAgent now to apply the update?"
             ):
-                # _swap_windows already re-launched the new binary via _relaunch_detached().
-                # Just close this (old) window and exit so the new process takes over.
-                logging.info("[OTA] User confirmed restart — closing old instance.")
+                logging.info("[OTA] User confirmed restart — launching new binary and exiting.")
+                # 1. Start the new binary as a detached process
+                _relaunch_detached(current_exe)
+                # 2. Destroy this window and exit the old process
                 try:
                     self.destroy()
                 except Exception:

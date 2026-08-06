@@ -171,14 +171,7 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
             logger.critical("[WIN SWAP] Rollback also failed: %s", rb_exc)
         raise SwapError(f"Failed to copy new binary into place: {exc}") from exc
 
-    # Re-launch the new binary as a detached process so the app restarts even
-    # when NOT running as a Windows Service (interactive / tray mode).
-    _relaunch_detached(current_exe)
-
-    logger.info(
-        "[WIN SWAP] Swap complete. New binary re-launched. "
-        "Main process will exit."
-    )
+    logger.info("[WIN SWAP] Swap complete. Call _relaunch_detached() to restart.")
     return True
 
 
