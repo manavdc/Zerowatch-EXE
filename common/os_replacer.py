@@ -189,15 +189,26 @@ def _relaunch_detached(current_exe: str) -> None:
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 1  # SW_SHOWNORMAL — show the new window
 
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [current_exe],
             creationflags = DETACHED | NEW_GROUP,
             startupinfo   = si,
             close_fds     = True,
         )
-        logger.info("[WIN SWAP] New binary re-launched: %s", current_exe)
+        # Give the process 1 second to start; if it terminates immediately it was
+        # likely blocked by antivirus (e.g. WinError 225).
+        time.sleep(1.0)
+        if proc.poll() is not None:
+            logger.warning(
+                "[WIN SWAP] Relaunched process exited immediately (code=%s) "
+                "— likely blocked by antivirus.", proc.returncode
+            )
+            return False
+        logger.info("[WIN SWAP] New binary re-launched: %s (pid=%d)", current_exe, proc.pid)
+        return True
     except Exception as exc:
         logger.warning("[WIN SWAP] Failed to re-launch new binary: %s", exc)
+        return False
 
 
 def _spawn_post_update_check(current_exe: str) -> None:

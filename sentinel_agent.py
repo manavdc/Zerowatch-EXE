@@ -6304,8 +6304,21 @@ class DashboardFrame(tk.Frame):
             ):
                 logging.info("[OTA] User confirmed restart — launching new binary and exiting.")
                 # 1. Start the new binary as a detached process
-                _relaunch_detached(current_exe)
-                # 2. Destroy this window and exit the old process
+                success = _relaunch_detached(current_exe)
+                if not success:
+                    banner_lbl.config(
+                        text="✗ Relaunch failed — new binary was blocked or failed to start. (Check Antivirus)",
+                        fg=self.c_red
+                    )
+                    messagebox.showerror(
+                        "Restart Failed",
+                        "Failed to launch the updated binary.\n\n"
+                        "The file may have been blocked by antivirus or Windows Defender.\n"
+                        "Please check your security software and launch SentinelAgent manually."
+                    )
+                    return
+
+                # 2. Destroy this window and exit the old process only if relaunch succeeded
                 try:
                     self.destroy()
                 except Exception:
