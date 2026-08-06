@@ -6318,12 +6318,12 @@ class DashboardFrame(tk.Frame):
                     )
                     return
 
-                # 2. Destroy this window and exit the old process only if relaunch succeeded
+                # 2. Force immediate process termination to release mutexes & DLL handles
                 try:
                     self.destroy()
                 except Exception:
                     pass
-                sys.exit(0)
+                os._exit(0)
 
         check_btn.config(command=_do_check)
         update_now_btn.config(command=_do_update_now)

@@ -175,36 +175,30 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
     return True
 
 
-def _relaunch_detached(current_exe: str) -> None:
+def _relaunch_detached(current_exe: str) -> bool:
     """
-    Re-launch the (already-swapped) binary as a fully detached process.
-    This is the restart mechanism when the agent is NOT registered as a
-    Windows Service — e.g. interactive desktop / tray mode.
+    Re-launch the (already-swapped) binary as a fully detached process after a 2-second delay.
+    This delay ensures the current instance can exit cleanly and release its Windows mutex
+    and DLL file handles before the new instance attempts to launch.
     """
     DETACHED  = 0x00000008
     NEW_GROUP = 0x00000200
 
     try:
+        # Launch via cmd.exe with 2s timeout so old PID exits & frees mutex before new launch
+        cmd = f'cmd.exe /c "timeout /t 2 /nobreak >NUL & start "" "{current_exe}""'
+
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 1  # SW_SHOWNORMAL — show the new window
+        si.wShowWindow = 0  # SW_HIDE
 
-        proc = subprocess.Popen(
-            [current_exe],
-            creationflags = DETACHED | NEW_GROUP,
+        subprocess.Popen(
+            cmd,
+            creationflags = DETACHED | NEW_GROUP | subprocess.CREATE_NO_WINDOW,
             startupinfo   = si,
             close_fds     = True,
         )
-        # Give the process 1 second to start; if it terminates immediately it was
-        # likely blocked by antivirus (e.g. WinError 225).
-        time.sleep(1.0)
-        if proc.poll() is not None:
-            logger.warning(
-                "[WIN SWAP] Relaunched process exited immediately (code=%s) "
-                "— likely blocked by antivirus.", proc.returncode
-            )
-            return False
-        logger.info("[WIN SWAP] New binary re-launched: %s (pid=%d)", current_exe, proc.pid)
+        logger.info("[WIN SWAP] Scheduled delayed relaunch for: %s", current_exe)
         return True
     except Exception as exc:
         logger.warning("[WIN SWAP] Failed to re-launch new binary: %s", exc)
