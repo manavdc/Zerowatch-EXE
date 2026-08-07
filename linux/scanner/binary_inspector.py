@@ -109,6 +109,70 @@ def _rpm_owner(filepath: str) -> Optional[dict]:
         return None
 
 
+def _pacman_owner(filepath: str) -> Optional[dict]:
+    """
+    Use pacman -Qo (Arch / Manjaro) to find which package owns the given file.
+    Output format: "/path/to/file is owned by packagename version"
+    Returns {'name': str, 'version': str, 'vendor': str} or None.
+    """
+    if not shutil.which("pacman"):
+        return None
+    try:
+        result = subprocess.run(
+            ["pacman", "-Qo", filepath],
+            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT,
+            env={**os.environ, "LANG": "C"},
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        # Format: "/usr/bin/python3 is owned by python 3.11.5-1"
+        parts = result.stdout.strip().rsplit(" ", 2)
+        if len(parts) < 3:
+            return None
+        pkg_name = parts[-2].strip()
+        version  = parts[-1].strip()
+        if not pkg_name:
+            return None
+        return {"name": pkg_name, "version": version, "vendor": "Arch Linux", "source": SOURCE_ELF_BINARY}
+    except Exception as exc:
+        logger.debug("pacman -Qo %s failed: %s", filepath, exc)
+        return None
+
+
+def _apk_owner(filepath: str) -> Optional[dict]:
+    """
+    Use apk info --who-owns (Alpine Linux) to find which package owns the given file.
+    Output format: "/path/to/file is owned by packagename-version"
+    Returns {'name': str, 'version': str, 'vendor': str} or None.
+    """
+    if not shutil.which("apk"):
+        return None
+    try:
+        result = subprocess.run(
+            ["apk", "info", "--who-owns", filepath],
+            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT,
+            env={**os.environ, "LANG": "C"},
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        # Format: "/usr/bin/python3 is owned by python3-3.11.5-r0"
+        token = result.stdout.strip().rsplit(" ", 1)[-1]  # e.g. "python3-3.11.5-r0"
+        # Split package name from version: last two hyphen-segments are version
+        parts = token.rsplit("-", 2)
+        if len(parts) == 3:
+            pkg_name = parts[0]
+            version  = f"{parts[1]}-{parts[2]}"
+        else:
+            pkg_name = token
+            version  = ""
+        if not pkg_name:
+            return None
+        return {"name": pkg_name, "version": version, "vendor": "Alpine Linux", "source": SOURCE_ELF_BINARY}
+    except Exception as exc:
+        logger.debug("apk info --who-owns %s failed: %s", filepath, exc)
+        return None
+
+
 def _source_for_path(filepath: str) -> str:
     """Determine ELF source tag from filename."""
     name = os.path.basename(filepath).lower()
@@ -138,8 +202,9 @@ def inspect_elf_file(
         if cached is not None:
             return cached
 
-    # Try package ownership (most authoritative)
-    owner = _dpkg_owner(filepath) or _rpm_owner(filepath)
+    # Try package ownership — dpkg (Debian/Ubuntu) → rpm (RHEL/Fedora) →
+    # pacman (Arch/Manjaro) → apk (Alpine) — first match wins.
+    owner = _dpkg_owner(filepath) or _rpm_owner(filepath) or _pacman_owner(filepath) or _apk_owner(filepath)
 
     if owner:
         item = SoftwareItem(

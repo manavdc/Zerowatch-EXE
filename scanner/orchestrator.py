@@ -106,13 +106,33 @@ logger = logging.getLogger("scanner.orchestrator")
 # ── Source priority for dedup (lower number = higher priority) ────────────────
 
 _SOURCE_PRIORITY: Dict[str, int] = {
+    # Windows / system-level (highest priority)
     "registry":         0,
     "os":               0,
     "driver":           1,
     "windows_store":    1,
+    "pe_sys":           1,
+    # Linux system-level
+    "deb_package":      0,
+    "rpm_package":      0,
+    "pacman_package":   0,
+    "snap_app":         1,
+    "flatpak_app":      1,
+    "kernel_module":    1,
+    # macOS system-level
+    "app_bundle":       0,
+    "macos_pkg":        0,
+    "homebrew_formula": 1,
+    "homebrew_cask":    1,
+    "macports":         1,
+    # Binary inspection (L1)
     "pe_binary":        2,
     "pe_dll":           2,
-    "pe_sys":           1,
+    "elf_binary":       2,
+    "elf_lib":          3,
+    "macho_binary":     2,
+    "dylib":            3,
+    # Manifest parsing (L2)
     "jar_manifest":     3,
     "npm_manifest":     4,
     "npm_lockfile":     4,

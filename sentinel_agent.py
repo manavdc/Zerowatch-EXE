@@ -5270,14 +5270,14 @@ def main_agent():
                     )
                     zw_client.log_event("RECONNECTED", {"flushed_count": flush_result.get("flushed", 0)})
             
-            # Check if Watchdog is still alive (every 60s)
-            if not skip_watchdog and (now - last_watchdog_check) > 60:
+            # Check if Watchdog is still alive (every 60s) — Windows only
+            if sys.platform == "win32" and not skip_watchdog and (now - last_watchdog_check) > 60:
                 last_watchdog_check = now
                 wd = ctypes.windll.kernel32.CreateMutexW(None, True, WATCHDOG_MUTEX_NAME)
                 wd_err = ctypes.windll.kernel32.GetLastError()
                 if wd:
                     ctypes.windll.kernel32.CloseHandle(wd)
-                
+
                 if wd_err != 183:
                     logging.warning("[MAIN] Watchdog missing! Reviving watchdog...")
                     spawn_watchdog()
@@ -6358,40 +6358,161 @@ class DashboardFrame(tk.Frame):
             _ota_background_monitor._callback = _on_update_detected
 
 
-    def _build_data_info_content(self, 
-    
-    parent_frame):
+    def _build_data_info_content(self, parent_frame):
         header = tk.Frame(parent_frame, bg=self.c_bg_base)
         header.pack(fill=tk.X, pady=(0, 20))
-        tk.Label(header, text="COLLECTED DATA", fg=self.c_white, bg=self.c_bg_base, font=("Arial", 18, "bold")).pack(side=tk.LEFT)
-        
-        desc = tk.Label(parent_frame, text="The following are collected from your device to provide security analytics and vulnerability matching.", fg=self.c_gray, bg=self.c_bg_base, font=self.f_normal, justify=tk.LEFT)
+        tk.Label(
+            header, text="COLLECTED DATA",
+            fg=self.c_white, bg=self.c_bg_base, font=("Arial", 18, "bold")
+        ).pack(side=tk.LEFT)
+
+        desc = tk.Label(
+            parent_frame,
+            text="The following are collected from your device to provide security analytics and vulnerability matching.",
+            fg=self.c_gray, bg=self.c_bg_base, font=self.f_normal, justify=tk.LEFT, wraplength=760
+        )
         desc.pack(anchor="w", pady=(0, 20))
-        
+
         container = tk.Frame(parent_frame, bg=self.c_bg_base)
         container.pack(fill=tk.BOTH, expand=True)
-        
-        fp = getattr(self.zw_client, "fingerprint_data", {}) or {}
-        
-        fields = [
-            ("MAC Address", fp.get("mac_address", "Unknown"), "Network interface unique hardware address used for device fingerprinting."),
-            ("BIOS UUID", fp.get("bios_uuid", "Unknown"), "Motherboard firmware unique identifier."),
-            ("Motherboard Serial", fp.get("motherboard_serial", "Unknown"), "Factory serial number of the motherboard."),
-            ("Machine GUID", fp.get("machine_guid", "Unknown"), "Windows OS unique identifier generated during installation."),
-            ("CPU ID", fp.get("cpu_id", "Unknown"), "Processor unique hardware identifier."),
-            ("Disk Serial", fp.get("disk_serial", "Unknown"), "Primary storage drive serial number.")
+
+        # ── Resolve fingerprint data ──────────────────────────────────────────
+        # Priority: 1. zw_client.fingerprint_data (in-memory, freshest)
+        #           2. fingerprint JSON on disk (survives restarts)
+        #           3. empty dict (show N/A — no data collected yet)
+        fp = getattr(self.zw_client, "fingerprint_data", None) or {}
+        if not fp:
+            try:
+                fp = _read_fingerprint_json(self.zw_client.base_dir) or {}
+            except Exception:
+                fp = {}
+
+        def _fval(key, *fallback_keys):
+            """Read value from fp, checking multiple key aliases."""
+            for k in (key,) + fallback_keys:
+                v = fp.get(k)
+                if v and str(v).strip() not in ("", "UNAVAILABLE", "Unknown", "None", "N/A"):
+                    return str(v).strip()
+            return "N/A"
+
+        # ── Build field list based on platform + available data ───────────────
+        fields = []
+        plat = sys.platform
+
+        # Device ID — shown on every platform
+        fields.append((
+            "Device ID",
+            _fval("device_id"),
+            "Unique deterministic identifier for this device, derived from hardware hashes.",
+        ))
+
+        # MAC Address — universal
+        fields.append((
+            "MAC Address",
+            _fval("mac_address"),
+            "Network interface hardware address used for device fingerprinting.",
+        ))
+
+        if plat == "win32":
+            fields += [
+                ("BIOS UUID",
+                 _fval("bios_uuid"),
+                 "Motherboard firmware unique identifier."),
+                ("Motherboard Serial",
+                 _fval("motherboard_serial"),
+                 "Factory serial number of the motherboard."),
+                ("Machine GUID",
+                 _fval("machine_guid"),
+                 "Windows OS unique identifier generated during installation."),
+                ("CPU ID",
+                 _fval("cpu_id"),
+                 "Processor unique hardware identifier."),
+                ("Disk Serial",
+                 _fval("disk_serial"),
+                 "Primary storage drive serial number."),
+                ("OS Product ID",
+                 _fval("os_serial"),
+                 "Windows product ID from registry."),
+            ]
+        elif plat == "darwin":
+            fields += [
+                ("IOKit Platform UUID",
+                 _fval("ioplatform_uuid", "bios_uuid"),
+                 "Apple IOKit unique platform identifier (equivalent of BIOS UUID on macOS)."),
+                ("Model Identifier",
+                 _fval("model_identifier", "motherboard_product"),
+                 "Apple hardware model identifier (e.g. MacBookPro18,3)."),
+                ("Hardware Serial",
+                 _fval("hardware_serial", "bios_serial"),
+                 "Apple factory hardware serial number."),
+                ("CPU Architecture",
+                 _fval("cpu_arch"),
+                 "Processor architecture (arm64 = Apple Silicon, x86_64 = Intel)."),
+                ("macOS Version",
+                 _fval("os_version"),
+                 "Currently running macOS version."),
+            ]
+        else:
+            # Linux
+            fields += [
+                ("DMI UUID",
+                 _fval("bios_uuid"),
+                 "System BIOS UUID from /sys/class/dmi/id (equivalent of BIOS UUID)."),
+                ("Motherboard Serial",
+                 _fval("motherboard_serial"),
+                 "Factory serial from /sys/class/dmi/id/board_serial."),
+                ("BIOS Serial",
+                 _fval("bios_serial"),
+                 "BIOS serial number from /sys/class/dmi/id/product_serial."),
+                ("CPU Model",
+                 _fval("cpu_id"),
+                 "Processor model string from /proc/cpuinfo."),
+                ("OS Release",
+                 _fval("os_serial"),
+                 "Distribution name and version from /etc/os-release."),
+            ]
+
+        # Hostname + username — always collected
+        fields += [
+            ("Hostname",
+             _fval("hostname") or self.zw_client.hostname or "N/A",
+             "Device network hostname used for asset identification."),
+            ("Username",
+             _fval("username", "operator_username"),
+             "Operating system user account name for the enrolled operator."),
         ]
-        
-        for i, (title, val, explanation) in enumerate(fields):
-            card = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=20, pady=15)
+
+        # ── Render cards ──────────────────────────────────────────────────────
+        for title, val, explanation in fields:
+            card = tk.Frame(
+                container, bg=self.c_bg_card,
+                highlightbackground=self.c_border, highlightthickness=1,
+                padx=20, pady=15
+            )
             card.pack(fill=tk.X, pady=5)
-            
+
             top = tk.Frame(card, bg=self.c_bg_card)
             top.pack(fill=tk.X)
-            tk.Label(top, text=title, fg=self.c_cyan, bg=self.c_bg_card, font=self.f_normal_bold).pack(side=tk.LEFT)
-            tk.Label(top, text=str(val), fg=self.c_white, bg=self.c_bg_card, font=self.f_normal_bold).pack(side=tk.RIGHT)
-            
-            tk.Label(card, text=explanation, fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
+
+            # Color the label red if the value is N/A to draw attention
+            label_color = self.c_cyan
+            value_color = self.c_white if val != "N/A" else "#f85149"
+
+            tk.Label(
+                top, text=title,
+                fg=label_color, bg=self.c_bg_card, font=self.f_normal_bold
+            ).pack(side=tk.LEFT)
+            tk.Label(
+                top, text=val,
+                fg=value_color, bg=self.c_bg_card, font=self.f_normal_bold
+            ).pack(side=tk.RIGHT)
+
+            tk.Label(
+                card, text=explanation,
+                fg=self.c_gray, bg=self.c_bg_card,
+                font=self.f_small, justify=tk.LEFT, wraplength=700
+            ).pack(anchor="w", pady=(8, 0))
+
 
     def _build_dashboard_content(self, parent_frame):
         header_frame = tk.Frame(parent_frame, bg=self.c_bg_base)

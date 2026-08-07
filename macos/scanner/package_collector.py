@@ -59,16 +59,17 @@ logger = logging.getLogger("macos.scanner.package_collector")
 _SUBPROCESS_TIMEOUT = 60  # seconds
 
 
-# ── Local macOS source tag constants ─────────────────────────────────────────
-# NOTE: Not promoted to common/scanner/models.py until backend validation
-# confirms these values are accepted by the CVE matching pipeline.
-
-SOURCE_APP_BUNDLE       = "app_bundle"
-SOURCE_MACOS_PKG        = "macos_pkg"
-SOURCE_HOMEBREW_FORMULA = "homebrew_formula"
-SOURCE_HOMEBREW_CASK    = "homebrew_cask"
-SOURCE_MACPORTS         = "macports"
-# "os" is reused from Linux convention — already in production use.
+# ── macOS source tag constants (canonical — from common.scanner.models) ─────────
+# These are now promoted to common/scanner/models.py and confirmed by the backend.
+from common.scanner.models import (
+    SOURCE_APP_BUNDLE,
+    SOURCE_MACOS_PKG,
+    SOURCE_HOMEBREW_FORMULA,
+    SOURCE_HOMEBREW_CASK,
+    SOURCE_MACPORTS,
+)
+# Convenience alias: macOS OS version reuses the cross-platform "os" tag.
+SOURCE_MACOS_OS = "os"
 
 
 # ── Subprocess helper ─────────────────────────────────────────────────────────

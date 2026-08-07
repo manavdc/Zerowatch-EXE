@@ -96,6 +96,67 @@ def _parse_meminfo() -> Dict[str, Any]:
     return mem
 
 
+def _get_ram_modules() -> List[Dict[str, Any]]:
+    """
+    Enumerate RAM DIMM slots via `dmidecode --type 17`.
+    Requires root privileges; returns [] if unavailable or access denied.
+
+    Each returned dict has keys:
+        slot, size_gb, type, speed_mhz, manufacturer, part_number
+    """
+    if not shutil.which("dmidecode"):
+        return []
+    modules: List[Dict[str, Any]] = []
+    try:
+        result = subprocess.run(
+            ["dmidecode", "--type", "17"],
+            capture_output=True, text=True, timeout=15,
+            env={**os.environ, "LANG": "C"},
+        )
+        if result.returncode != 0:
+            logger.debug("dmidecode --type 17 returned %d", result.returncode)
+            return []
+
+        current: Dict[str, Any] = {}
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Memory Device"):
+                if current:
+                    modules.append(current)
+                current = {}
+            elif ":" in line:
+                key, _, val = line.partition(":")
+                key = key.strip().lower()
+                val = val.strip()
+                if key == "locator" and "bank" not in key:
+                    current["slot"] = val
+                elif key == "size" and val not in ("No Module Installed", "Not Installed", ""):
+                    # Parse e.g. "16384 MB" or "16 GB"
+                    parts = val.split()
+                    try:
+                        amount = int(parts[0])
+                        unit   = parts[1].upper() if len(parts) > 1 else "MB"
+                        size_gb = round(amount / 1024, 1) if unit == "MB" else amount
+                        current["size_gb"] = size_gb
+                    except (ValueError, IndexError):
+                        pass
+                elif key == "type":
+                    current["type"] = val
+                elif key == "speed" and "Unknown" not in val:
+                    current["speed_mhz"] = val.replace(" MT/s", "").replace(" MHz", "")
+                elif key == "manufacturer" and val not in ("Unknown", "", "Not Specified"):
+                    current["manufacturer"] = val
+                elif key == "part number" and val not in ("Unknown", "", "Not Specified"):
+                    current["part_number"] = val.strip()
+        if current:
+            modules.append(current)
+        # Filter out empty / uninstalled slots
+        modules = [m for m in modules if "size_gb" in m]
+    except Exception as exc:
+        logger.debug("dmidecode RAM module enumeration failed: %s", exc)
+    return modules
+
+
 def _get_gpus() -> List[str]:
     """Try to enumerate GPU names from /sys/class/drm or lspci."""
     gpus: List[str] = []
@@ -209,6 +270,7 @@ class LinuxHardwareCollector(HardwareCollector):
         gpus = _get_gpus()
         macs = _get_mac_addresses()
         os_rel = _get_os_release()
+        ram_modules = _get_ram_modules()
 
         total_kb = mem["total_kb"]
         total_gb = round(total_kb / (1024 * 1024), 2) if total_kb > 0 else 0.0
@@ -226,8 +288,8 @@ class LinuxHardwareCollector(HardwareCollector):
             "ram": {
                 "total_kb": str(total_kb),
                 "total_gb": total_gb,
-                "modules": [],
-                "module_count": 0,
+                "modules": ram_modules,
+                "module_count": len(ram_modules),
             },
             "gpu": gpus[0] if gpus else "Unknown",
             "gpus": [{"name": g} for g in gpus],

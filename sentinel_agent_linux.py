@@ -356,9 +356,23 @@ class LinuxAgent:
         individual_code = os.environ.get("INDIVIDUAL_CODE") or os.environ.get("ZEROWATCH_INDIVIDUAL_CODE")
 
         if not team_code and not individual_code:
-            logger.warning("No enrollment code (TEAM_CODE/INDIVIDUAL_CODE) found in environment. Waiting for enrollment...")
-            # Fallback for development: use a dummy team code or block
-            team_code = "123456"
+            logger.warning(
+                "No enrollment code found in environment. "
+                "Set TEAM_CODE=<your-team-code> or INDIVIDUAL_CODE=<your-code> "
+                "then restart the agent, OR enroll the device from the ZeroWatch dashboard."
+            )
+            # Poll every 30s for an env var to appear (e.g. set by a parent wrapper script)
+            # This ensures the agent does NOT send a fake "123456" to production.
+            logger.info("Waiting for enrollment code to be set in environment (Ctrl+C to abort)...")
+            while not self._shutdown_event.is_set():
+                self._shutdown_event.wait(timeout=30)
+                team_code = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
+                individual_code = os.environ.get("INDIVIDUAL_CODE") or os.environ.get("ZEROWATCH_INDIVIDUAL_CODE")
+                if team_code or individual_code:
+                    logger.info("Enrollment code found. Proceeding with enrollment...")
+                    break
+            if not team_code and not individual_code:
+                return False
 
         # 1. Team Code Join Flow
         if team_code:
@@ -487,42 +501,67 @@ class LinuxAgent:
             logger.debug("Heartbeat error: %s", exc)
             return False
 
+    def _sync_full_with_retry(self, software: list) -> bool:
+        """Push full software inventory to backend, retrying up to 3 times on failure."""
+        for attempt in range(3):
+            if self._shutdown_event.is_set():
+                return False
+            if self._sync_full(software):
+                return True
+            logger.warning("Full sync attempt %d/3 failed. Retrying in 15s...", attempt + 1)
+            self._shutdown_event.wait(timeout=15)
+        logger.error("Full sync failed after 3 attempts — inventory will retry on next delta cycle.")
+        return False
+
     def _initial_scan_and_sync(self) -> None:
-        """Run full scan and push inventory to backend."""
-        logger.info("Running initial full scan...")
+        """Run full L0 scan and push to backend immediately."""
+        logger.info("Running initial full scan (L0 — registry/packages)...")
         try:
-            items = self._orchestrator.run_full_scan(stop_event=self._shutdown_event)
-            dicts = _items_to_dicts(items)
-            logger.info("Initial scan: %d software items", len(dicts))
-            self._sync_full(dicts)
+            items = self._orchestrator.run_full_scan(
+                include_filesystem=False,  # L0 only; filesystem handled by start_periodic_scans()
+                stop_event=self._shutdown_event,
+            )
+            logger.info("Initial L0 scan: %d software items", len(items))
+            self._sync_full_with_retry(items)
         except Exception as exc:
             logger.error("Initial scan failed: %s", exc, exc_info=True)
 
+    def _on_fs_delta(self, added_items: list, removed_items: list) -> None:
+        """
+        Callback from start_periodic_scans() — push L1/L2 ELF/manifest deltas to backend.
+        NOTE: added_items / removed_items are already List[dict] (converted by
+        _emit_fs_delta inside the orchestrator). Do NOT wrap with _items_to_dicts().
+        """
+        if (added_items or removed_items) and self._session._jwt:
+            self._sync_delta(added_items, removed_items)
+
     def _monitor_loop(self) -> None:
-        """Background thread: periodic delta scan + heartbeat."""
-        last_delta   = time.monotonic()
-        last_heartbeat = time.monotonic()
+        """
+        Background thread: fast L0 registry delta every 60s.
+        L1/L2 filesystem deltas are handled by start_periodic_scans() (4h priority / 24h deep).
+        This mirrors the Windows agent's two-tier scan architecture.
+        """
+        last_heartbeat  = time.monotonic()
+        last_l0_delta   = time.monotonic()
+        L0_INTERVAL     = 60   # seconds between L0 (package manager) delta scans
 
         while not self._shutdown_event.is_set() and not self._stop_event.is_set():
             now = time.monotonic()
 
-            # Heartbeat
+            # ── Heartbeat ──────────────────────────────────────────────────
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 self._heartbeat()
                 last_heartbeat = now
 
-            # Delta scan
-            if now - last_delta >= MONITOR_INTERVAL:
+            # ── Fast L0 delta (dpkg/rpm/pacman/snap/flatpak/etc.) ──────────
+            if now - last_l0_delta >= L0_INTERVAL:
                 try:
-                    added, removed = self._orchestrator.run_delta_scan()
+                    added, removed = self._orchestrator.run_registry_delta()
                     if added or removed:
-                        self._sync_delta(
-                            _items_to_dicts(added),
-                            _items_to_dicts(removed),
-                        )
-                    last_delta = now
+                        self._sync_delta(added, removed)
+                    last_l0_delta = now
                 except Exception as exc:
-                    logger.warning("Delta scan error: %s", exc)
+                    logger.warning("L0 delta scan error: %s", exc)
 
             time.sleep(5)
 
@@ -542,10 +581,14 @@ class LinuxAgent:
             logger.error("Could not authenticate after %d attempts — exiting", max_retries)
             return 1
 
-        # Initial scan
+        # Initial L0 scan (fast — package managers only)
         self._initial_scan_and_sync()
 
-        # Start background monitor thread
+        # Start background L1/L2 filesystem scans (4h priority / 24h deep)
+        self._orchestrator.start_periodic_scans(on_delta=self._on_fs_delta)
+        logger.info("Periodic filesystem scan started (4h priority / 24h deep).")
+
+        # Start background L0 monitor thread (heartbeat + 60s registry delta)
         monitor = threading.Thread(target=self._monitor_loop, daemon=True, name="linux-monitor")
         monitor.start()
 
@@ -556,11 +599,17 @@ class LinuxAgent:
 
         logger.info("Shutdown signal received — stopping agent")
         self._stop_event.set()
+
+        # Stop filesystem scanner before joining monitor thread
+        try:
+            self._orchestrator.stop_periodic_scans(timeout=10)
+        except Exception as exc:
+            logger.debug("Orchestrator stop error (non-fatal): %s", exc)
+
         monitor.join(timeout=10)
 
-        # Cleanup
+        # Cleanup build-time config
         try:
-            import agent_build_config
             cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_build_config.py")
             if os.path.exists(cfg_path):
                 os.remove(cfg_path)

@@ -452,10 +452,20 @@ class MacOSAgent:
 
         if not team_code and not individual_code:
             logger.warning(
-                "No enrollment code found (TEAM_CODE / INDIVIDUAL_CODE env vars). "
-                "Waiting for admin to enroll this device from the dashboard..."
+                "No enrollment code found in environment. "
+                "Set TEAM_CODE=<your-team-code> or INDIVIDUAL_CODE=<your-code> "
+                "then restart the agent, OR enroll the device from the ZeroWatch dashboard."
             )
-            team_code = "123456"   # Development fallback — triggers pending state
+            logger.info("Waiting for enrollment code to be set in environment (Ctrl+C to abort)...")
+            while not self._shutdown_event.is_set():
+                self._shutdown_event.wait(timeout=30)
+                team_code = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
+                individual_code = os.environ.get("INDIVIDUAL_CODE") or os.environ.get("ZEROWATCH_INDIVIDUAL_CODE")
+                if team_code or individual_code:
+                    logger.info("Enrollment code found. Proceeding with enrollment...")
+                    break
+            if not team_code and not individual_code:
+                return False
 
         # ── Team Code Join Flow ────────────────────────────────────────────────
         if team_code:
@@ -566,6 +576,18 @@ class MacOSAgent:
             logger.warning("Full sync error: %s", exc)
         return False
 
+    def _sync_full_with_retry(self, software: list, hardware: dict) -> bool:
+        """Push full inventory, retrying up to 3 times on transient failures."""
+        for attempt in range(3):
+            if self._shutdown_event.is_set():
+                return False
+            if self._sync_full(software, hardware):
+                return True
+            logger.warning("Full sync attempt %d/3 failed. Retrying in 15s...", attempt + 1)
+            self._shutdown_event.wait(timeout=15)
+        logger.error("Full sync failed after 3 attempts — will retry on next delta.")
+        return False
+
     def _sync_delta(self, added: list, removed: list) -> bool:
         """Push incremental delta to backend."""
         if not added and not removed:
@@ -601,55 +623,51 @@ class MacOSAgent:
             logger.debug("Heartbeat error: %s", exc)
             return False
 
-    # ── Scan phases ────────────────────────────────────────────────────────────
+    # ── Scan phases ────────────────────────────────────────────────
 
     def _initial_scan_and_sync(self) -> None:
         """
-        Phase A: L0 (app bundles, pkgutil, Homebrew, MacPorts, OS item).
-        Completes in < 2 s and sends the first inventory immediately so the
-        dashboard shows products/vendors without waiting for the full walk.
-
-        Phase B: Full filesystem scan (L1 Mach-O + L2 manifests) runs in
-        the same call on cold start (no previous cache). On warm starts the
-        cached items are merged and only the filesystem delta is computed.
+        Fast L0 scan: app bundles, pkgutil, Homebrew, MacPorts, macOS version.
+        Completes in < 5s and sends the first inventory to the dashboard immediately.
+        L1 (Mach-O filesystem) and L2 (manifests) are handled by start_periodic_scans().
         """
-        logger.info("Running initial full scan (L0 + L1 + L2)...")
+        logger.info("Running initial L0 scan (app bundles, pkgutil, Homebrew, macOS version)...")
         try:
-            # L0 first (fast) — emit to backend immediately
-            items_l0 = self._orchestrator.run_full_scan(
-                include_filesystem=False,
+            items = self._orchestrator.run_full_scan(
+                include_filesystem=False,   # L0 only on cold start
                 stop_event=self._shutdown_event,
             )
-            dicts_l0 = _items_to_dicts(items_l0)
-            logger.info("L0 scan: %d software items", len(dicts_l0))
-
+            logger.info("Initial L0 scan: %d software items", len(items))
             hw = _build_hardware_profile(self._platform)
-            self._sync_full(dicts_l0, hw)
-
-            # Filesystem scan (L1+L2) — may take several minutes on first run
-            if not self._shutdown_event.is_set():
-                logger.info("Running filesystem scan (L1 Mach-O + L2 manifests)...")
-                items_fs = self._orchestrator.run_full_scan(
-                    include_filesystem=True,
-                    stop_event=self._shutdown_event,
-                )
-                dicts_fs = _items_to_dicts(items_fs)
-                logger.info("Full scan (L0+L1+L2): %d software items", len(dicts_fs))
-                self._sync_full(dicts_fs, hw)
-
+            self._sync_full_with_retry(items, hw)
         except Exception as exc:
             logger.error("Initial scan failed: %s", exc, exc_info=True)
 
-    # ── Monitor loop ───────────────────────────────────────────────────────────
+    def _on_fs_delta(self, added_items: list, removed_items: list) -> None:
+        """
+        Callback from start_periodic_scans() — push L1/L2 Mach-O deltas to backend.
+        NOTE: added_items / removed_items are already List[dict] (converted by
+        _emit_fs_delta inside the orchestrator). Do NOT wrap with _items_to_dicts().
+        """
+        if (added_items or removed_items) and self._session._jwt:
+            self._sync_delta(added_items, removed_items)
+
+    # ── Monitor loop ────────────────────────────────────────────────
 
     def _monitor_loop(self) -> None:
-        """Background thread: periodic delta scan + heartbeat."""
-        last_delta     = time.monotonic()
-        last_heartbeat = time.monotonic()
+        """
+        Background thread: fast L0 delta every 60s (app bundle installs/removals).
+        L1/L2 Mach-O filesystem deltas are handled by start_periodic_scans()
+        on a 4h priority / 24h deep schedule — identical to Windows pattern.
+        """
+        last_heartbeat  = time.monotonic()
+        last_l0_delta   = time.monotonic()
+        L0_INTERVAL     = 60   # seconds between L0 app-bundle delta checks
 
         while not self._shutdown_event.is_set() and not self._stop_event.is_set():
             now = time.monotonic()
 
+            # ── Heartbeat ──────────────────────────────────────────────────
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 self._heartbeat()
                 last_heartbeat = now

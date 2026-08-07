@@ -199,7 +199,7 @@ echo.
 echo [4/5] Compiling sentinel_agent.py
 echo       This will utilize all available CPU cores (%NUMBER_OF_PROCESSORS% threads)
 echo.
-set "PACKAGE_FLAGS=--include-package=common --include-package=scanner --include-package=platforms --include-package=windows --include-package=linux"
+set "PACKAGE_FLAGS=--include-package=common --include-package=scanner --include-package=platforms --include-package=windows --nofollow-import-to=linux --nofollow-import-to=macos"
 set "DATA_FLAGS=--include-data-dir=resources=resources"
 set "SPEED_FLAGS=--lto=no --jobs=%NUMBER_OF_PROCESSORS%"
 set "BASE_FLAGS=--assume-yes-for-downloads --zig --windows-console-mode=disable --output-dir=build --output-filename=%OUTPUT_NAME% %ICON_FLAG% --include-data-file=%ICON_PATH%=favicon.ico %PACKAGE_FLAGS% %DATA_FLAGS% %SPEED_FLAGS%"

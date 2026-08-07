@@ -49,6 +49,15 @@ SOURCE_KERNEL_MODULE     = "kernel_module"
 SOURCE_ELF_BINARY        = "elf_binary"
 SOURCE_ELF_LIB           = "elf_lib"
 
+# ── macOS source tags ─────────────────────────────────────────────────────────
+SOURCE_APP_BUNDLE        = "app_bundle"
+SOURCE_MACOS_PKG         = "macos_pkg"
+SOURCE_HOMEBREW_FORMULA  = "homebrew_formula"
+SOURCE_HOMEBREW_CASK     = "homebrew_cask"
+SOURCE_MACPORTS          = "macports"
+SOURCE_MACHO_BINARY      = "macho_binary"
+SOURCE_DYLIB             = "dylib"
+
 
 # ── Item dataclass ────────────────────────────────────────────────────────────
 
