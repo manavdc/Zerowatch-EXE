@@ -520,7 +520,12 @@ class ScanOrchestrator:
             # Only delta on registry-sourced keys to avoid false removals
             # from filesystem items not present in the Layer 0 subset
             l0_sources = {
-                "registry", "windows_store", "driver", "os"
+                 # Windows
+                "registry", "windows_store", "driver", "os",
+                # macOS
+                "app_bundle", "macos_pkg", "homebrew_formula", "homebrew_cask", "macports",
+                # Linux
+                "deb_package", "rpm_package", "pacman_package", "snap_app", "flatpak_app", "kernel_module"
             }
             old_l0_keys = {
                 k for k, v in self._last_snapshot.items()
