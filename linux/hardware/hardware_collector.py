@@ -239,9 +239,49 @@ class LinuxHardwareCollector(HardwareCollector):
     """Linux implementation of HardwareCollector interface."""
 
     def collect_fingerprint(self) -> Dict[str, Any]:
+        """
+        Collect a full set of hardware identifiers for the GUI DATA INFO panel
+        and for device fingerprinting.
+
+        All fields mirror the Windows collect_fingerprint() dict so that the GUI
+        _build_data_info_content() can read them with the same keys on every OS.
+        """
+        import socket
+
+        machine_id  = get_machine_id() or ""
+        dmi_uuid    = get_dmi_product_uuid() or ""
+        bios_serial = _read_file("/sys/class/dmi/id/product_serial")
+        mb_serial   = _read_file("/sys/class/dmi/id/board_serial")
+        mb_product  = _read_file("/sys/class/dmi/id/product_name")
+        cpu         = _parse_cpuinfo()
+        macs        = _get_mac_addresses()
+        mac_addr    = macs[0] if macs else ""
+        os_rel      = _get_os_release()
+        os_serial   = os_rel.get("PRETTY_NAME") or os_rel.get("NAME") or "Linux"
+        dev_id      = generate_device_id()
+        hostname    = ""
+        try:
+            hostname = socket.gethostname()
+        except Exception:
+            pass
+
         return {
-            "machine_id": get_machine_id() or "",
-            "dmi_uuid": get_dmi_product_uuid() or "",
+            # Keys that exactly match Windows collect_fingerprint() so the GUI works
+            "bios_uuid":          dmi_uuid,
+            "bios_serial":        bios_serial or "UNAVAILABLE",
+            "motherboard_serial": mb_serial or "UNAVAILABLE",
+            "motherboard_product": mb_product or "UNAVAILABLE",
+            "cpu_id":             cpu.get("model_name", "Unknown"),
+            "machine_guid":       machine_id,   # machine-id is Linux's machine GUID equivalent
+            "mac_address":        mac_addr,
+            "mac_addresses":      macs,
+            "disk_serial":        "UNAVAILABLE",  # Requires root; not collected without sudo
+            "os_serial":          os_serial,
+            "device_id":          dev_id,
+            "hostname":           hostname,
+            # Linux-specific extras (read by GUI on linux branch)
+            "machine_id":         machine_id,
+            "dmi_uuid":           dmi_uuid,
         }
 
     def generate_device_id(self, fingerprint: Dict[str, Any]) -> str:

@@ -319,15 +319,65 @@ class MacOSHardwareCollector(HardwareCollector):
 
     def collect_fingerprint(self) -> Dict[str, Any]:
         """
-        Return a dict of stable hardware identifiers.
-        The caller passes this to generate_device_id().
+        Collect a full set of hardware identifiers for the GUI DATA INFO panel
+        and for device fingerprinting.
+
+        All fields use the same key names as the Windows collect_fingerprint()
+        so that the GUI _build_data_info_content() can display them with the
+        same field-lookup code on every OS.  macOS-specific extras are also
+        included for the GUI's darwin branch.
         """
+        import socket as _socket
+
         identity, source = get_primary_identity()
+        arch  = _get_arch()
+        model = _get_model_identifier()
+
+        # IOKit serial — also useful to display in GUI
+        try:
+            from macos.hardware.fingerprint import (
+                get_ioreg_uuid, get_ioreg_serial,
+            )
+            hw_serial       = get_ioreg_serial() or "UNAVAILABLE"
+            ioplatform_uuid = get_ioreg_uuid() or identity
+        except Exception:
+            hw_serial       = identity if source == "ioreg_serial" else "UNAVAILABLE"
+            ioplatform_uuid = identity if source == "ioreg_uuid"   else "UNAVAILABLE"
+
+        os_info = _get_os_info()
+        macs    = _get_mac_addresses()
+        mac_addr = macs[0] if macs else ""
+        dev_id  = generate_device_id()
+        cpu_brand = _get_cpu_brand()
+
+        hostname = ""
+        try:
+            hostname = _socket.gethostname()
+        except Exception:
+            pass
+
         return {
-            "identity": identity,
-            "source": source,
-            "arch": _get_arch(),
-            "model": _get_model_identifier(),
+            # Keys matching Windows collect_fingerprint() — used by GUI
+            "bios_uuid":          ioplatform_uuid,    # IOKit UUID (macOS analog of BIOS UUID)
+            "bios_serial":        hw_serial,            # IOPlatformSerialNumber
+            "motherboard_serial": hw_serial,            # Same serial (no separate mb serial on Mac)
+            "motherboard_product": model,               # e.g. "MacBookPro18,3"
+            "cpu_id":             cpu_brand,            # CPU/chip brand string
+            "machine_guid":       ioplatform_uuid,     # Same as bios_uuid (no separate GUID)
+            "mac_address":        mac_addr,
+            "mac_addresses":      macs,
+            "disk_serial":        "UNAVAILABLE",       # Not exposed without entitlements
+            "os_serial":          os_info.get("version", ""),
+            "device_id":          dev_id,
+            "hostname":           hostname,
+            # macOS-specific extras (read by GUI darwin branch)
+            "ioplatform_uuid":    ioplatform_uuid,
+            "hardware_serial":    hw_serial,
+            "model_identifier":   model,
+            "cpu_arch":           arch,
+            "os_version":         os_info.get("version", ""),
+            "identity":           identity,
+            "source":             source,
         }
 
     def generate_device_id(self, fingerprint: Dict[str, Any]) -> str:
