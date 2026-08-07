@@ -99,7 +99,12 @@ def _build_plist(
       StandardOutPath  — stdout log file (if provided)
       StandardErrorPath — stderr log file (if provided)
     """
-    program_arguments = [exe_path]
+    import sys
+    if exe_path.endswith('.py'):
+        program_arguments = [sys.executable, exe_path]
+    else:
+        program_arguments = [exe_path]
+
     if daemon_args:
         # Validate all args are strings
         for arg in daemon_args:

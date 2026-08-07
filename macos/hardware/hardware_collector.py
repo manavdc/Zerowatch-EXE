@@ -133,6 +133,75 @@ def _get_ram_bytes() -> int:
         return 0
 
 
+def _get_ram_modules() -> List[Dict[str, Any]]:
+    """
+    Get detailed RAM modules list via system_profiler SPMemoryDataType -json.
+    Falls back to synthesizing a single module from hw.memsize if system_profiler fails
+    or if running on Apple Silicon (which uses unified memory and lacks individual DIMM slots).
+    """
+    sp = shutil.which("system_profiler") or "/usr/sbin/system_profiler"
+    raw = _run([sp, "SPMemoryDataType", "-json"], timeout=20)
+    
+    modules = []
+    
+    def _parse_size_to_bytes(size_str: str) -> int:
+        parts = str(size_str).strip().split()
+        if not parts:
+            return 0
+        try:
+            val = float(parts[0])
+            unit = parts[1].upper() if len(parts) > 1 else "GB"
+            if "GB" in unit:
+                return int(val * 1024 * 1024 * 1024)
+            elif "MB" in unit:
+                return int(val * 1024 * 1024)
+            elif "KB" in unit:
+                return int(val * 1024)
+            return int(val)
+        except (ValueError, IndexError):
+            return 0
+
+    if raw:
+        try:
+            data = json.loads(raw)
+            memory_data = data.get("SPMemoryDataType", [])
+            if memory_data:
+                for mem_dict in memory_data:
+                    items = mem_dict.get("_items")
+                    if isinstance(items, list):
+                        for item in items:
+                            size = item.get("dimm_size") or ""
+                            if not size or "empty" in str(size).lower():
+                                continue
+                            
+                            speed = item.get("dimm_speed") or "Unknown"
+                            speed_mhz = speed.replace(" MHz", "").strip() if " MHz" in speed else speed
+                            
+                            modules.append({
+                                "manufacturer": item.get("dimm_manufacturer") or "ANONYMIZED",
+                                "part_number":  item.get("dimm_part_number") or "ANONYMIZED",
+                                "serial":       item.get("dimm_serial_number") or "ANONYMIZED",
+                                "speed_mhz":    speed_mhz,
+                                "capacity_bytes": str(_parse_size_to_bytes(size))
+                            })
+        except Exception as exc:
+            logger.debug("system_profiler SPMemoryDataType parse failed: %s", exc)
+
+    # Fallback / Apple Silicon check: If no modules were collected, synthesize a single module
+    if not modules:
+        ram_bytes = _get_ram_bytes()
+        if ram_bytes > 0:
+            modules.append({
+                "manufacturer": "Apple Inc.",
+                "part_number":  "Unified Memory" if _get_arch() == "arm64" else "System RAM",
+                "serial":       "ANONYMIZED",
+                "speed_mhz":    "Unknown",
+                "capacity_bytes": str(ram_bytes)
+            })
+            
+    return modules
+
+
 # ── Architecture ──────────────────────────────────────────────────────────────
 
 def _get_arch() -> str:
@@ -312,6 +381,7 @@ class MacOSHardwareCollector(HardwareCollector):
         os_info = _get_os_info()
         gpus = _get_gpus()  # Only expensive call
         macs = _get_mac_addresses()
+        ram_modules = _get_ram_modules()
 
         return {
             "cpu": cpu_brand,
@@ -326,8 +396,8 @@ class MacOSHardwareCollector(HardwareCollector):
             "ram": {
                 "total_kb": ram_kb,
                 "total_gb": ram_gb,
-                "modules": [],               # Module-level detail needs system_profiler SPMemoryDataType
-                "module_count": 0,
+                "modules": ram_modules,
+                "module_count": len(ram_modules),
             },
             "gpu": gpus[0] if gpus else "Unknown",
             "gpus": [{"name": g} for g in gpus],

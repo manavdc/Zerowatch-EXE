@@ -3164,6 +3164,9 @@ def protect_agent_files():
     Protects the agent's executable, data files and directory from deletion.
     Uses NTFS ACLs (icacls) to restrict modification to SYSTEM only.
     """
+    if sys.platform != "win32":
+        return
+
     base_dir = get_base_dir()
     exe_path = get_exe_path()
 
@@ -7380,6 +7383,10 @@ def main():
         if sys.platform.startswith("linux"):
             from sentinel_agent_linux import LinuxSentinelAgent
             agent = LinuxSentinelAgent()
+            agent.run()
+        elif sys.platform == "darwin":
+            from sentinel_agent_macos import MacOSSentinelAgent
+            agent = MacOSSentinelAgent()
             agent.run()
         else:
             main_agent()
