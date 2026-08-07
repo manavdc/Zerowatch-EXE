@@ -246,6 +246,7 @@ except (ImportError, AttributeError):
 
 KILL_PASSWORD = "Pass@123" # Fallback offline password
 MUTEX_NAME = "Global\\SentinelAgent_ZeroWatch_4F9A2E1B"
+DAEMON_MUTEX_NAME = "Global\\SentinelAgent_Daemon_4F9A2E1B"
 WATCHDOG_MUTEX_NAME = "Global\\SentinelAgent_Watchdog_4F9A2E1B"
 PROMPT_MUTEX_NAME = "Global\\SentinelAgent_Prompt_4F9A2E1B"  # Prevents multiple password prompts
 HEARTBEAT_INTERVAL = 120  # Reduced from 60 to lower CPU
@@ -2159,6 +2160,33 @@ def enforce_single_instance():
     return mutex  # MUST keep reference alive — releasing frees the mutex
 
 
+def enforce_single_daemon_instance():
+    """
+    Claims the daemon-specific named Windows kernel mutex or POSIX lock file.
+    If a background daemon is already running, this process exits silently.
+    """
+    if sys.platform != "win32":
+        import fcntl
+        lock_path = os.path.join(get_base_dir(), "state", "daemon.lock")
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        try:
+            f = open(lock_path, "w")
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            f.write(str(os.getpid()))
+            f.flush()
+            return f
+        except (BlockingIOError, PermissionError):
+            logging.info("Another daemon instance is already running. Exiting silently.")
+            sys.exit(0)
+
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, True, DAEMON_MUTEX_NAME)
+    last_err = ctypes.windll.kernel32.GetLastError()
+    if last_err == 183:  # ERROR_ALREADY_EXISTS
+        logging.info("Another daemon instance is already running. Exiting silently.")
+        sys.exit(0)
+    return mutex
+
+
 # ============================================================================
 # MODULE 2: FINGERPRINT — Device Identity & UID Generation
 # ============================================================================
@@ -3914,7 +3942,7 @@ def _is_daemon_running():
                 pass
         return False
 
-    probe = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    probe = ctypes.windll.kernel32.CreateMutexW(None, True, DAEMON_MUTEX_NAME)
     err = ctypes.windll.kernel32.GetLastError()
     if probe:
         ctypes.windll.kernel32.CloseHandle(probe)
@@ -4913,7 +4941,7 @@ def main_agent():
     The core agent loop. Runs silently in the background.
     """
     # --- Bootstrap ---
-    mutex = enforce_single_instance()
+    mutex = enforce_single_daemon_instance()
     # Console hiding moved down so user can enroll on first run
     
     logging.info("=" * 50)
@@ -7023,25 +7051,6 @@ class UnifiedSentinelGUI(tk.Tk):
             self.current_frame.destroy()
         self.current_frame = new_frame
         self.current_frame.pack(fill=tk.BOTH, expand=True)
-
-def _is_daemon_running():
-    if sys.platform != "win32":
-        lock_path = os.path.join(get_base_dir(), "state", "daemon.lock")
-        if os.path.exists(lock_path):
-            try:
-                with open(lock_path, "r") as f:
-                    pid = int(f.read().strip())
-                os.kill(pid, 0)
-                return True
-            except (OSError, ValueError):
-                pass
-        return False
-
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
-    err = ctypes.windll.kernel32.GetLastError()
-    if mutex:
-        ctypes.windll.kernel32.CloseHandle(mutex)
-    return err == 183 # ERROR_ALREADY_EXISTS
 
 def _spawn_daemon_process():
     exe_path = get_exe_path()
