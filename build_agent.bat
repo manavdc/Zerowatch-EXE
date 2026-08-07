@@ -15,6 +15,8 @@ set "CUSTOM_SERVER_URL="
 set "LAST_ERROR_MSG="
 set "ICON_PATH=resources\favicon.ico"
 set "ICON_FLAG="
+set "CLEAN_BUILD=0"
+set "SKIP_PIP=0"
 
 if exist "%ICON_PATH%" (
     set "ICON_FLAG=--windows-icon-from-ico=%ICON_PATH%"
@@ -52,6 +54,21 @@ if /I "%~1"=="/dev" (
     shift
     goto parse_args
 )
+if /I "%~1"=="/clean" (
+    set "CLEAN_BUILD=1"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="/fast" (
+    set "SKIP_PIP=1"
+    shift
+    goto parse_args
+)
+if /I "%~1"=="/nopip" (
+    set "SKIP_PIP=1"
+    shift
+    goto parse_args
+)
 if /I "%~1"=="/server" (
     if "%~2"=="" (
         echo [ERROR] /server requires a URL argument.
@@ -79,6 +96,11 @@ if /I "%BUILD_STYLE%"=="onefile" (
     echo [Profile] Onefile - single EXE deliverable
 ) else (
     echo [Profile] Standalone - folder output with tk-inter plugin
+)
+if "%CLEAN_BUILD%"=="1" (
+    echo [Cache] Clean build requested - cache will be purged
+) else (
+    echo [Cache] Incremental build enabled (fast recompilation)
 )
 echo.
 
@@ -121,15 +143,19 @@ if /I not "%BASE_API_URL:~-4%"=="/api" set "BASE_API_URL=%BASE_API_URL%/api"
 echo [Server] EXE will be pinned to: %BASE_API_URL%
 echo.
 
-echo [1/5] Installing build dependencies...
-py -3.11 -m pip install -r requirements-windows.txt
-if errorlevel 1 (
-    echo [WARN] requirements-windows.txt install had issues, installing core deps directly...
-    py -3.11 -m pip install nuitka wmi requests zstandard "python-socketio[client]" cryptography
-)
-if errorlevel 1 (
-    set "LAST_ERROR_MSG=Failed to install build dependencies."
-    goto build_failed
+if "%SKIP_PIP%"=="1" (
+    echo [1/5] Skipping dependency check (/fast enabled)...
+) else (
+    echo [1/5] Checking build dependencies...
+    py -3.11 -m pip install --disable-pip-version-check --quiet -r requirements-windows.txt
+    if errorlevel 1 (
+        echo [WARN] requirements-windows.txt install had issues, installing core deps directly...
+        py -3.11 -m pip install --disable-pip-version-check nuitka wmi requests zstandard "python-socketio[client]" cryptography
+    )
+    if errorlevel 1 (
+        set "LAST_ERROR_MSG=Failed to install build dependencies."
+        goto build_failed
+    )
 )
 echo.
 
@@ -163,26 +189,26 @@ if exist "build\%OUTPUT_NAME%" (
         goto build_failed
     )
 )
-rem Clean corrupted build directories to prevent Nuitka crashes
-if exist "build\sentinel_agent.build" rd /s /q "build\sentinel_agent.build"
-if exist "build\sentinel_agent.onefile-build" rd /s /q "build\sentinel_agent.onefile-build"
+if "%CLEAN_BUILD%"=="1" (
+    echo [CLEAN] Purging previous build directory...
+    if exist "build\sentinel_agent.build" rd /s /q "build\sentinel_agent.build"
+    if exist "build\sentinel_agent.onefile-build" rd /s /q "build\sentinel_agent.onefile-build"
+)
 echo.
 
 echo [4/5] Compiling sentinel_agent.py
-echo       This may take several minutes (Python -> C -> binary)
+echo       This will utilize all available CPU cores (%NUMBER_OF_PROCESSORS% threads)
 echo.
 set "PACKAGE_FLAGS=--include-package=common --include-package=scanner --include-package=platforms --include-package=windows --include-package=linux"
 set "DATA_FLAGS=--include-data-dir=resources=resources"
-set "BASE_FLAGS=--assume-yes-for-downloads --zig --windows-console-mode=disable --output-dir=build --output-filename=%OUTPUT_NAME% %ICON_FLAG% --include-data-file=%ICON_PATH%=favicon.ico %PACKAGE_FLAGS% %DATA_FLAGS%"
+set "SPEED_FLAGS=--lto=no --jobs=%NUMBER_OF_PROCESSORS%"
+set "BASE_FLAGS=--assume-yes-for-downloads --zig --windows-console-mode=disable --output-dir=build --output-filename=%OUTPUT_NAME% %ICON_FLAG% --include-data-file=%ICON_PATH%=favicon.ico %PACKAGE_FLAGS% %DATA_FLAGS% %SPEED_FLAGS%"
 
 if /I "%BUILD_STYLE%"=="onefile" (
     for /f "delims=" %%i in ('py -3.11 -c "import sys; print(sys.prefix)"') do set "PYTHON_PREFIX=%%i"
     set "TCL_ROOT=!PYTHON_PREFIX!\tcl"
-    if not exist "!TCL_ROOT!\tcl8.6\init.tcl" (
-        echo [ERROR] Cannot find Tcl library at !TCL_ROOT!\tcl8.6
-        echo [ERROR] Cannot build - Tcl/Tk not found in Python installation.
-        set "LAST_ERROR_MSG=Tcl library not found."
-        goto build_failed
+    if not exist "!TCL_ROOT!\tcl8.6\init.tcl" if not exist "!TCL_ROOT!\init.tcl" (
+        echo [WARN] Tcl library not found at standard path !TCL_ROOT!, relying on Nuitka tk-inter plugin auto-detection...
     )
     set "STYLE_FLAGS=--onefile --onefile-no-compression --enable-plugin=tk-inter --onefile-tempdir-spec={CACHE_DIR}/ZeroWatch/extracted"
 ) else (
@@ -193,9 +219,11 @@ call :run_compile
 set "BUILD_EXIT=%ERRORLEVEL%"
 if not "%BUILD_EXIT%"=="0" (
     echo [WARN] Zig build failed with exit code %BUILD_EXIT%. Retrying without --zig...
-    if exist "build\sentinel_agent.build" rd /s /q "build\sentinel_agent.build"
-    if exist "build\sentinel_agent.onefile-build" rd /s /q "build\sentinel_agent.onefile-build"
-    set "BASE_FLAGS=--assume-yes-for-downloads --windows-console-mode=disable --output-dir=build --output-filename=%OUTPUT_NAME% %ICON_FLAG% --include-data-file=%ICON_PATH%=favicon.ico %PACKAGE_FLAGS% %DATA_FLAGS%"
+    if "%CLEAN_BUILD%"=="1" (
+        if exist "build\sentinel_agent.build" rd /s /q "build\sentinel_agent.build"
+        if exist "build\sentinel_agent.onefile-build" rd /s /q "build\sentinel_agent.onefile-build"
+    )
+    set "BASE_FLAGS=--assume-yes-for-downloads --windows-console-mode=disable --output-dir=build --output-filename=%OUTPUT_NAME% %ICON_FLAG% --include-data-file=%ICON_PATH%=favicon.ico %PACKAGE_FLAGS% %DATA_FLAGS% %SPEED_FLAGS%"
     call :run_compile
     set "BUILD_EXIT=%ERRORLEVEL%"
 )
@@ -254,9 +282,12 @@ if /I "%BUILD_STYLE%"=="onefile" (
 )
 echo.
 
-echo [CLEANUP] Removing build artifacts...
-if exist "build\sentinel_agent.build" rd /s /q "build\sentinel_agent.build"
-if exist "build\sentinel_agent.onefile-build" rd /s /q "build\sentinel_agent.onefile-build"
+echo [CLEANUP] Cleaning temporary build artifacts...
+rem Retain compilation cache for fast incremental rebuilds unless /clean was specified
+if "%CLEAN_BUILD%"=="1" (
+    if exist "build\sentinel_agent.build" rd /s /q "build\sentinel_agent.build"
+    if exist "build\sentinel_agent.onefile-build" rd /s /q "build\sentinel_agent.onefile-build"
+)
 if /I "%BUILD_STYLE%"=="onefile" if exist "build\sentinel_agent.dist" rd /s /q "build\sentinel_agent.dist" >nul 2>nul
 if exist "__pycache__" rd /s /q "__pycache__"
 echo       Artifacts cleaned.
@@ -275,3 +306,4 @@ echo.
 echo Build did not finish. Review the error messages above.
 pause
 exit /b %BUILD_EXIT%
+
