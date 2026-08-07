@@ -59,10 +59,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Detect OS platform
+OS_NAME="$(uname -s)"
+AGENT_PLATFORM="Linux"
+if [[ "${OS_NAME}" == "Darwin" ]]; then
+    AGENT_PLATFORM="macOS"
+fi
+
 # ── Interactive server selection if not preset ────────────────────────────────
 if [[ -z "${SERVER_PRESET}" ]]; then
     echo "════════════════════════════════════════════════════════════"
-    echo " ZeroWatch Linux Agent — Select Target Server"
+    echo " ZeroWatch ${AGENT_PLATFORM} Agent — Select Target Server"
     echo "════════════════════════════════════════════════════════════"
     echo ""
     echo "  [1] Production  - https://zerowatch.deepcytes.io"
@@ -101,7 +108,7 @@ else
 fi
 
 echo "════════════════════════════════════════════════════════════"
-echo " ZeroWatch Linux Agent — Launcher"
+echo " ZeroWatch ${AGENT_PLATFORM} Agent — Launcher"
 echo " Server: ${BASE_API_URL}"
 echo " Preset: ${SERVER_PRESET}"
 echo " Daemon: ${DAEMON_MODE}"
@@ -135,7 +142,12 @@ echo ""
 
 # ── Install dependencies ──────────────────────────────────────────────────────
 echo "[1/3] Installing Python dependencies..."
-REQS_FILE="${SCRIPT_DIR}/requirements-linux.txt"
+if [[ "${AGENT_PLATFORM}" == "macOS" ]]; then
+    REQS_FILE="${SCRIPT_DIR}/requirements-common.txt"
+else
+    REQS_FILE="${SCRIPT_DIR}/requirements-linux.txt"
+fi
+
 if [[ ! -f "${REQS_FILE}" ]]; then
     REQS_FILE="${SCRIPT_DIR}/requirements.txt"
 fi
@@ -161,7 +173,12 @@ echo "      Server config written to: agent_build_config.py"
 echo ""
 
 # ── Validate certificate pins (mirrors build_agent.bat step 2.5/5) ────────────
-echo "[2.5/3] Pin validation skipped on Linux (avoiding Windows-specific winreg import)."
+echo "[2.5/3] Running certificate pin validation..."
+if [[ -f "${SCRIPT_DIR}/verify_pins.py" ]]; then
+    "${PYTHON}" "${SCRIPT_DIR}/verify_pins.py" "${SERVER_PRESET}"
+else
+    echo "[WARN] verify_pins.py not found — skipping pin check"
+fi
 echo ""
 
 # ── Launch agent ──────────────────────────────────────────────────────────────
@@ -172,7 +189,7 @@ if [[ ! -f "${AGENT_SCRIPT}" ]]; then
     exit 1
 fi
 
-echo "[3/3] Launching ZeroWatch Linux Agent..."
+echo "[3/3] Launching ZeroWatch ${AGENT_PLATFORM} Agent..."
 echo "      Press Ctrl+C to stop."
 echo ""
 
