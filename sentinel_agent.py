@@ -4638,8 +4638,9 @@ def _run_cli_update(zw_client, version_str):
         _bot()
         time.sleep(3)
 
-        # On Windows: os_replacer already spawned --post-update-check + the swap
-        # happened inline. On Linux/macOS: systemctl/launchctl restart was called.
+        # On Windows: binary swapped inline. The new agent will call
+        # startup_bak_cleanup() on next start to remove .bak automatically.
+        # On Linux/macOS: systemctl/launchctl restart was called.
         # Exit the CLI so the process exits cleanly.
         sys.exit(0)
 
