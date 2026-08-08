@@ -171,10 +171,6 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
             logger.critical("[WIN SWAP] Rollback also failed: %s", rb_exc)
         raise SwapError(f"Failed to copy new binary into place: {exc}") from exc
 
-    # Spawn the post-update watchdog BEFORE the old process exits so it can
-    # monitor the new agent's liveness and remove the .bak on success.
-    _spawn_post_update_check(current_exe)
-
     logger.info("[WIN SWAP] Swap complete. Call _relaunch_detached() to restart.")
     return True
 
@@ -214,31 +210,6 @@ def _relaunch_detached(current_exe: str) -> bool:
         return False
 
 
-def _spawn_post_update_check(current_exe: str) -> None:
-    """
-    Spawn detached child: current_exe --post-update-check --parent-pid <PID>
-
-    The child runs PostUpdateWatchdog which monitors liveness for 120 seconds
-    and rolls back if the agent fails to heartbeat.
-    """
-    DETACHED    = 0x00000008
-    NEW_GROUP   = 0x00000200
-
-    cmd = [current_exe, "--post-update-check", "--parent-pid", str(os.getpid())]
-
-    try:
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0  # SW_HIDE
-
-        subprocess.Popen(
-            cmd,
-            creationflags = DETACHED | NEW_GROUP | subprocess.CREATE_NO_WINDOW,
-            startupinfo   = si,
-        )
-        logger.info("[WIN SWAP] Detached post-update watchdog spawned.")
-    except Exception as exc:
-        logger.warning("[WIN SWAP] Failed to spawn post-update check process: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +224,8 @@ def _swap_linux(new_binary: str, current_exe: str, zw_client=None) -> bool:
       3. chmod 755
       4. restorecon (SELinux context, best-effort)
       5. systemctl restart zerowatch-agent.service (or --user fallback)
-      6. Start in-process 120s watchdog thread
+
+    The new agent cleans up .bak on its own startup via startup_bak_cleanup().
     """
     bak_path = current_exe + ".bak"
 
@@ -286,16 +258,8 @@ def _swap_linux(new_binary: str, current_exe: str, zw_client=None) -> bool:
     # 4. Restore SELinux context (best-effort)
     _restorecon_linux(current_exe)
 
-    # 5. Restart service via systemd
-    service_restarted = _systemctl_restart()
-
-    # 6. Launch 120s watchdog thread
-    _start_inprocess_watchdog(
-        bak_path      = bak_path,
-        current_exe   = current_exe,
-        zw_client     = zw_client,
-        restart_fn    = _systemctl_restart,
-    )
+    # 5. Restart service via systemd — the new agent will call startup_bak_cleanup()
+    _systemctl_restart()
 
     return True
 
@@ -360,7 +324,8 @@ def _swap_macos(new_binary: str, current_exe: str, zw_client=None) -> bool:
       3. shutil.copy2 → .bak
       4. os.replace() atomic swap
       5. launchctl kickstart -k system/io.deepcytes.zerowatch.agent
-      6. Start in-process 120s watchdog thread
+
+    The new agent cleans up .bak on its own startup via startup_bak_cleanup().
     """
     bak_path = current_exe + ".bak"
 
@@ -389,16 +354,8 @@ def _swap_macos(new_binary: str, current_exe: str, zw_client=None) -> bool:
             logger.critical("[MACOS SWAP] Rollback failed: %s", rb_exc)
         raise SwapError(f"os.replace failed: {exc}") from exc
 
-    # 5. Kick launchd
+    # 5. Kick launchd — the new agent will call startup_bak_cleanup()
     _launchctl_kickstart()
-
-    # 6. Launch 120s watchdog thread
-    _start_inprocess_watchdog(
-        bak_path    = bak_path,
-        current_exe = current_exe,
-        zw_client   = zw_client,
-        restart_fn  = _launchctl_kickstart,
-    )
 
     return True
 
@@ -471,136 +428,8 @@ def _launchctl_kickstart() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 120-second Out-of-Band Watchdog (self-healing mechanism)
+# Startup: post-update .bak cleanup (called by the newly started agent)
 # ---------------------------------------------------------------------------
-
-def _start_inprocess_watchdog(
-    bak_path:    str,
-    current_exe: str,
-    zw_client,
-    restart_fn:  Callable[[], bool],
-) -> None:
-    """
-    Launch the 120-second self-healing watchdog in a daemon thread.
-
-    The watchdog polls for heartbeat success every _WATCHDOG_POLL_SECS.
-    If the updated agent proves liveness (heartbeat returns a non-error result)
-    within WATCHDOG_TIMEOUT_SECS, the .bak backup is removed.
-    Otherwise the backup is restored and the native service is restarted.
-    """
-    t = threading.Thread(
-        target = _watchdog_thread,
-        kwargs = dict(
-            bak_path    = bak_path,
-            current_exe = current_exe,
-            zw_client   = zw_client,
-            restart_fn  = restart_fn,
-        ),
-        name   = "ota-watchdog",
-        daemon = True,  # Daemon thread: does not block interpreter shutdown
-    )
-    t.start()
-    logger.info(
-        "[WATCHDOG] 120-second out-of-band health monitor started (poll every %ds).",
-        _WATCHDOG_POLL_SECS,
-    )
-
-
-def _watchdog_thread(
-    bak_path:    str,
-    current_exe: str,
-    zw_client,
-    restart_fn:  Callable[[], bool],
-) -> None:
-    """
-    Watchdog body (runs on daemon thread):
-
-    Polls for heartbeat success for up to WATCHDOG_TIMEOUT_SECS (120s).
-    On success: commit the update (remove .bak).
-    On timeout/failure: revert .bak → current_exe, restart service.
-    """
-    deadline = time.monotonic() + WATCHDOG_TIMEOUT_SECS
-    liveness_confirmed = False
-
-    while time.monotonic() < deadline:
-        time.sleep(_WATCHDOG_POLL_SECS)
-
-        if _check_heartbeat(zw_client):
-            liveness_confirmed = True
-            break
-
-    if liveness_confirmed:
-        logger.info(
-            "[WATCHDOG] Updated agent proved liveness within %ds. "
-            "Committing update — removing .bak.",
-            WATCHDOG_TIMEOUT_SECS,
-        )
-        _commit_update(bak_path)
-    else:
-        logger.error(
-            "[WATCHDOG] Updated agent did NOT prove liveness within %ds. "
-            "Initiating automatic rollback.",
-            WATCHDOG_TIMEOUT_SECS,
-        )
-        _rollback(bak_path, current_exe, restart_fn)
-
-
-def _check_heartbeat(zw_client) -> bool:
-    """
-    Check whether the agent can successfully heartbeat to the backend.
-
-    Accepts any non-error return from zw_client.heartbeat() as proof of liveness.
-    Returns True if heartbeat succeeded, False if it failed or client is unavailable.
-    """
-    if zw_client is None:
-        # No client reference — attempt a simple connectivity probe
-        # to localhost instead (the new agent may have restarted the loop)
-        return _ping_local_agent()
-
-    try:
-        result = zw_client.heartbeat()
-        # ZeroWatchClient.heartbeat() returns the server status string or raises
-        if result is not None and result != "error":
-            logger.debug("[WATCHDOG] Heartbeat OK (status=%s).", result)
-            return True
-    except Exception as exc:
-        logger.debug("[WATCHDOG] Heartbeat check raised: %s", exc)
-    return False
-
-
-def _ping_local_agent() -> bool:
-    """
-    Fallback liveness check when no ZeroWatchClient is available.
-    Attempts to connect to the agent's named mutex (Windows) or lock file (POSIX).
-    """
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            MUTEX_NAME = "Global\\SentinelAgent_ZeroWatch_4F9A2E1B"
-            h = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
-            err = ctypes.windll.kernel32.GetLastError()
-            if h:
-                ctypes.windll.kernel32.CloseHandle(h)
-            return err == 183  # ERROR_ALREADY_EXISTS → mutex held by running agent
-        except Exception:
-            return False
-    else:
-        # POSIX: check daemon.lock for a live PID
-        from common.updater import _PLATFORM_KEY  # just to avoid circular import
-        lock_candidates = [
-            "/var/lib/zerowatch/state/daemon.lock",
-            os.path.expanduser("~/.local/share/zerowatch/state/daemon.lock"),
-        ]
-        for lock_path in lock_candidates:
-            if os.path.exists(lock_path):
-                try:
-                    with open(lock_path, "r") as fh:
-                        pid = int(fh.read().strip())
-                    os.kill(pid, 0)  # signal 0: probe, raises OSError if dead
-                    return True
-                except (OSError, ValueError):
-                    continue
-        return False
 
 
 def _commit_update(bak_path: str) -> None:
@@ -608,9 +437,57 @@ def _commit_update(bak_path: str) -> None:
     try:
         if os.path.exists(bak_path):
             os.remove(bak_path)
-            logger.info("[WATCHDOG] .bak removed: %s — update committed.", bak_path)
+            logger.info("[OTA] .bak removed: %s — update committed.", bak_path)
     except OSError as exc:
-        logger.warning("[WATCHDOG] Failed to remove .bak: %s", exc)
+        logger.warning("[OTA] Failed to remove .bak: %s", exc)
+
+
+def startup_bak_cleanup(current_exe: str) -> None:
+    """
+    Called by the NEWLY started agent on startup to clean up any leftover .bak
+    file from a previous successful OTA update swap.
+
+    Design rationale
+    ----------------
+    The previous "--post-update-check" subprocess architecture was fundamentally
+    broken for Nuitka onefile binaries: the watchdog subprocess tried to
+    self-extract into the same temp directory that the main agent already had
+    open and locked (e.g. _asyncio.pyd), causing:
+      • Visible terminal/console flashes on every update
+      • Ghost background SentinelAgent processes that never exited
+      • .bak files that were never removed
+
+    This function runs entirely INSIDE the new agent's own process:
+      1. Check if <current_exe>.bak exists (signals a pending update commit)
+      2. Start a daemon thread that waits 30 seconds (startup stability window)
+      3. If the agent is still running after 30 s → remove .bak safely
+
+    No subprocess spawning. No extraction conflicts. No ghost processes.
+    If the agent crashes within 30 s, the daemon thread dies with the process
+    and .bak is preserved for manual recovery.
+
+    Args:
+        current_exe: Absolute path to the running executable (from get_exe_path()).
+    """
+    bak_path = current_exe + ".bak"
+    if not os.path.exists(bak_path):
+        return  # Normal startup — nothing to clean up
+
+    logger.info(
+        "[OTA] Post-update .bak detected: %s — scheduling cleanup after 30s stability window.",
+        bak_path,
+    )
+
+    def _cleanup() -> None:
+        # 30-second grace period confirms the agent started successfully.
+        # If the process crashes before this completes, the daemon thread is
+        # killed automatically and .bak remains for manual recovery.
+        time.sleep(30)
+        _commit_update(bak_path)
+        logger.info("[OTA] Post-update cleanup complete.")
+
+    t = threading.Thread(target=_cleanup, name="post-update-cleanup", daemon=True)
+    t.start()
 
 
 def _rollback(
@@ -652,134 +529,7 @@ def _rollback(
         logger.critical("[WATCHDOG] Rollback OSError: %s — manual recovery required.", exc)
 
 
-# ---------------------------------------------------------------------------
-# PostUpdateWatchdog — called from main() via --post-update-check flag
-# ---------------------------------------------------------------------------
+# NOTE: PostUpdateWatchdog and the subprocess-based watchdog architecture
+# have been permanently removed. .bak cleanup is now handled by
+# startup_bak_cleanup() which runs inside the NEW agent's own process.
 
-class PostUpdateWatchdog:
-    """
-    Invoked when the newly updated binary is started with --post-update-check.
-
-    This is the out-of-band watchdog that was spawned by the OLD binary's
-    _swap_windows() call. It runs independently from the new binary's process,
-    verifying that the new binary is healthy before committing.
-
-    Workflow:
-      1. Determine paths (bak, exe)
-      2. Wait for the new agent daemon to initialize (15s grace period)
-      3. Poll heartbeat / mutex for up to WATCHDOG_TIMEOUT_SECS (120s)
-      4. On success: remove .bak
-      5. On failure: restore .bak and restart via sc.exe / systemctl / launchctl
-    """
-
-    def run(self) -> None:
-        """Entry point — called from main() when --post-update-check is in sys.argv."""
-        current_exe = self._resolve_current_exe()
-        bak_path    = current_exe + ".bak"
-
-        if not os.path.exists(bak_path):
-            logger.info(
-                "[POST-UPDATE WATCHDOG] No .bak file found at %s — "
-                "assuming update was already committed or not applicable.",
-                bak_path,
-            )
-            return
-
-        logger.info(
-            "[POST-UPDATE WATCHDOG] Monitoring new agent for %ds liveness...",
-            WATCHDOG_TIMEOUT_SECS,
-        )
-
-        # Grace period: let the new agent fully initialize and acquire its mutex
-        # before we start polling. New agent needs ~5-10s to boot the Tkinter GUI.
-        time.sleep(20)
-
-        restart_fn = self._get_platform_restart_fn()
-        _watchdog_thread(
-            bak_path    = bak_path,
-            current_exe = current_exe,
-            zw_client   = None,    # No client reference in post-update-check mode
-            restart_fn  = restart_fn,
-        )
-
-    @staticmethod
-    def _resolve_current_exe() -> str:
-        """Resolve the path of the current executable."""
-        if "SENTINEL_EXE_PATH" in os.environ:
-            return os.environ["SENTINEL_EXE_PATH"]
-
-        # 1. Try Nuitka's original argv0 first (most robust for onefile)
-        try:
-            import sys
-            main_mod = sys.modules.get('__main__')
-            compiled_obj = getattr(main_mod, '__compiled__', None)
-            if compiled_obj:
-                orig = getattr(compiled_obj, "original_argv0", None)
-                if orig:
-                    return os.path.abspath(orig)
-        except Exception:
-            pass
-
-        # 2. Fallback to sys.argv[0] if it looks like an executable (and is NOT the temp extraction folder)
-        if sys.argv[0]:
-            argv0_abs = os.path.abspath(sys.argv[0])
-            is_temp = "ZeroWatch/extracted" in argv0_abs.replace("\\", "/") or "ZeroWatch\\extracted" in argv0_abs
-            if (argv0_abs.endswith('.exe') or not argv0_abs.endswith('.py')) and not is_temp:
-                return argv0_abs
-
-        # 3. Fallback to sys.executable if compiled/frozen
-        if getattr(sys, "frozen", False) or "__compiled__" in dir(sys.modules.get("__main__", None)):
-            return os.path.abspath(sys.executable)
-
-        # 4. Ultimate fallback to sys.argv[0]
-        return os.path.abspath(sys.argv[0])
-
-    @staticmethod
-    def _get_platform_restart_fn() -> Callable[[], bool]:
-        """Return the appropriate service restart function for the current platform.
-
-        On Windows desktop mode (no registered service), rollback is not performed
-        automatically — the user must relaunch manually. This avoids false rollbacks
-        when the agent is running as a standalone GUI app rather than a service.
-        """
-        if sys.platform == "win32":
-            def _win_restart() -> bool:
-                # First, check if the agent is registered as a Windows service
-                try:
-                    result = subprocess.run(
-                        ["sc", "query", _WIN_SERVICE_NAME],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                    service_exists = result.returncode == 0
-                except Exception:
-                    service_exists = False
-
-                if not service_exists:
-                    # Desktop mode — do NOT rollback automatically; just log.
-                    logger.warning(
-                        "[POST-UPDATE WATCHDOG] New agent did not prove liveness but no "
-                        "Windows service is registered. Skipping rollback in desktop mode. "
-                        "Please relaunch SentinelAgent manually if needed."
-                    )
-                    return False
-
-                # Service mode — restart via sc.exe
-                try:
-                    subprocess.run(
-                        ["sc", "stop", _WIN_SERVICE_NAME],
-                        capture_output=True, text=True, timeout=15,
-                    )
-                    time.sleep(3)
-                    result = subprocess.run(
-                        ["sc", "start", _WIN_SERVICE_NAME],
-                        capture_output=True, text=True, timeout=15,
-                    )
-                    return result.returncode == 0
-                except Exception as exc:
-                    logger.warning("[POST-UPDATE WATCHDOG] sc.exe restart failed: %s", exc)
-                    return False
-            return _win_restart
-        elif sys.platform == "darwin":
-            return _launchctl_kickstart
-        else:
-            return _systemctl_restart

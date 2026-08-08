@@ -70,9 +70,36 @@ except ImportError:
 GITHUB_REPO = "manavdc/Zerowatch-EXE"
 
 # GitHub Releases CDN URLs (no API rate-limit risk — static asset downloads)
-_RELEASES_BASE = f"https://github.com/{GITHUB_REPO}/releases/latest/download"
-MANIFEST_URL   = f"{_RELEASES_BASE}/release-manifest.json"
+_RELEASES_BASE   = f"https://github.com/{GITHUB_REPO}/releases/latest/download"
+MANIFEST_URL     = f"{_RELEASES_BASE}/release-manifest.json"
 MANIFEST_SIG_URL = f"{_RELEASES_BASE}/release-manifest.json.sig"
+
+# ---------------------------------------------------------------------------
+# Dev mode: localhost testing override
+# ---------------------------------------------------------------------------
+# When the binary is built with /dev (localhost:3001), the updater uses the
+# local backend as the manifest/binary source and bypasses Ed25519 verification.
+# This allows full OTA flow testing without a GitHub release.
+_DEV_MODE: bool = False
+_DEV_BASE_URL: str = ""
+
+try:
+    from agent_build_config import FORCED_BASE_API_URL as _BUILD_API_URL  # type: ignore
+    _api = str(_BUILD_API_URL).rstrip("/")
+    if "localhost" in _api or "127.0.0.1" in _api:
+        _DEV_MODE    = True
+        _DEV_BASE_URL = _api  # e.g. "http://localhost:3001/api"
+        # Override manifest URLs to point at local backend
+        MANIFEST_URL     = f"{_DEV_BASE_URL}/agent/update/manifest"
+        MANIFEST_SIG_URL = f"{_DEV_BASE_URL}/agent/update/manifest.sig"
+        import logging as _log
+        _log.getLogger("ota.updater").info(
+            "[OTA] DEV MODE: Using local backend manifest at %s", MANIFEST_URL
+        )
+except (ImportError, AttributeError):
+    pass  # Production build — use GitHub CDN
+
+# ---------------------------------------------------------------------------
 
 # TUF-inspired Timestamp: refuse to trust manifests older than this
 MANIFEST_MAX_AGE_DAYS: int = 3
@@ -95,6 +122,7 @@ _PLATFORM_KEY: dict[str, str] = {
 }
 
 logger = logging.getLogger("ota.updater")
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -175,12 +203,17 @@ class _TUFLayers:
         """
         [ROOT LAYER] Verify the Ed25519 detached signature over the raw manifest bytes.
 
-        The public key is embedded at build-time (OTA_ED25519_PUBLIC_KEY_B64).
-        Any signature failure immediately aborts — zero trust until this passes.
-
-        Raises:
-            ManifestVerificationError: if the signature is invalid.
+        In DEV MODE (localhost build), the signature is the sentinel string b'DEV_BYPASS'
+        and verification is skipped. This is safe because dev builds never leave localhost.
         """
+        # Dev mode bypass: local backend sends b'DEV_BYPASS' instead of a real sig
+        if _DEV_MODE and sig_bytes == b"DEV_BYPASS":
+            logger.warning(
+                "[ROOT] DEV MODE: Skipping Ed25519 verification (localhost build). "
+                "This bypass is NOT present in production builds."
+            )
+            return
+
         try:
             from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
             from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
@@ -204,14 +237,13 @@ class _TUFLayers:
     def verify_timestamp(manifest: dict) -> None:
         """
         [TIMESTAMP LAYER] Guard against freeze attacks.
-
-        Verifies that the manifest's 'released_at' field is within
-        MANIFEST_MAX_AGE_DAYS (3 days). An expired manifest fails safe:
-        the agent refuses to apply updates from stale metadata.
-
-        Raises:
-            TimestampExpiredError: if the manifest is older than allowed.
+        In DEV MODE, timestamp expiry is skipped (local test manifests are always fresh).
         """
+        # Dev mode: skip timestamp validation for local test manifests
+        if _DEV_MODE:
+            logger.debug("[TIMESTAMP] DEV MODE: Skipping timestamp expiry check.")
+            return
+
         released_at_str = manifest.get("released_at", "")
         if not released_at_str:
             raise TimestampExpiredError(
@@ -629,7 +661,11 @@ class UpdateChecker:
             )
 
         filename = entry["filename"]
-        asset_url = f"https://github.com/{GITHUB_REPO}/releases/latest/download/{filename}"
+        if _DEV_MODE:
+            # Dev mode: binary is served from local backend
+            asset_url = f"{_DEV_BASE_URL}/agent/update/binary/{filename}"
+        else:
+            asset_url = f"https://github.com/{GITHUB_REPO}/releases/latest/download/{filename}"
 
         target = TargetInfo(
             filename    = filename,

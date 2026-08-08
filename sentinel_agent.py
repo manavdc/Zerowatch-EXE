@@ -7448,6 +7448,16 @@ def main():
     if "--password-prompt" not in sys.argv and "--reset" not in sys.argv:
         hide_console()
 
+    # 1.5  Post-update .bak cleanup — runs in the NEW agent after an OTA swap.
+    #      startup_bak_cleanup() is a no-op if no .bak exists (normal start).
+    #      It starts a 30-second daemon thread that deletes the .bak once the
+    #      agent proves it has started stably. No subprocess spawning.
+    try:
+        from common.os_replacer import startup_bak_cleanup
+        startup_bak_cleanup(get_exe_path())
+    except Exception:
+        pass  # Never block startup
+
     # 2. Force enrollment (CLI flag)
     if "--enroll" in sys.argv:
         base_dir = get_base_dir()
@@ -7474,16 +7484,6 @@ def main():
     # 3. Visible kill utility
     if "--password-prompt" in sys.argv:
         password_kill_cli()
-        return
-
-    # 4. Post-Update Health Watchdog (spawned by os_replacer after Windows swap)
-    if "--post-update-check" in sys.argv:
-        try:
-            from common.os_replacer import PostUpdateWatchdog
-            logging.info("[OTA] --post-update-check: starting 120s liveness watchdog.")
-            PostUpdateWatchdog().run()
-        except Exception as exc:
-            logging.error("[OTA] PostUpdateWatchdog error: %s", exc)
         return
 
     # 5. Internal anti-kill watchdog
