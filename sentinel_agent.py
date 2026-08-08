@@ -3952,6 +3952,31 @@ def _is_daemon_running():
     return err == 183
 
 
+def _is_windows_mutex_held(mutex_name):
+    "Return True when another process currently owns a named mutex."
+    if sys.platform != "win32":
+        return False
+    probe = ctypes.windll.kernel32.CreateMutexW(None, True, mutex_name)
+    err = ctypes.windll.kernel32.GetLastError()
+    if probe:
+        ctypes.windll.kernel32.CloseHandle(probe)
+    return err == 183
+
+
+def _wait_for_auxiliary_processes(timeout=10.0):
+    "Wait for the old daemon and watchdog to release their mutexes."
+    if sys.platform != "win32":
+        return True
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not (_is_windows_mutex_held(DAEMON_MUTEX_NAME) or
+                _is_windows_mutex_held(WATCHDOG_MUTEX_NAME)):
+            return True
+        time.sleep(0.25)
+    logging.warning("[OTA] Auxiliary process shutdown timed out.")
+    return False
+
+
 def _spawn_daemon_process():
     target_path = get_exe_path()
     if target_path.endswith('.py'):
@@ -4805,6 +4830,12 @@ def watchdog_process(target_exe_path):
 
     while True:
         try:
+            # Check intentional shutdown before checking the main mutex.
+            base_dir = os.path.dirname(target_exe_path)
+            if os.path.exists(_shutdown_signal_path(base_dir)):
+                logging.info("[WATCHDOG] Shutdown signal detected; exiting watchdog.")
+                return
+
             # Check if main agent holds its mutex
             agent_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
             last_err = ctypes.windll.kernel32.GetLastError()
@@ -5200,6 +5231,7 @@ def main_agent():
             # unlink event within 2 seconds and release the SQLite file locks
             # before the GUI's clear_local_state() tries to delete the db files.
             _orchestrator_closed_for_unlink = False
+            shutdown_during_sleep = False
             for _tick in range(15):  # 15 × 2 s = 30 s total base interval
                 time.sleep(2)
                 # Fast-path: check for an unlink signal written by the GUI
@@ -5216,7 +5248,10 @@ def main_agent():
                 # Also respect shutdown signal mid-sleep
                 if consume_shutdown_signal(base_dir):
                     logging.info("[MAIN] Shutdown signal detected mid-sleep. Exiting.")
+                    shutdown_during_sleep = True
                     break
+            if shutdown_during_sleep:
+                break
             if _orchestrator_closed_for_unlink:
                 # Force the outer loop to reach the JWT-missing branch immediately
                 zw_client.jwt = None
@@ -6336,7 +6371,8 @@ class DashboardFrame(tk.Frame):
                 except Exception as _sig_exc:
                     logging.warning("[OTA] Could not write shutdown signal: %s", _sig_exc)
 
-                # 1. Start the new binary as a detached process
+                # 1. Wait for auxiliary processes before scheduling relaunch.
+                _wait_for_auxiliary_processes()
                 success = _relaunch_detached(current_exe)
                 if not success:
                     # Relaunch failed — undo the shutdown signal so the watchdog keeps running
