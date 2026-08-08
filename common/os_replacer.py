@@ -176,45 +176,41 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
 
 
 def _relaunch_detached(current_exe: str) -> bool:
-    """
-    Re-launch the (already-swapped) binary as a fully detached process after a 2-second delay.
-    Uses PowerShell -WindowStyle Hidden to avoid any visible terminal flash.
-    The delay ensures the old instance can exit and release its Windows mutex and DLL
-    file handles before the new instance attempts to start.
-    """
-    DETACHED  = 0x00000008
-    NEW_GROUP = 0x00000200
+    """Schedule a hidden, delayed launch of the newly installed executable."""
+    detached = 0x00000008
+    new_group = 0x00000200
 
     try:
-        # Use PowerShell with hidden window to avoid cmd.exe flash
-        # Start-Sleep 2 gives the old process time to call os._exit(0) and release mutex
+        escaped_exe = current_exe.replace("'", "''")
         ps_script = (
-            f"Start-Sleep -Seconds 2; "
-            f"Start-Process -FilePath '{current_exe}'"
+            f"$target = '{escaped_exe}'; "
+            "Start-Sleep -Seconds 2; "
+            "Start-Process -FilePath $target"
         )
-
+        import base64
+        encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
+        ps_exe = os.path.join(
+            os.environ.get("WINDIR", r"C:\Windows"),
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+        )
+        if not os.path.exists(ps_exe):
+            ps_exe = "powershell.exe"
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0  # SW_HIDE
-
+        si.wShowWindow = 0
         subprocess.Popen(
-            ["powershell", "-WindowStyle", "Hidden", "-NonInteractive", "-Command", ps_script],
-            creationflags = DETACHED | NEW_GROUP | subprocess.CREATE_NO_WINDOW,
-            startupinfo   = si,
-            close_fds     = True,
+            [ps_exe, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+             "-EncodedCommand", encoded],
+            creationflags=detached | new_group | subprocess.CREATE_NO_WINDOW,
+            startupinfo=si,
+            close_fds=True,
         )
-        logger.info("[WIN SWAP] Scheduled hidden PowerShell delayed relaunch for: %s", current_exe)
+        logger.info("[WIN SWAP] Scheduled hidden delayed relaunch for: %s", current_exe)
         return True
     except Exception as exc:
         logger.warning("[WIN SWAP] Failed to re-launch new binary: %s", exc)
         return False
 
-
-
-
-# ---------------------------------------------------------------------------
-# Linux atomic swap (Section 4.2)
-# ---------------------------------------------------------------------------
 
 def _swap_linux(new_binary: str, current_exe: str, zw_client=None) -> bool:
     """

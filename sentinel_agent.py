@@ -3963,17 +3963,6 @@ def _is_windows_mutex_held(mutex_name):
     return err == 183
 
 
-def _is_windows_mutex_held(mutex_name):
-    "Return True when another process currently owns a named mutex."
-    if sys.platform != "win32":
-        return False
-    probe = ctypes.windll.kernel32.CreateMutexW(None, True, mutex_name)
-    err = ctypes.windll.kernel32.GetLastError()
-    if probe:
-        ctypes.windll.kernel32.CloseHandle(probe)
-    return err == 183
-
-
 def _wait_for_auxiliary_processes(timeout=10.0):
     "Wait for the old daemon and watchdog to release their mutexes."
     if sys.platform != "win32":
@@ -5325,9 +5314,11 @@ def main_agent():
                 if wd:
                     ctypes.windll.kernel32.CloseHandle(wd)
 
-                if wd_err != 183:
-                    logging.warning("[MAIN] Watchdog missing! Reviving watchdog...")
+                if wd_err != 183 and _is_windows_mutex_held(MUTEX_NAME):
+                    logging.warning("[MAIN] Watchdog missing while GUI is active; reviving watchdog...")
                     spawn_watchdog()
+                elif wd_err != 183:
+                    logging.debug("[MAIN] GUI is not active; watchdog revival suppressed.")
 
             # Poll asset info every 15 minutes
             if (now - last_asset_poll) >= 15 * 60:
