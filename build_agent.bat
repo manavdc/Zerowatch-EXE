@@ -88,9 +88,9 @@ goto parse_args
 :args_done
 
 if /I "%BUILD_MODE%"=="admin" (
-    echo [Mode] Admin build enabled (UAC prompt required at launch)
+    echo [Mode] Admin build enabled ^(UAC prompt required at launch^)
 ) else (
-    echo [Mode] User build (no forced UAC prompt)
+    echo [Mode] User build ^(no forced UAC prompt^)
 )
 if /I "%BUILD_STYLE%"=="onefile" (
     echo [Profile] Onefile - single EXE deliverable
@@ -100,7 +100,7 @@ if /I "%BUILD_STYLE%"=="onefile" (
 if "%CLEAN_BUILD%"=="1" (
     echo [Cache] Clean build requested - cache will be purged
 ) else (
-    echo [Cache] Incremental build enabled (fast recompilation)
+    echo [Cache] Incremental build enabled ^(fast recompilation^)
 )
 echo.
 
@@ -144,7 +144,7 @@ echo [Server] EXE will be pinned to: %BASE_API_URL%
 echo.
 
 if "%SKIP_PIP%"=="1" (
-    echo [1/5] Skipping dependency check (/fast enabled)...
+    echo [1/5] Skipping dependency check ^(/fast enabled^)...
 ) else (
     echo [1/5] Checking build dependencies...
     py -3.11 -m pip install --disable-pip-version-check --quiet -r requirements-windows.txt

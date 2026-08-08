@@ -60,7 +60,7 @@ jobs:
           # Strip leading "v" — "v1.2.2" → "1.2.2"; keep as-is if no match
           version = re.sub(r"^v", "", ref) if re.match(r"^v\d+\.\d+\.\d+", ref) else "0.0.0"
           with open("agent_build_config.py", "w") as f:
-              f.write(f'FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"\n')
+              f.write(f'FORCED_BASE_API_URL = "http://localhost:3001/api"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
 
       - name: Build with Nuitka (onefile)
@@ -131,7 +131,7 @@ jobs:
           ref = os.environ.get("GITHUB_REF_NAME", "")
           version = re.sub(r"^v", "", ref) if re.match(r"^v\d+\.\d+\.\d+", ref) else "0.0.0"
           with open("agent_build_config.py", "w") as f:
-              f.write(f'FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"\n')
+              f.write(f'FORCED_BASE_API_URL = "http://localhost:3001/api"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
 
       - name: Build with Nuitka (onefile)
@@ -197,7 +197,7 @@ jobs:
           ref = os.environ.get("GITHUB_REF_NAME", "")
           version = re.sub(r"^v", "", ref) if re.match(r"^v\d+\.\d+\.\d+", ref) else "0.0.0"
           with open("agent_build_config.py", "w") as f:
-              f.write(f'FORCED_BASE_API_URL = "https://zerowatch.deepcytes.io/api"\n')
+              f.write(f'FORCED_BASE_API_URL = "http://localhost:3001/api"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
 
       - name: Build with Nuitka (onefile)

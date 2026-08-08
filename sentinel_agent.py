@@ -972,7 +972,7 @@ class ZeroWatchClient:
         return state
 
     def _save_join_state(self, status, team_code=None, request_id=None, team_id=None, team_name=None):
-        temp_path = f"{self.join_state_file}.tmp"
+        temp_path = f"{self.join_state_file}.{uuid.uuid4().hex}.tmp"
         try:
             os.makedirs(self.state_dir, exist_ok=True)
             state = self._build_join_state(
@@ -3824,7 +3824,7 @@ def _write_fingerprint_json(base_dir, payload):
     serialized = json.dumps(payload, indent=4).encode("utf-8")
     encrypted = encrypt_data(serialized)
     data_to_write = encrypted if encrypted else serialized
-    temp_path = f"{path}.tmp"
+    temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
     with open(temp_path, "wb") as handle:
         handle.write(data_to_write)
         handle.flush()
@@ -4058,7 +4058,7 @@ def request_shutdown_signal(base_dir, reason="manual-disable"):
     serialized = json.dumps(payload).encode("utf-8")
     encrypted = encrypt_data(serialized)
     data_to_write = encrypted if encrypted else serialized
-    temp_path = f"{signal_path}.tmp"
+    temp_path = f"{signal_path}.{uuid.uuid4().hex}.tmp"
     os.makedirs(os.path.dirname(signal_path), exist_ok=True)
     with open(temp_path, "wb") as handle:
         handle.write(data_to_write)
@@ -4123,7 +4123,7 @@ def request_unlink_signal(base_dir):
     signal_path = _unlink_signal_path(base_dir)
     try:
         os.makedirs(os.path.dirname(signal_path), exist_ok=True)
-        temp_path = f"{signal_path}.tmp"
+        temp_path = f"{signal_path}.{uuid.uuid4().hex}.tmp"
         with open(temp_path, "wb") as handle:
             handle.write(b"unlink")
             handle.flush()
@@ -4872,7 +4872,7 @@ def export_products_csv(base_dir, inventory):
     encrypted = encrypt_data(serialized)
     data_to_write = encrypted if encrypted else serialized
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    temp_path = f"{filepath}.tmp"
+    temp_path = f"{filepath}.{uuid.uuid4().hex}.tmp"
     with open(temp_path, "wb") as f:
         f.write(data_to_write)
         f.flush()
