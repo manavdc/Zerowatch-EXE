@@ -58,9 +58,40 @@ class ScanCache:
         self._db_path = db_path
         self._agent_version = agent_version
         self._local = threading.local()
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self._init_connection()
-        self._check_invalidation()
+        self._using_memory_fallback = False
+
+        try:
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            if self._has_unwritable_sidecars(db_path):
+                raise sqlite3.OperationalError("SQLite sidecar files are not writable")
+            self._init_connection()
+            self._check_invalidation()
+        except sqlite3.OperationalError as exc:
+            if "readonly" not in str(exc).lower() and "writable" not in str(exc).lower():
+                raise
+            # A stale SYSTEM-created WAL/SHM pair can be readable but not
+            # writable by the interactive user. The cache is an optimization;
+            # keep the agent alive with a private in-memory cache instead.
+            logger.warning(
+                "Persistent scan cache is not writable (%s); using in-memory cache.",
+                exc,
+            )
+            self._db_path = ":memory:"
+            self._using_memory_fallback = True
+            self._local = threading.local()
+            self._init_connection()
+            self._check_invalidation()
+
+    @staticmethod
+    def _has_unwritable_sidecars(db_path: str) -> bool:
+        """Detect WAL/SHM files that the current process cannot update."""
+        if db_path == ":memory:":
+            return False
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path + suffix
+            if os.path.exists(sidecar) and not os.access(sidecar, os.W_OK):
+                return True
+        return False
 
     def _conn(self) -> sqlite3.Connection:
         if not getattr(self._local, "conn", None):

@@ -69,6 +69,7 @@ jobs:
           python -m nuitka ^
             --standalone ^
             --onefile ^
+            --windows-console-mode=disable ^
             --onefile-tempdir-spec={CACHE_DIR}/ZeroWatch/extracted ^
             --enable-plugin=tk-inter ^
             --output-dir=dist\windows ^

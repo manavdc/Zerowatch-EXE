@@ -184,7 +184,7 @@ def _relaunch_detached(current_exe: str) -> bool:
         escaped_exe = current_exe.replace("'", "''")
         ps_script = (
             f"$target = '{escaped_exe}'; "
-            "Start-Sleep -Seconds 2; "
+            "Start-Sleep -Seconds 5; "
             "Start-Process -FilePath $target"
         )
         import base64
