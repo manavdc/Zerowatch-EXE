@@ -3953,6 +3953,17 @@ def _is_daemon_running():
 
 
 def _is_windows_mutex_held(mutex_name):
+    """Return True when another process currently owns a named mutex."""
+    if sys.platform != "win32":
+        return False
+    probe = ctypes.windll.kernel32.CreateMutexW(None, True, mutex_name)
+    err = ctypes.windll.kernel32.GetLastError()
+    if probe:
+        ctypes.windll.kernel32.CloseHandle(probe)
+    return err == 183
+
+
+def _is_windows_mutex_held(mutex_name):
     "Return True when another process currently owns a named mutex."
     if sys.platform != "win32":
         return False
