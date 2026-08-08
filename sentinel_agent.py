@@ -6327,9 +6327,23 @@ class DashboardFrame(tk.Frame):
                 "Restart SentinelAgent now to apply the update?"
             ):
                 logging.info("[OTA] User confirmed restart — launching new binary and exiting.")
+                # 0. Signal the watchdog guardian to exit gracefully.
+                #    Without this, the watchdog detects the mutex release from os._exit(0)
+                #    and RESPAWNS the agent — causing 4+ ghost processes every update.
+                try:
+                    request_shutdown_signal(get_base_dir(), reason="ota-restart")
+                    logging.info("[OTA] Shutdown signal written — watchdog will exit cleanly.")
+                except Exception as _sig_exc:
+                    logging.warning("[OTA] Could not write shutdown signal: %s", _sig_exc)
+
                 # 1. Start the new binary as a detached process
                 success = _relaunch_detached(current_exe)
                 if not success:
+                    # Relaunch failed — undo the shutdown signal so the watchdog keeps running
+                    try:
+                        consume_shutdown_signal(get_base_dir())
+                    except Exception:
+                        pass
                     banner_lbl.config(
                         text="✗ Relaunch failed — new binary was blocked or failed to start. (Check Antivirus)",
                         fg=self.c_red
@@ -7456,6 +7470,15 @@ def main():
     try:
         from common.os_replacer import startup_bak_cleanup
         startup_bak_cleanup(get_exe_path())
+    except Exception:
+        pass  # Never block startup
+
+    # 1.6  Consume any leftover OTA shutdown signal from the previous agent.
+    #      During OTA restart, the OLD agent writes shutdown.signal so its watchdog
+    #      exits cleanly. The NEW agent must delete it so ITS watchdog starts normally
+    #      (otherwise the new watchdog would immediately detect the signal and exit).
+    try:
+        consume_shutdown_signal(get_base_dir())
     except Exception:
         pass  # Never block startup
 
