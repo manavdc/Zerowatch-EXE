@@ -171,6 +171,10 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
             logger.critical("[WIN SWAP] Rollback also failed: %s", rb_exc)
         raise SwapError(f"Failed to copy new binary into place: {exc}") from exc
 
+    # Spawn the post-update watchdog BEFORE the old process exits so it can
+    # monitor the new agent's liveness and remove the .bak on success.
+    _spawn_post_update_check(current_exe)
+
     logger.info("[WIN SWAP] Swap complete. Call _relaunch_detached() to restart.")
     return True
 
@@ -178,27 +182,32 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
 def _relaunch_detached(current_exe: str) -> bool:
     """
     Re-launch the (already-swapped) binary as a fully detached process after a 2-second delay.
-    This delay ensures the current instance can exit cleanly and release its Windows mutex
-    and DLL file handles before the new instance attempts to launch.
+    Uses PowerShell -WindowStyle Hidden to avoid any visible terminal flash.
+    The delay ensures the old instance can exit and release its Windows mutex and DLL
+    file handles before the new instance attempts to start.
     """
     DETACHED  = 0x00000008
     NEW_GROUP = 0x00000200
 
     try:
-        # Launch via cmd.exe with 2s timeout so old PID exits & frees mutex before new launch
-        cmd = f'cmd.exe /c "timeout /t 2 /nobreak >NUL & start "" "{current_exe}""'
+        # Use PowerShell with hidden window to avoid cmd.exe flash
+        # Start-Sleep 2 gives the old process time to call os._exit(0) and release mutex
+        ps_script = (
+            f"Start-Sleep -Seconds 2; "
+            f"Start-Process -FilePath '{current_exe}'"
+        )
 
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 0  # SW_HIDE
 
         subprocess.Popen(
-            cmd,
+            ["powershell", "-WindowStyle", "Hidden", "-NonInteractive", "-Command", ps_script],
             creationflags = DETACHED | NEW_GROUP | subprocess.CREATE_NO_WINDOW,
             startupinfo   = si,
             close_fds     = True,
         )
-        logger.info("[WIN SWAP] Scheduled delayed relaunch for: %s", current_exe)
+        logger.info("[WIN SWAP] Scheduled hidden PowerShell delayed relaunch for: %s", current_exe)
         return True
     except Exception as exc:
         logger.warning("[WIN SWAP] Failed to re-launch new binary: %s", exc)
@@ -681,8 +690,9 @@ class PostUpdateWatchdog:
             WATCHDOG_TIMEOUT_SECS,
         )
 
-        # Grace period: let the new agent initialize
-        time.sleep(15)
+        # Grace period: let the new agent fully initialize and acquire its mutex
+        # before we start polling. New agent needs ~5-10s to boot the Tkinter GUI.
+        time.sleep(20)
 
         restart_fn = self._get_platform_restart_fn()
         _watchdog_thread(
@@ -726,9 +736,34 @@ class PostUpdateWatchdog:
 
     @staticmethod
     def _get_platform_restart_fn() -> Callable[[], bool]:
-        """Return the appropriate service restart function for the current platform."""
+        """Return the appropriate service restart function for the current platform.
+
+        On Windows desktop mode (no registered service), rollback is not performed
+        automatically — the user must relaunch manually. This avoids false rollbacks
+        when the agent is running as a standalone GUI app rather than a service.
+        """
         if sys.platform == "win32":
             def _win_restart() -> bool:
+                # First, check if the agent is registered as a Windows service
+                try:
+                    result = subprocess.run(
+                        ["sc", "query", _WIN_SERVICE_NAME],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    service_exists = result.returncode == 0
+                except Exception:
+                    service_exists = False
+
+                if not service_exists:
+                    # Desktop mode — do NOT rollback automatically; just log.
+                    logger.warning(
+                        "[POST-UPDATE WATCHDOG] New agent did not prove liveness but no "
+                        "Windows service is registered. Skipping rollback in desktop mode. "
+                        "Please relaunch SentinelAgent manually if needed."
+                    )
+                    return False
+
+                # Service mode — restart via sc.exe
                 try:
                     subprocess.run(
                         ["sc", "stop", _WIN_SERVICE_NAME],
