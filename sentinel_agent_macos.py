@@ -66,6 +66,8 @@ from platforms import PlatformFactory
 
 # ── Scan orchestrator (platform-agnostic) ─────────────────────────────────────
 from scanner import ScanOrchestrator
+from common.daemon_ota import start_daemon_ota_monitor
+from common.state_cleanup import clear_device_state
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT CONFIGURATION
@@ -83,6 +85,7 @@ if os.path.exists(_BUILD_CFG_PATH):
     with open(_BUILD_CFG_PATH, "r", encoding="utf-8") as _f:
         exec(compile(_f.read(), _BUILD_CFG_PATH, "exec"), _cfg_ns)
     BASE_API_URL: str = _cfg_ns.get("FORCED_BASE_API_URL", "")
+    AGENT_VERSION: str = _cfg_ns.get("FORCED_AGENT_VERSION", AGENT_VERSION)
 else:
     BASE_API_URL = os.environ.get("ZEROWATCH_API_URL", "http://localhost:3001/api")
 
@@ -440,6 +443,11 @@ class MacOSAgent:
                 if resp.status_code == 200:
                     logger.info("JWT valid — authenticated")
                     return True
+                if resp.status_code == 404:
+                    self._orchestrator.close()
+                    clear_device_state(self._state_dir)
+                    self._session.clear_jwt()
+                    logger.info("Device was unlinked; local state cleared.")
                 logger.info("JWT rejected (HTTP %d) — re-joining", resp.status_code)
                 self._session.clear_jwt()
             except Exception as exc:
@@ -672,7 +680,7 @@ class MacOSAgent:
                 self._heartbeat()
                 last_heartbeat = now
 
-            if now - last_delta >= MONITOR_INTERVAL:
+            if now - last_l0_delta >= MONITOR_INTERVAL:
                 try:
                     added, removed = self._orchestrator.run_delta_scan()
                     if added or removed:
@@ -680,7 +688,7 @@ class MacOSAgent:
                             _items_to_dicts(added),
                             _items_to_dicts(removed),
                         )
-                    last_delta = now
+                    last_l0_delta = now
                 except Exception as exc:
                     logger.warning("Delta scan error: %s", exc)
 
@@ -714,6 +722,13 @@ class MacOSAgent:
             name="macos-monitor",
         )
         monitor.start()
+        ota_monitor = None
+        try:
+            ota_monitor = start_daemon_ota_monitor(
+            os.path.abspath(sys.argv[0]), AGENT_VERSION, self._shutdown_event
+            )
+        except Exception:
+            logger.exception("Failed to start daemon OTA monitor; continuing without OTA")
 
         logger.info("ZeroWatch macOS Agent running. Press Ctrl+C or send SIGTERM to stop.")
 
@@ -723,6 +738,8 @@ class MacOSAgent:
         logger.info("Shutdown signal received — stopping macOS agent")
         self._stop_event.set()
         monitor.join(timeout=10)
+        if ota_monitor is not None:
+            ota_monitor.stop()
 
         # Clean up the build-time config file (written by run_agent.sh)
         try:

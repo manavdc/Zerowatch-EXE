@@ -177,6 +177,21 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
 
 def _relaunch_detached(current_exe: str) -> bool:
     """Schedule a hidden, delayed launch of the newly installed executable."""
+    if sys.platform != "win32":
+        try:
+            subprocess.Popen(
+                [current_exe],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            logger.info("[POSIX SWAP] Relaunched updated binary: %s", current_exe)
+            return True
+        except Exception as exc:
+            logger.warning("[POSIX SWAP] Failed to relaunch updated binary: %s", exc)
+            return False
+
     detached = 0x00000008
     new_group = 0x00000200
 

@@ -75,8 +75,12 @@ def _global_crash_handler(exc_type, exc_value, exc_traceback):
     except Exception:
         pass
         
-    # Show MessageBox (Windows only)
-    if sys.platform == "win32" and hasattr(ctypes, "windll"):
+    # Only interactive mode may show UI. Daemon/watchdog/service failures
+    # must remain headless and be handled by their supervisor.
+    interactive_mode = not any(
+        flag in sys.argv for flag in ("--daemon", "--watchdog", "--password-prompt")
+    )
+    if interactive_mode and sys.platform == "win32" and hasattr(ctypes, "windll"):
         try:
             ctypes.windll.user32.MessageBoxW(
                 0,
@@ -3081,78 +3085,31 @@ def register_startup_registry():
         logging.warning(f"HKCU startup registration failed: {e}")
 
 def register_task_scheduler():
-    """Creates a resilient Task Scheduler setup.
+    """Register exactly one per-user daemon task.
 
-    Strategy:
-      1) ONSTART as SYSTEM (best for reboot reliability)
-      2) ONLOGON highest privilege
-      3) ONLOGON limited privilege
+    Multiple tasks with different identities create duplicate daemons and
+    mixed SQLite ACL ownership. The GUI/daemon pair now has one supervisor.
     """
     if sys.platform != "win32":
         return True
     exe_path = get_exe_path()
     daemon_cmd = " ".join(_daemon_args())
-    any_success = False
-
-    def _create_task(task_name, schedule, run_level, run_as=None):
-        cmd = [
-            "schtasks", "/create", "/tn", task_name,
-            "/tr", f'"{exe_path}" {daemon_cmd}',
-            "/sc", schedule,
-            "/rl", run_level,
-            "/f",
-        ]
-        if run_as:
-            cmd.extend(["/ru", run_as])
-        result = run_hidden(cmd)
-        return result
-
-    def _create_resume_task(task_name, run_level, run_as=None):
-        cmd = [
-            "schtasks", "/create", "/tn", task_name,
-            "/tr", f'"{exe_path}" {daemon_cmd}',
-            "/sc", "ONEVENT",
-            "/ec", "System",
-            "/mo", "*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]",
-            "/rl", run_level,
-            "/f",
-        ]
-        if run_as:
-            cmd.extend(["/ru", run_as])
-        return run_hidden(cmd)
-
     try:
-        result = _create_task("SentinelAgentStartup", "ONSTART", "HIGHEST", run_as="SYSTEM")
+        # Remove legacy identities before creating the one canonical task.
+        for legacy in ("SentinelAgentStartup", "SentinelAgentResume"):
+            run_hidden(["schtasks", "/delete", "/tn", legacy, "/f"])
+        result = run_hidden([
+            "schtasks", "/create", "/tn", "SentinelAgent",
+            "/tr", f'"{exe_path}" {daemon_cmd}',
+            "/sc", "ONLOGON", "/rl", "HIGHEST", "/f",
+        ])
         if result.returncode == 0:
-            logging.info("Startup task created (ONSTART/SYSTEM).")
-            any_success = True
-        else:
-            logging.warning(f"Startup task registration failed: {result.stderr}")
-
-        result = _create_task("SentinelAgent", "ONLOGON", "HIGHEST")
-        if result.returncode == 0:
-            logging.info("Logon task created (highest privilege).")
-            any_success = True
-        else:
-            logging.warning(f"Logon task (highest) failed: {result.stderr}")
-
-        result = _create_task("SentinelAgent", "ONLOGON", "LIMITED")
-        if result.returncode == 0:
-            logging.info("Logon task created (limited privilege).")
-            any_success = True
-        else:
-            logging.warning(f"Logon task (limited) failed: {result.stderr}")
-
-        result = _create_resume_task("SentinelAgentResume", "HIGHEST", run_as="SYSTEM")
-        if result.returncode == 0:
-            logging.info("Resume task created (Power-Troubleshooter event).")
-            any_success = True
-        else:
-            logging.warning(f"Resume task registration failed: {result.stderr}")
+            logging.info("Canonical per-user logon task created.")
+            return True
+        logging.warning("Task registration failed: %s", result.stderr)
     except Exception as e:
         logging.warning(f"Task Scheduler registration failed: {e}")
-
-    return any_success
+    return False
 
 
 # ============================================================================
