@@ -17,6 +17,8 @@ import logging
 import re
 import socket
 import socketio
+import shutil
+import glob
 from urllib.parse import urlparse
 import cert_pinning
 
@@ -303,9 +305,10 @@ def _secure_state_dir(base_dir):
             return "/Library/Application Support/ZeroWatch/state"
         return os.path.expanduser("~/Library/Application Support/ZeroWatch/state")
     elif sys.platform.startswith("linux"):
-        is_root = (os.geteuid() == 0) if hasattr(os, "geteuid") else False
-        if is_root:
-            return "/var/lib/zerowatch/state"
+        # Link/authentication state must not change with the UID that happens
+        # to launch the process.  Hardware collection may require root, but
+        # the device identity is system-wide and shared by all launch modes.
+        return os.environ.get("ZEROWATCH_STATE_DIR", "/var/lib/zerowatch/state")
     return os.path.join(base_dir, "state")
 
 
@@ -315,6 +318,40 @@ def _state_path(base_dir, filename):
 
 def _legacy_state_path(base_dir, filename):
     return os.path.join(base_dir, filename)
+
+
+def _migrate_linux_shared_state(base_dir, state_dir):
+    """Migrate the old per-launcher Linux state into the shared state dir."""
+    if not sys.platform.startswith("linux"):
+        return
+    legacy_dir = os.path.join(base_dir, "state")
+    if os.path.abspath(legacy_dir) == os.path.abspath(state_dir) or not os.path.isdir(legacy_dir):
+        return
+    try:
+        os.makedirs(state_dir, mode=0o770, exist_ok=True)
+        names = (
+            "zerowatch_token.dat", OFFLINE_QUEUE_FILE, TEAM_JOIN_STATE_FILE,
+            FINGERPRINT_JSON_FILE, "products.csv", "sentinel_agent.log",
+            "dashboard_cache.dat", "asset_info.json", "consent_accepted.dat",
+        )
+        for name in names:
+            source = os.path.join(legacy_dir, name)
+            target = os.path.join(state_dir, name)
+            if os.path.isfile(source) and not os.path.exists(target):
+                shutil.copy2(source, target)
+                os.remove(source)
+        for source in glob.glob(os.path.join(legacy_dir, "scan_cache.db*")):
+            target = os.path.join(state_dir, os.path.basename(source))
+            if os.path.isfile(source) and not os.path.exists(target):
+                shutil.copy2(source, target)
+                os.remove(source)
+        logging.info("Linux shared state initialized at %s", state_dir)
+    except OSError as exc:
+        logging.warning(
+            "Cannot initialize shared Linux state at %s: %s. "
+            "Install it with controlled user/group access before launching the agent.",
+            state_dir, exc,
+        )
 
 
 def _purge_legacy_build_artifacts(base_dir):
@@ -736,6 +773,7 @@ class ZeroWatchClient:
         self.queue_file = _state_path(base_dir, OFFLINE_QUEUE_FILE)
         self.state_dir = _secure_state_dir(base_dir)
         self.join_state_file = _state_path(base_dir, TEAM_JOIN_STATE_FILE)
+        _migrate_linux_shared_state(base_dir, self.state_dir)
         
         # DEBUG LOGGING
         _append_gui_log(base_dir, f"Client Init: state_dir={self.state_dir}")
@@ -1296,7 +1334,13 @@ class ZeroWatchClient:
 
     def _load_jwt(self):
         _append_gui_log(self.base_dir, f"Attempting to load JWT from {self.token_file}")
-        for token_path in [self.token_file, _legacy_state_path(self.base_dir, "zerowatch_token.dat")]:
+        token_paths = [self.token_file]
+        # Linux legacy state is migrated into the shared directory before this
+        # method runs. Do not fall back to a per-user token there, otherwise a
+        # permission problem could silently create a second linked identity.
+        if not sys.platform.startswith("linux"):
+            token_paths.append(_legacy_state_path(self.base_dir, "zerowatch_token.dat"))
+        for token_path in token_paths:
             if os.path.exists(token_path):
                 try:
                     with open(token_path, "rb") as f:
@@ -3730,12 +3774,14 @@ def _fingerprint_json_path(base_dir):
 
 def _read_fingerprint_json(base_dir):
     try:
+        if sys.platform.startswith("linux"):
+            _migrate_linux_shared_state(base_dir, _secure_state_dir(base_dir))
         raw = None
         source_path = None
-        for path in (
-            _fingerprint_json_path(base_dir),
-            _legacy_state_path(base_dir, FINGERPRINT_JSON_FILE),
-        ):
+        paths = [_fingerprint_json_path(base_dir)]
+        if not sys.platform.startswith("linux"):
+            paths.append(_legacy_state_path(base_dir, FINGERPRINT_JSON_FILE))
+        for path in paths:
             if os.path.exists(path):
                 with open(path, "rb") as handle:
                     raw = handle.read()
@@ -6003,17 +6049,50 @@ class DashboardFrame(tk.Frame):
 
     def _build_settings_content(self, parent_frame):
         header = tk.Frame(parent_frame, bg=self.c_bg_base)
-        header.pack(fill=tk.X, pady=(0, 20))
-        tk.Label(header, text="SETTINGS", fg=self.c_white, bg=self.c_bg_base, font=("Arial", 18, "bold")).pack(side=tk.LEFT)
+        header.pack(fill=tk.X, pady=(0, 12))
+        tk.Label(header, text="SETTINGS", fg=self.c_white, bg=self.c_bg_base, font=("Arial", 22, "bold")).pack(side=tk.LEFT)
         
-        desc = tk.Label(parent_frame, text="Configure agent system settings. Changes require administrator privileges.", fg=self.c_gray, bg=self.c_bg_base, font=self.f_normal, justify=tk.LEFT)
-        desc.pack(anchor="w", pady=(0, 20))
+        desc = tk.Label(parent_frame, text="Configure how this device operates. Changes require administrator privileges.", fg=self.c_gray, bg=self.c_bg_base, font=self.f_normal, justify=tk.LEFT)
+        desc.pack(anchor="w", pady=(0, 24))
         
         container = tk.Frame(parent_frame, bg=self.c_bg_base)
         container.pack(fill=tk.BOTH, expand=True)
+
+        def make_toggle(parent, variable, command):
+            """Create a large, high-contrast toggle without changing setting behavior."""
+            holder = tk.Frame(parent, bg=self.c_bg_card, cursor="hand2")
+            canvas = tk.Canvas(holder, width=64, height=36, bg=self.c_bg_card,
+                               highlightthickness=0, bd=0, cursor="hand2")
+            canvas.pack(side=tk.LEFT)
+            state = tk.Label(holder, text="", bg=self.c_bg_card, fg=self.c_gray,
+                             font=("Arial", 9, "bold"), width=3, anchor="w")
+            state.pack(side=tk.LEFT, padx=(5, 0))
+
+            def redraw(*_):
+                enabled = bool(variable.get())
+                canvas.delete("all")
+                track = self.c_cyan if enabled else "#3a414d"
+                knob = "#ffffff"
+                canvas.create_oval(2, 2, 34, 34, fill=track, outline=track)
+                canvas.create_rectangle(18, 2, 46, 34, fill=track, outline=track)
+                canvas.create_oval(30, 2, 62, 34, fill=track, outline=track)
+                x = 46 if enabled else 18
+                canvas.create_oval(x - 11, 7, x + 11, 29, fill=knob, outline=knob)
+                state.configure(text="ON" if enabled else "OFF",
+                                fg=self.c_cyan if enabled else self.c_gray)
+
+            def toggle(_event=None):
+                variable.set(not variable.get())
+                command()
+
+            variable.trace_add("write", redraw)
+            canvas.bind("<Button-1>", toggle)
+            holder.bind("<Button-1>", toggle)
+            redraw()
+            return holder
         
-        card = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=20, pady=15)
-        card.pack(fill=tk.X, pady=5)
+        card = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=24, pady=18)
+        card.pack(fill=tk.X, pady=(0, 10))
         
         top = tk.Frame(card, bg=self.c_bg_card)
         top.pack(fill=tk.X)
@@ -6030,13 +6109,12 @@ class DashboardFrame(tk.Frame):
             else:
                 show_windows_notification("Zerowatch", "Sentinel Agent stopped scanning")
                 
-        chk = tk.Checkbutton(top, variable=inventory_enabled, bg=self.c_bg_card, activebackground=self.c_bg_card, command=toggle_inventory)
-        chk.pack(side=tk.RIGHT)
+        make_toggle(top, inventory_enabled, toggle_inventory).pack(side=tk.RIGHT)
         
-        tk.Label(card, text="Automatically scan and collect hardware and software inventory.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
+        tk.Label(card, text="Automatically scan and collect hardware and software inventory.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
         
-        card2 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=20, pady=15)
-        card2.pack(fill=tk.X, pady=5)
+        card2 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=24, pady=18)
+        card2.pack(fill=tk.X, pady=(0, 10))
         
         top2 = tk.Frame(card2, bg=self.c_bg_card)
         top2.pack(fill=tk.X)
@@ -6053,13 +6131,12 @@ class DashboardFrame(tk.Frame):
             else:
                 show_windows_notification("Zerowatch", "Auto start on boot disabled")
                 
-        chk2 = tk.Checkbutton(top2, variable=auto_start_enabled, bg=self.c_bg_card, activebackground=self.c_bg_card, command=toggle_auto_start)
-        chk2.pack(side=tk.RIGHT)
+        make_toggle(top2, auto_start_enabled, toggle_auto_start).pack(side=tk.RIGHT)
         
-        tk.Label(card2, text="Automatically start the agent when the computer boots.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
+        tk.Label(card2, text="Automatically start the agent when the computer boots.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
 
-        card3 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=20, pady=15)
-        card3.pack(fill=tk.X, pady=5)
+        card3 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=24, pady=18)
+        card3.pack(fill=tk.X, pady=(0, 10))
         
         top3 = tk.Frame(card3, bg=self.c_bg_card)
         top3.pack(fill=tk.X)
@@ -6089,7 +6166,7 @@ class DashboardFrame(tk.Frame):
         unlink_btn = tk.Button(top3, text="Unlink", bg=self.c_red, fg=self.c_white, font=self.f_normal_bold, bd=0, activebackground=self.c_bg_card, activeforeground=self.c_red, cursor="hand2", command=on_unlink_click)
         unlink_btn.pack(side=tk.RIGHT)
         
-        tk.Label(card3, text="Disconnect this device from the currently linked team.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_small, justify=tk.LEFT).pack(anchor="w", pady=(10,0))
+        tk.Label(card3, text="Disconnect this device from the currently linked team.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
 
 
 

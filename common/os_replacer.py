@@ -196,11 +196,28 @@ def _relaunch_detached(current_exe: str) -> bool:
     new_group = 0x00000200
 
     try:
-        escaped_exe = current_exe.replace("'", "''")
+        # In source/dev runs current_exe is a .py file.  Start it through the
+        # active Python interpreter; launching a .py directly via PowerShell
+        # depends on the user's file association and commonly opens an editor
+        # instead of restarting the agent.
+        if current_exe.lower().endswith(".py"):
+            target = sys.executable
+            launch_args = [current_exe, *sys.argv[1:]]
+        else:
+            target = current_exe
+            launch_args = list(sys.argv[1:])
+
+        def _ps_quote(value: str) -> str:
+            return "'" + str(value).replace("'", "''") + "'"
+
+        escaped_target = _ps_quote(target)
+        escaped_args = "@(" + ",".join(_ps_quote(arg) for arg in launch_args) + ")"
+        escaped_workdir = _ps_quote(os.path.dirname(os.path.abspath(current_exe)))
         ps_script = (
-            f"$target = '{escaped_exe}'; "
+            f"$target = {escaped_target}; "
+            f"$args = {escaped_args}; "
             "Start-Sleep -Seconds 5; "
-            "Start-Process -FilePath $target"
+            f"Start-Process -FilePath $target -ArgumentList $args -WorkingDirectory {escaped_workdir}"
         )
         import base64
         encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
@@ -231,7 +248,8 @@ def _swap_linux(new_binary: str, current_exe: str, zw_client=None) -> bool:
     """
     Linux POSIX atomic swap:
       1. shutil.copy2 current → .bak
-      2. os.replace(new_binary, current_exe)  ← POSIX atomic renameat(2)
+      2. Copy new_binary into the target directory, then os.replace() that
+         same-filesystem staging file → current_exe (POSIX atomic renameat(2))
       3. chmod 755
       4. restorecon (SELinux context, best-effort)
       5. systemctl restart zerowatch-agent.service (or --user fallback)
@@ -239,6 +257,10 @@ def _swap_linux(new_binary: str, current_exe: str, zw_client=None) -> bool:
     The new agent cleans up .bak on its own startup via startup_bak_cleanup().
     """
     bak_path = current_exe + ".bak"
+    # The download commonly lives in /tmp while the installed binary may be
+    # on another mount (for example /mnt/e under WSL). os.replace() cannot
+    # cross filesystems (EXDEV), so stage beside the target first.
+    staging_path = current_exe + ".new"
 
     # 1. Backup
     try:
@@ -247,12 +269,20 @@ def _swap_linux(new_binary: str, current_exe: str, zw_client=None) -> bool:
     except OSError as exc:
         raise SwapError(f"Failed to create .bak: {exc}") from exc
 
-    # 2. Atomic POSIX replace
+    # 2. Stage on the target filesystem, then atomically replace the target.
     try:
-        os.replace(new_binary, current_exe)
+        shutil.copy2(new_binary, staging_path)
+        # Make the staged contents durable before exposing them as the binary.
+        with open(staging_path, "rb") as staged_file:
+            os.fsync(staged_file.fileno())
+        os.replace(staging_path, current_exe)
         logger.info("[LINUX SWAP] Atomic replace complete: %s", current_exe)
     except OSError as exc:
         logger.error("[LINUX SWAP] Atomic replace failed — restoring .bak: %s", exc)
+        try:
+            os.remove(staging_path)
+        except OSError:
+            pass
         try:
             shutil.copy2(bak_path, current_exe)
         except OSError as rb_exc:
