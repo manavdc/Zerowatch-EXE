@@ -132,24 +132,78 @@ logger = logging.getLogger("linux.agent")
 
 # ── State directory ───────────────────────────────────────────────────────────
 
+# Identity files that must be portable between state directories on Linux/macOS
+# so that the device is not re-enrolled when the launch UID changes.
+_SHARED_IDENTITY_FILES = (
+    "zerowatch_token.dat",       # Legacy JWT
+    "zw_team_join_state.dat",    # Legacy join state
+    "agent_token.enc",           # Linux/macOS JWT
+    "join_state.json",           # Linux/macOS join state
+    "consent_accepted.dat",
+    "device_fingerprint.json",
+    "asset_info.json",
+    "dashboard_cache.dat",
+)
+
 def _get_state_dir() -> str:
     base = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        "/var/lib/zerowatch/state",
-        os.path.expanduser("~/.local/share/zerowatch/state"),
-        os.path.join(base, "state"),
-    ]
-    for path in candidates:
+    system_dir = "/var/lib/zerowatch/state"
+    user_dir   = os.path.expanduser("~/.local/share/zerowatch/state")
+    local_dir  = os.path.join(base, "state")
+
+    # ── Try system dir first (preferred — consistent across UIDs) ──────
+    try:
+        os.makedirs(system_dir, mode=0o700, exist_ok=True)
+        _probe = os.path.join(system_dir, ".write_probe")
+        with open(_probe, "w") as _fh:
+            _fh.write("x")
+        os.remove(_probe)
+        return system_dir                          # writable → use it
+    except OSError:
+        pass  # root-owned or missing; fall through to user-dir
+
+    # ── System dir not writable. Find the first user-writable fallback ─
+    for fallback in (user_dir, local_dir):
         try:
-            os.makedirs(path, mode=0o700, exist_ok=True)
-            test = os.path.join(path, ".write_test")
-            with open(test, "w") as fh:
-                fh.write("x")
-            os.remove(test)
-            return path
+            os.makedirs(fallback, mode=0o700, exist_ok=True)
+            _probe = os.path.join(fallback, ".write_probe")
+            with open(_probe, "w") as _fh:
+                _fh.write("x")
+            os.remove(_probe)
         except OSError:
             continue
-    return os.path.join(base, "state")
+
+        # ── Migrate identity files from the unwritable system dir ───
+        if os.path.isdir(system_dir):
+            migrated = []
+            for name in _SHARED_IDENTITY_FILES:
+                src = os.path.join(system_dir, name)
+                dst = os.path.join(fallback, name)
+                if os.path.isfile(src) and not os.path.exists(dst):
+                    try:
+                        import shutil as _shutil
+                        _shutil.copy2(src, dst)
+                        migrated.append(name)
+                    except OSError:
+                        pass
+            if migrated:
+                logger.warning(
+                    "%s is not writable by the current user. "
+                    "Identity files migrated to %s (%s). "
+                    "To avoid this, run: sudo chmod -R o+rwX %s",
+                    system_dir, fallback, ", ".join(migrated), system_dir,
+                )
+            else:
+                logger.info(
+                    "%s not writable; using %s instead.",
+                    system_dir, fallback,
+                )
+
+        return fallback
+
+    # Last-resort — return local dir without write verification
+    return local_dir
+
 
 
 # ── Device ID ─────────────────────────────────────────────────────────────────
