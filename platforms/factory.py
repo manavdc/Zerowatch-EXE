@@ -17,6 +17,7 @@ logger = logging.getLogger("platforms.factory")
 
 class PlatformFactory:
     """Factory responsible for detecting OS and instantiating the platform container."""
+    _cached_platform: Optional[Platform] = None
 
     @staticmethod
     def create(
@@ -32,25 +33,30 @@ class PlatformFactory:
           - Linux   (sys.platform.startswith("linux"))
           - macOS   (sys.platform == "darwin")
         """
+        if PlatformFactory._cached_platform is not None:
+            return PlatformFactory._cached_platform
+
         plat = sys.platform
 
         if plat == "win32":
             from windows.platform import WindowsPlatform
             reg_fn = existing_registry_fn or (lambda: [])
             logger.info("Initializing WindowsPlatform for win32 host...")
-            return WindowsPlatform(reg_fn)
+            PlatformFactory._cached_platform = WindowsPlatform(reg_fn)
+            return PlatformFactory._cached_platform
 
         elif plat.startswith("linux"):
             from linux.platform import LinuxPlatform
-            reg_fn = existing_registry_fn or (lambda: [])
             logger.info("Initializing LinuxPlatform for linux host...")
-            return LinuxPlatform(reg_fn)
+            PlatformFactory._cached_platform = LinuxPlatform(existing_registry_fn or (lambda: []))
+            return PlatformFactory._cached_platform
 
         elif plat == "darwin":
             from macos.platform import MacOSPlatform
-            reg_fn = existing_registry_fn or (lambda: [])
             logger.info("Initializing MacOSPlatform for darwin host...")
-            return MacOSPlatform(reg_fn)
+            PlatformFactory._cached_platform = MacOSPlatform(existing_registry_fn or (lambda: []))
+            return PlatformFactory._cached_platform
 
         else:
             raise NotImplementedError(f"Unsupported operating system platform: {plat}")
+

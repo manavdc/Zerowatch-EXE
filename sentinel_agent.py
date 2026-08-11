@@ -35,6 +35,15 @@ except ImportError:
 # Module-level background monitor instance (started in main_agent / run_interactive)
 _ota_background_monitor = None
 
+IS_COMPILED = False
+try:
+    import builtins
+    if hasattr(builtins, "__compiled__") or "__compiled__" in globals():
+        IS_COMPILED = True
+except Exception:
+    pass
+
+
 if sys.platform == "win32":
     import winreg
     import ctypes.wintypes as wt
@@ -817,7 +826,7 @@ def _configure_logging():
     global LOG_FILE
     early_base_dir = (
         os.path.dirname(os.path.abspath(sys.argv[0]))
-        if str(sys.argv[0]).endswith('.exe')
+        if IS_COMPILED or str(sys.argv[0]).endswith('.exe')
         else os.path.dirname(os.path.abspath(__file__))
     )
     LOG_FILE = _state_path(early_base_dir, "sentinel_agent.log")
@@ -835,10 +844,11 @@ def _configure_logging():
     root_logger.addHandler(handler)
 
     # Console stream handler (active when running as standard Python script from CLI)
-    if not str(sys.argv[0]).endswith('.exe'):
+    if not (IS_COMPILED or str(sys.argv[0]).endswith('.exe')):
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(formatter)
         root_logger.addHandler(console_handler)
+
 
     # Silence noisy urllib3/socketio connectionpool retry warnings during long-polling
     logging.getLogger("urllib3").setLevel(logging.ERROR)
@@ -4096,25 +4106,30 @@ def _spawn_daemon_process():
     else:
         daemon_cmd = [target_path, *_daemon_args()]
 
-    if sys.platform != "win32":
+    try:
+        if sys.platform != "win32":
+            daemon_proc = subprocess.Popen(
+                daemon_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            time.sleep(1.5)
+            return daemon_proc.poll() is None, daemon_proc.pid
+
+        DETACHED = 0x00000008
+        NEW_GROUP = 0x00000200
         daemon_proc = subprocess.Popen(
             daemon_cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            creationflags=DETACHED | NEW_GROUP | subprocess.CREATE_NO_WINDOW,
+            startupinfo=_windows_hidden_startupinfo(),
         )
         time.sleep(1.5)
         return daemon_proc.poll() is None, daemon_proc.pid
+    except Exception as e:
+        logging.error(f"Failed to spawn daemon: {e}")
+        return False, None
 
-    DETACHED = 0x00000008
-    NEW_GROUP = 0x00000200
-    daemon_proc = subprocess.Popen(
-        daemon_cmd,
-        creationflags=DETACHED | NEW_GROUP | subprocess.CREATE_NO_WINDOW,
-        startupinfo=_windows_hidden_startupinfo(),
-    )
-    time.sleep(1.5)
-    return daemon_proc.poll() is None, daemon_proc.pid
 
 
 def unregister_startup_registry():
@@ -7375,43 +7390,7 @@ class UnifiedSentinelGUI(tk.Tk):
         self.current_frame = new_frame
         self.current_frame.pack(fill=tk.BOTH, expand=True)
 
-def _spawn_daemon_process():
-    exe_path = get_exe_path()
-    # When running as a compiled .exe, execute it directly.
-    # When running as a .py script from the interpreter, we must prepend
-    # sys.executable so Windows doesn't try to run the .py file as a Win32
-    # application (which causes WinError 193 "not a valid Win32 application").
-    if sys.argv[0].endswith('.exe'):
-        args = [exe_path] + _daemon_args()
-    else:
-        args = [sys.executable, exe_path] + _daemon_args()
-    try:
-        if sys.platform != "win32":
-            p = subprocess.Popen(
-                args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            return True, p.pid
 
-        DETACHED = 0x00000008
-        NEW_GROUP = 0x00000200
-        p = subprocess.Popen(
-            args,
-            creationflags=DETACHED | NEW_GROUP | subprocess.CREATE_NO_WINDOW,
-            startupinfo=_windows_hidden_startupinfo(),
-        )
-        return True, p.pid
-    except Exception as e:
-        logging.error(f"Failed to spawn daemon: {e}")
-        return False, None
-
-def _daemon_args():
-    args = ["--daemon"]
-    if "--hardened" in sys.argv:
-        args.append("--hardened")
-    return args
 
 def prompt_consent(base_dir, force_show=False):
     consent_file = os.path.join(_secure_state_dir(base_dir), "consent_accepted.dat")
