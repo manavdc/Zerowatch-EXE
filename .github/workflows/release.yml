@@ -57,8 +57,8 @@ jobs:
         run: |
           import os, re
           ref = os.environ.get("GITHUB_REF_NAME", "")
-          # Strip leading "v" — "v1.2.2" → "1.2.2"; keep as-is if no match
-          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+\.\d+\.\d+", ref) else "0.0.0"
+          # Strip leading "v" — "v3" → "3", "v1.2.2" → "1.2.2"; fallback to "0.0.0"
+          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+", ref) else "0.0.0"
           with open("agent_build_config.py", "w") as f:
               f.write(f'FORCED_BASE_API_URL = "http://localhost:3001/api"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
@@ -130,7 +130,8 @@ jobs:
         run: |
           import os, re
           ref = os.environ.get("GITHUB_REF_NAME", "")
-          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+\.\d+\.\d+", ref) else "0.0.0"
+          # Strip leading "v" — "v3" → "3", "v1.2.2" → "1.2.2"; fallback to "0.0.0"
+          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+", ref) else "0.0.0"
           with open("agent_build_config.py", "w") as f:
               f.write(f'FORCED_BASE_API_URL = "http://localhost:3001/api"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
@@ -194,7 +195,8 @@ jobs:
         run: |
           import os, re
           ref = os.environ.get("GITHUB_REF_NAME", "")
-          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+\.\d+\.\d+", ref) else "0.0.0"
+          # Strip leading "v" — "v3" → "3", "v1.2.2" → "1.2.2"; fallback to "0.0.0"
+          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+", ref) else "0.0.0"
           with open("agent_build_config.py", "w") as f:
               f.write(f'FORCED_BASE_API_URL = "http://localhost:3001/api"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')

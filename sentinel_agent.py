@@ -248,7 +248,25 @@ import math
 try:
     from agent_build_config import FORCED_AGENT_VERSION as AGENT_VERSION  # injected by CI
 except (ImportError, AttributeError):
-    AGENT_VERSION = "1.1.1"  # fallback for local dev builds
+    # Fallback: fetch the current release version from GitHub at runtime.
+    # This ensures the version badge and update check reflect the real release tag,
+    # even when running directly from source (no CI build config present).
+    def _fetch_github_release_version() -> str:
+        try:
+            import urllib.request
+            import json as _json
+            url = "https://api.github.com/repos/manavdc/Zerowatch-EXE/releases/latest"
+            req = urllib.request.Request(url, headers={"User-Agent": "SentinelAgent-init"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = _json.loads(resp.read().decode())
+                tag = data.get("tag_name", "")
+                # Strip leading "v": "v3" → "3", "v1.2.3" → "1.2.3"
+                return tag.lstrip("v") if tag else "0.0.0"
+        except Exception:
+            return "0.0.0"
+
+    AGENT_VERSION = _fetch_github_release_version()
+
 
 KILL_PASSWORD = "Pass@123" # Fallback offline password
 MUTEX_NAME = "Global\\SentinelAgent_ZeroWatch_4F9A2E1B"
