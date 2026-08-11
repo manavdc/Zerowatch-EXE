@@ -294,6 +294,21 @@ def _sanitize_organization_name(value, fallback="Unknown"):
     return organization_name[:ORGANIZATION_NAME_MAX_LENGTH]
 
 
+
+# Identity files that must be portable between state directories on Linux
+# so that the device is not re-enrolled when the launch UID changes.
+_LINUX_IDENTITY_FILES = (
+    "zerowatch_token.dat",       # JWT — the most critical one
+    "zw_team_join_state.dat",    # enrollment state
+    "agent_token.enc",           # Linux/macOS JWT (sentinel_agent_linux path)
+    "join_state.json",           # Linux/macOS join state
+    "consent_accepted.dat",
+    "device_fingerprint.json",
+    "asset_info.json",
+    "dashboard_cache.dat",
+)
+
+
 def _secure_state_dir(base_dir):
     if sys.platform == "win32":
         program_data = str(os.environ.get("PROGRAMDATA") or "").strip()
@@ -305,10 +320,71 @@ def _secure_state_dir(base_dir):
             return "/Library/Application Support/ZeroWatch/state"
         return os.path.expanduser("~/Library/Application Support/ZeroWatch/state")
     elif sys.platform.startswith("linux"):
-        # Link/authentication state must not change with the UID that happens
-        # to launch the process.  Hardware collection may require root, but
-        # the device identity is system-wide and shared by all launch modes.
-        return os.environ.get("ZEROWATCH_STATE_DIR", "/var/lib/zerowatch/state")
+        # If ZEROWATCH_STATE_DIR is explicitly set, honour it unconditionally.
+        explicit = os.environ.get("ZEROWATCH_STATE_DIR", "")
+        if explicit:
+            return explicit
+
+        system_dir = "/var/lib/zerowatch/state"
+        user_dir   = os.path.expanduser("~/.local/share/zerowatch/state")
+        local_dir  = os.path.join(base_dir, "state")
+
+        # ── Try system dir first (preferred — consistent across UIDs) ──────
+        try:
+            os.makedirs(system_dir, mode=0o700, exist_ok=True)
+            _probe = os.path.join(system_dir, ".write_probe")
+            with open(_probe, "w") as _fh:
+                _fh.write("x")
+            os.remove(_probe)
+            return system_dir                          # writable → use it
+        except OSError:
+            pass  # root-owned or missing; fall through to user-dir
+
+        # ── System dir not writable. Find the first user-writable fallback ─
+        for fallback in (user_dir, local_dir):
+            try:
+                os.makedirs(fallback, mode=0o700, exist_ok=True)
+                _probe = os.path.join(fallback, ".write_probe")
+                with open(_probe, "w") as _fh:
+                    _fh.write("x")
+                os.remove(_probe)
+            except OSError:
+                continue
+
+            # ── Migrate identity files from the unwritable system dir ───
+            # This keeps the JWT and join-state consistent so the same device
+            # identity is used regardless of whether sudo was used, preventing
+            # the agent from appearing as two separate devices on the backend.
+            if os.path.isdir(system_dir):
+                migrated = []
+                for name in _LINUX_IDENTITY_FILES:
+                    src = os.path.join(system_dir, name)
+                    dst = os.path.join(fallback, name)
+                    if os.path.isfile(src) and not os.path.exists(dst):
+                        try:
+                            import shutil as _shutil
+                            _shutil.copy2(src, dst)
+                            migrated.append(name)
+                        except OSError:
+                            pass
+                if migrated:
+                    logging.warning(
+                        "[STATE] %s is not writable by the current user. "
+                        "Identity files migrated to %s (%s). "
+                        "To avoid this, run: sudo chmod -R o+rwX %s",
+                        system_dir, fallback, ", ".join(migrated), system_dir,
+                    )
+                else:
+                    logging.info(
+                        "[STATE] %s not writable; using %s instead.",
+                        system_dir, fallback,
+                    )
+
+            return fallback
+
+        # Last-resort — return local dir without write verification
+        return local_dir
+
     return os.path.join(base_dir, "state")
 
 
