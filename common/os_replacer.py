@@ -33,6 +33,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Callable, Optional
@@ -196,10 +197,9 @@ def _relaunch_detached(current_exe: str) -> bool:
     new_group = 0x00000200
 
     try:
-        # In source/dev runs current_exe is a .py file.  Start it through the
-        # active Python interpreter; launching a .py directly via PowerShell
-        # depends on the user's file association and commonly opens an editor
-        # instead of restarting the agent.
+        # In source/dev runs current_exe is a .py file. Start it through the
+        # active Python interpreter; launching a .py directly depends on the
+        # user's file association and can open an editor instead of the agent.
         if current_exe.lower().endswith(".py"):
             target = sys.executable
             launch_args = [current_exe, *sys.argv[1:]]
@@ -207,37 +207,29 @@ def _relaunch_detached(current_exe: str) -> bool:
             target = current_exe
             launch_args = list(sys.argv[1:])
 
-        def _ps_quote(value: str) -> str:
-            return "'" + str(value).replace("'", "''") + "'"
+        # Do not use a detached PowerShell process here. It can exit without
+        # launching the child (policy/endpoint controls) while Popen still
+        # reports success. A tiny cmd launcher is independent of PowerShell,
+        # waits until the old process has exited, then removes itself.
+        command_line = subprocess.list2cmdline([target, *launch_args])
+        fd, launcher_path = tempfile.mkstemp(prefix="zerowatch_restart_", suffix=".cmd")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\r\n") as launcher:
+            launcher.write("@echo off\r\n")
+            launcher.write("timeout /t 5 /nobreak >nul\r\n")
+            launcher.write(f"start \"\" /b {command_line}\r\n")
+            launcher.write("del \"%~f0\"\r\n")
 
-        escaped_target = _ps_quote(target)
-        escaped_args = "@(" + ",".join(_ps_quote(arg) for arg in launch_args) + ")"
-        escaped_workdir = _ps_quote(os.path.dirname(os.path.abspath(current_exe)))
-        ps_script = (
-            f"$target = {escaped_target}; "
-            f"$args = {escaped_args}; "
-            "Start-Sleep -Seconds 5; "
-            f"Start-Process -FilePath $target -ArgumentList $args -WorkingDirectory {escaped_workdir}"
-        )
-        import base64
-        encoded = base64.b64encode(ps_script.encode("utf-16le")).decode("ascii")
-        ps_exe = os.path.join(
-            os.environ.get("WINDIR", r"C:\Windows"),
-            "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
-        )
-        if not os.path.exists(ps_exe):
-            ps_exe = "powershell.exe"
+        cmd_exe = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 0
         subprocess.Popen(
-            [ps_exe, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
-             "-EncodedCommand", encoded],
+            [cmd_exe, "/d", "/c", launcher_path],
             creationflags=detached | new_group | subprocess.CREATE_NO_WINDOW,
             startupinfo=si,
             close_fds=True,
         )
-        logger.info("[WIN SWAP] Scheduled hidden delayed relaunch for: %s", current_exe)
+        logger.info("[WIN SWAP] Scheduled cmd-based delayed relaunch for: %s", current_exe)
         return True
     except Exception as exc:
         logger.warning("[WIN SWAP] Failed to re-launch new binary: %s", exc)
