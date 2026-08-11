@@ -210,7 +210,10 @@ if /I "%BUILD_STYLE%"=="onefile" (
     if not exist "!TCL_ROOT!\tcl8.6\init.tcl" if not exist "!TCL_ROOT!\init.tcl" (
         echo [WARN] Tcl library not found at standard path !TCL_ROOT!, relying on Nuitka tk-inter plugin auto-detection...
     )
-    set "STYLE_FLAGS=--onefile --onefile-no-compression --enable-plugin=tk-inter --onefile-tempdir-spec={CACHE_DIR}/ZeroWatch/extracted"
+    rem Compress the outer onefile launcher so it does not retain a second
+    rem full, uncompressed runtime on disk. The shared cache still lets the
+    rem GUI, daemon, and watchdog reuse one extracted runtime.
+    set "STYLE_FLAGS=--onefile --enable-plugin=tk-inter --onefile-tempdir-spec={CACHE_DIR}/ZeroWatch/extracted"
 ) else (
     set "STYLE_FLAGS=--standalone --enable-plugin=tk-inter"
 )

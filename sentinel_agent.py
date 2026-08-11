@@ -1625,6 +1625,13 @@ class ZeroWatchClient:
             return False, None, f"unsupported method {method}"
 
         self.last_server_status = resp.status_code
+        try:
+            data = self._parse_server_payload(resp)
+            if self._handle_unlinked_response(resp, data):
+                return False, resp.status_code, "unlinked"
+        except Exception:
+            pass
+
         if self._is_acknowledged_response(resp):
             return True, resp.status_code, None
 
@@ -1661,6 +1668,9 @@ class ZeroWatchClient:
                 ok, status_code, error_text = self._send_queue_item(item)
                 if ok:
                     flushed += 1
+                elif error_text == "unlinked":
+                    # Break out and stop processing immediately, since local state is now cleared
+                    break
                 else:
                     retry_count = int(item.get("retry_count") or 0) + 1
                     backoff = min(900, OFFLINE_FLUSH_MIN_INTERVAL * (2 ** min(retry_count, 6)))
@@ -4948,17 +4958,17 @@ def show_windows_notification(title, message):
             'Start-Sleep -Seconds 5;'
             '$objNotifyIcon.Dispose();'
         )
-        import shutil
-        ps_exe = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-        zw_exe = os.path.join(temp_dir, "SentinelAgent.exe")
-        try:
-            if not os.path.exists(zw_exe):
-                shutil.copy2(ps_exe, zw_exe)
-            ps_path = zw_exe
-        except Exception:
-            ps_path = "powershell"
-        
-        # Run powershell detached
+        # Do not copy PowerShell into TEMP under the agent's name. Apart from
+        # leaving an unnecessary executable behind, that made the onefile
+        # extraction directory look like it contained a second agent.
+        ps_path = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"),
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+        )
+        if not os.path.isfile(ps_path):
+            ps_path = "powershell.exe"
+
+        # Run PowerShell detached.
         subprocess.Popen([ps_path, "-WindowStyle", "Hidden", "-Command", ps_script], 
                          creationflags=subprocess.CREATE_NO_WINDOW)
         
@@ -4969,6 +4979,9 @@ def show_windows_notification(title, message):
 def hide_console():
     """Hides the console window so the agent runs invisibly."""
     if sys.platform != "win32":
+        return
+    if "--dev" in sys.argv or "--no-hide" in sys.argv or os.environ.get("ZEROWATCH_DEV_MODE") == "1":
+        print("[CONSOLE LOG] Skipping console hiding (debug/dev mode active).")
         return
     whnd = ctypes.windll.kernel32.GetConsoleWindow()
     if whnd != 0:

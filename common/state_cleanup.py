@@ -17,6 +17,7 @@ def clear_device_state(state_dir: str) -> None:
         "consent_accepted.dat", "device_fingerprint.json", "products.csv",
         "dashboard_cache.dat", "asset_info.json", "unlink.signal",
         "shutdown.signal", "sentinel_agent.log",
+        "agent_token.enc", "join_state.json",
     }
     paths = [os.path.join(state_dir, name) for name in names]
     paths.extend(glob.glob(os.path.join(state_dir, "scan_cache.db*")))
