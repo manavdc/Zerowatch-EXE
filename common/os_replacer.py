@@ -33,7 +33,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from typing import Callable, Optional
@@ -177,7 +176,7 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
 
 
 def _relaunch_detached(current_exe: str) -> bool:
-    """Schedule a hidden, delayed launch of the newly installed executable."""
+    """Launch the replacement agent after the current Windows process exits."""
     if sys.platform != "win32":
         try:
             subprocess.Popen(
@@ -207,29 +206,24 @@ def _relaunch_detached(current_exe: str) -> bool:
             target = current_exe
             launch_args = list(sys.argv[1:])
 
-        # Do not use a detached PowerShell process here. It can exit without
-        # launching the child (policy/endpoint controls) while Popen still
-        # reports success. A tiny cmd launcher is independent of PowerShell,
-        # waits until the old process has exited, then removes itself.
-        command_line = subprocess.list2cmdline([target, *launch_args])
-        fd, launcher_path = tempfile.mkstemp(prefix="zerowatch_restart_", suffix=".cmd")
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\r\n") as launcher:
-            launcher.write("@echo off\r\n")
-            launcher.write("timeout /t 5 /nobreak >nul\r\n")
-            launcher.write(f"start \"\" /b {command_line}\r\n")
-            launcher.write("del \"%~f0\"\r\n")
-
-        cmd_exe = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+        # Start the replacement directly instead of through PowerShell/cmd.
+        # Its entry point waits on this PID before doing any agent work, so it
+        # cannot race the old GUI, daemon, or watchdog shutdown.
+        launch_args.extend(["--restart-wait-pid", str(os.getpid())])
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 0
-        subprocess.Popen(
-            [cmd_exe, "/d", "/c", launcher_path],
+        child = subprocess.Popen(
+            [target, *launch_args],
             creationflags=detached | new_group | subprocess.CREATE_NO_WINDOW,
             startupinfo=si,
             close_fds=True,
+            cwd=os.path.dirname(os.path.abspath(current_exe)) or None,
         )
-        logger.info("[WIN SWAP] Scheduled cmd-based delayed relaunch for: %s", current_exe)
+        logger.info(
+            "[WIN SWAP] Started replacement PID %s; waiting for parent PID %s.",
+            child.pid, os.getpid(),
+        )
         return True
     except Exception as exc:
         logger.warning("[WIN SWAP] Failed to re-launch new binary: %s", exc)

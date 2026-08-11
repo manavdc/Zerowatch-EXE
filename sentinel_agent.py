@@ -7521,6 +7521,37 @@ def run_interactive():
                 pass
         sys.exit(1)
 
+def _wait_for_restart_parent() -> None:
+    """On Windows, defer startup until the OTA parent process has exited."""
+    flag = "--restart-wait-pid"
+    if sys.platform != "win32" or flag not in sys.argv:
+        return
+    try:
+        index = sys.argv.index(flag)
+        parent_pid = int(sys.argv[index + 1])
+        del sys.argv[index:index + 2]
+    except (IndexError, ValueError):
+        logging.warning("[OTA] Ignoring malformed restart parent argument.")
+        return
+
+    if parent_pid <= 0 or parent_pid == os.getpid():
+        return
+    try:
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x00000102
+        parent = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, parent_pid)
+        if not parent:
+            return  # The parent already exited before this process started.
+        try:
+            result = ctypes.windll.kernel32.WaitForSingleObject(parent, 30000)
+            if result == WAIT_TIMEOUT:
+                logging.warning("[OTA] Timed out waiting for restart parent PID %s.", parent_pid)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(parent)
+    except Exception as exc:
+        logging.warning("[OTA] Could not wait for restart parent PID %s: %s", parent_pid, exc)
+
+
 def main():
     """
     Entry point resolver. The same binary serves multiple purposes:
@@ -7531,6 +7562,10 @@ def main():
       --watchdog          -> Internal watchdog process
       (default)           -> Interactive routing (Enroll -> Dashboard)
     """
+    # A Windows OTA child starts immediately, then waits here until the old
+    # process releases all executable and agent resources.
+    _wait_for_restart_parent()
+
     # 1. Immediate Console Hiding
     if "--password-prompt" not in sys.argv and "--reset" not in sys.argv:
         hide_console()
