@@ -171,11 +171,12 @@ def _parse_reference_token(token: bytes) -> Optional[str]:
     try:
         slot_id = slot_part.decode("ascii")
     except UnicodeDecodeError:
-        logger.error("Reference token contains non-ASCII slot_id — corrupt reference")
+        logger.warning("Reference token contains non-ASCII slot_id — likely an old-format or cross-platform token (not a macOS ZW_KC token)")
         return None
     if len(slot_id) != _SLOT_ID_HEX_LEN:
-        logger.error(
-            "Reference token slot_id has wrong length (expected %d, got %d) — corrupt",
+        logger.warning(
+            "Reference token slot_id has wrong length (expected %d, got %d) — "
+            "likely a stale token from a previous enrollment or different platform",
             _SLOT_ID_HEX_LEN, len(slot_id),
         )
         return None
@@ -183,7 +184,7 @@ def _parse_reference_token(token: bytes) -> Optional[str]:
     try:
         int(slot_id, 16)
     except ValueError:
-        logger.error("Reference token slot_id is not valid hex — corrupt reference")
+        logger.warning("Reference token slot_id is not valid hex — likely a stale token from a previous enrollment")
         return None
     return slot_id
 

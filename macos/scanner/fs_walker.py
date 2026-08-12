@@ -156,6 +156,8 @@ SYSTEM_SCAN_ROOTS: List[str] = [
     "/Library",
     "/usr/local",
     "/opt",
+    "/usr/local/lib",    # Intel Homebrew dylibs
+    "/opt/homebrew/lib", # Apple Silicon Homebrew dylibs
 ]
 
 # User-space scan roots (expanded per running user at call time)
@@ -170,18 +172,49 @@ _USER_SCAN_ROOTS_TEMPLATES: List[str] = [
     ".local",           # ~/.local (pip install --user etc.)
 ]
 
+# System users to skip when enumerating /Users/* as root
+_SYSTEM_USER_NAMES: FrozenSet[str] = frozenset({
+    "shared", "guest",
+})
+
 
 def _get_user_scan_dirs() -> List[str]:
     """
     Return per-user scan directories that actually exist.
-    Reads HOME from the environment without assuming a specific username.
+
+    Non-root: reads HOME from the environment for the current user.
+    Root (daemon via sudo): scans /Users/* to cover every human account on the
+    machine, since HOME=/var/root has no user software.
     """
     home = os.environ.get("HOME") or os.path.expanduser("~")
     dirs = []
-    for rel in _USER_SCAN_ROOTS_TEMPLATES:
-        p = os.path.join(home, rel)
-        if os.path.isdir(p):
-            dirs.append(p)
+
+    # When running as root, enumerate all human user home dirs under /Users/
+    home_dirs: List[str] = []
+    if os.geteuid() == 0:
+        users_root = "/Users"
+        if os.path.isdir(users_root):
+            try:
+                with os.scandir(users_root) as it:
+                    for entry in it:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        # Skip system/service accounts
+                        if entry.name.startswith("_") or entry.name.lower() in _SYSTEM_USER_NAMES:
+                            continue
+                        home_dirs.append(entry.path)
+            except OSError:
+                pass
+    # Always include the current HOME (fallback for non-root or /Users missing)
+    if home and home not in home_dirs:
+        home_dirs.append(home)
+
+    for user_home in home_dirs:
+        for rel in _USER_SCAN_ROOTS_TEMPLATES:
+            p = os.path.join(user_home, rel)
+            if os.path.isdir(p):
+                dirs.append(p)
+
     return dirs
 
 

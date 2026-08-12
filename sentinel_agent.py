@@ -345,9 +345,27 @@ def _secure_state_dir(base_dir):
         if program_data:
             return os.path.join(program_data, "ZeroWatch", "state")
     elif sys.platform == "darwin":
-        is_root = (os.geteuid() == 0) if hasattr(os, "geteuid") else False
-        if is_root:
-            return "/Library/Application Support/ZeroWatch/state"
+        # Canonical shared path: both root and non-root use the same directory.
+        # This ensures the GUI agent and the daemon agent share the same state
+        # (JWT, enrollment, fingerprint) regardless of how the agent is launched.
+        canonical = "/Library/Application Support/ZeroWatch/state"
+        try:
+            os.makedirs(canonical, mode=0o755, exist_ok=True)
+            # Set sticky + world-writable on first creation (root context)
+            try:
+                current_mode = os.stat(canonical).st_mode & 0o7777
+                if current_mode != 0o1777:
+                    os.chmod(canonical, 0o1777)
+            except OSError:
+                pass
+            _probe = os.path.join(canonical, ".write_probe")
+            with open(_probe, "w") as _fh:
+                _fh.write("x")
+            os.remove(_probe)
+            return canonical
+        except OSError:
+            pass
+        # Fallback: per-user dir if /Library is not writable (non-admin user)
         return os.path.expanduser("~/Library/Application Support/ZeroWatch/state")
     elif sys.platform.startswith("linux"):
         # If ZEROWATCH_STATE_DIR is explicitly set, honour it unconditionally.
@@ -2229,7 +2247,12 @@ class ZeroWatchClient:
 # ---------------------------------------------------------------------------
 def get_exe_path():
     """Returns the absolute path to the current executable."""
-    # 1. Try Nuitka's original argv0 first (most robust for onefile)
+    # 1. PyInstaller onefile: _MEIPASS is set to the temp extraction dir.
+    #    sys.argv[0] is the real outer binary — always prefer it here.
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        return os.path.abspath(sys.argv[0])
+
+    # 2. Try Nuitka's original argv0 first (most robust for onefile)
     try:
         if "__compiled__" in globals():
             orig = getattr(__compiled__, "original_argv0", None)
@@ -2238,7 +2261,7 @@ def get_exe_path():
     except Exception:
         pass
 
-    # 2. Try sys.modules['__main__'] __compiled__ original_argv0
+    # 3. Try sys.modules['__main__'] __compiled__ original_argv0
     try:
         import sys
         main_mod = sys.modules.get('__main__')
@@ -2250,20 +2273,29 @@ def get_exe_path():
     except Exception:
         pass
 
-    # 3. Fallback to sys.argv[0] if it looks like an executable (and is NOT the temp extraction folder)
+    # 4. Fallback to sys.argv[0] if it looks like an executable (and is NOT a temp extraction folder)
     if sys.argv[0]:
         argv0_abs = os.path.abspath(sys.argv[0])
-        # Make sure it's not the temp extraction directory python.exe
-        is_temp_path = "ZeroWatch/extracted" in argv0_abs.replace("\\", "/") or "ZeroWatch\\extracted" in argv0_abs
-        if (argv0_abs.endswith('.exe') or not argv0_abs.endswith('.py')) and not is_temp_path:
+        # Reject PyInstaller onefile temp extraction paths (/tmp/onefile_* or Windows %TEMP%\onefile_*)
+        is_pyinstaller_temp = (
+            "/tmp/onefile_" in argv0_abs.replace("\\", "/")
+            or "\\Temp\\onefile_" in argv0_abs
+            or "\\tmp\\onefile_" in argv0_abs.lower()
+        )
+        is_zerowatch_temp = (
+            "ZeroWatch/extracted" in argv0_abs.replace("\\", "/")
+            or "ZeroWatch\\extracted" in argv0_abs
+        )
+        if (argv0_abs.endswith('.exe') or not argv0_abs.endswith('.py')) and not is_pyinstaller_temp and not is_zerowatch_temp:
             return argv0_abs
 
-    # 4. Fallback to sys.executable if compiled
+    # 5. Fallback to sys.executable if compiled
     if "__compiled__" in globals():
         return os.path.abspath(sys.executable)
 
-    # 5. Ultimate fallback to __file__
+    # 6. Ultimate fallback to __file__
     return os.path.abspath(__file__)
+
 
 
 def get_base_dir():

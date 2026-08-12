@@ -136,26 +136,64 @@ _SHARED_IDENTITY_FILES = (
 
 def _get_state_dir() -> str:
     """
-    Return the best available writable state directory.
-    Order: /var/lib/zerowatch/state → ~/.local/share/zerowatch/state → ./state/
+    Return the canonical shared state directory for ZeroWatch on macOS.
+
+    Primary path: /Library/Application Support/ZeroWatch/state
+    This is the SAME path regardless of whether the agent runs as root (sudo)
+    or as a normal user. Using a single shared directory ensures:
+      - Only one enrollment ever exists per machine
+      - JWT, fingerprint, and join-state are shared between invocations
+      - No duplicate device registrations when the user switches between
+        `sudo ./agent` and `./agent`
+
+    Permissions:
+      On first creation (as root), the directory is set to 0o1777 (sticky,
+      world-writable) so non-root users can also read/write their own files.
+      This is the same model used by /tmp on macOS.
+
+    Fallback chain (only if /Library/Application Support is not accessible):
+      /var/lib/zerowatch/state  → ~/.local/share/zerowatch/state  → ./state/
     """
+    # ── Primary: /Library/Application Support/ZeroWatch/state ───────────
+    canonical = "/Library/Application Support/ZeroWatch/state"
+    try:
+        os.makedirs(canonical, mode=0o755, exist_ok=True)
+        # Set sticky + world-writable so both root and user can access it.
+        # Only try chmod if we own the dir (root context) to avoid
+        # unnecessary PermissionErrors.
+        try:
+            current_mode = os.stat(canonical).st_mode & 0o7777
+            if current_mode != 0o1777:
+                os.chmod(canonical, 0o1777)
+        except OSError:
+            pass
+        # Verify it's writable
+        _probe = os.path.join(canonical, ".write_probe")
+        with open(_probe, "w") as _fh:
+            _fh.write("x")
+        os.remove(_probe)
+        return canonical
+    except OSError:
+        pass  # Fall through to legacy paths
+
+    # ── Legacy fallback chain (maintains backward compat) ───────────────
     base = os.path.dirname(os.path.abspath(__file__))
     system_dir = "/var/lib/zerowatch/state"
     user_dir   = os.path.expanduser("~/.local/share/zerowatch/state")
     local_dir  = os.path.join(base, "state")
 
-    # ── Try system dir first (preferred — consistent across UIDs) ──────
+    # Try system dir first (consistent across UIDs)
     try:
         os.makedirs(system_dir, mode=0o700, exist_ok=True)
         _probe = os.path.join(system_dir, ".write_probe")
         with open(_probe, "w") as _fh:
             _fh.write("x")
         os.remove(_probe)
-        return system_dir                          # writable → use it
+        return system_dir
     except OSError:
-        pass  # root-owned or missing; fall through to user-dir
+        pass
 
-    # ── System dir not writable. Find the first user-writable fallback ─
+    # User-writable fallback
     for fallback in (user_dir, local_dir):
         try:
             os.makedirs(fallback, mode=0o700, exist_ok=True)
@@ -166,7 +204,7 @@ def _get_state_dir() -> str:
         except OSError:
             continue
 
-        # ── Migrate identity files from the unwritable system dir ───
+        # Migrate identity files from system dir if possible
         if os.path.isdir(system_dir):
             migrated = []
             for name in _SHARED_IDENTITY_FILES:
@@ -187,16 +225,67 @@ def _get_state_dir() -> str:
                     system_dir, fallback, ", ".join(migrated), system_dir,
                 )
             else:
-                logger.info(
-                    "%s not writable; using %s instead.",
-                    system_dir, fallback,
-                )
+                logger.info("%s not writable; using %s instead.", system_dir, fallback)
 
         return fallback
 
-    # Last-resort — return local dir without write verification
     return local_dir
 
+
+# ── Single-instance lock ───────────────────────────────────────────────
+
+_LOCK_FILE_PATH = "/Library/Application Support/ZeroWatch/state/.zerowatch.lock"
+_lock_fh = None   # module-level handle — keeps fd open for the process lifetime
+
+
+def _acquire_single_instance_lock() -> bool:
+    """
+    Acquire an exclusive non-blocking flock on the ZeroWatch lock file.
+
+    Returns True if this process is the only running instance.
+    Returns False if another instance already holds the lock — caller should exit.
+
+    The lock is automatically released when the process exits (fd closed by OS).
+    Works across both root and normal-user invocations because the lock file
+    lives in the shared state directory.
+    """
+    global _lock_fh
+    import fcntl
+
+    lock_path = _LOCK_FILE_PATH
+    try:
+        os.makedirs(os.path.dirname(lock_path), mode=0o1777, exist_ok=True)
+    except OSError:
+        pass
+
+    try:
+        _lock_fh = open(lock_path, "w")
+        # Ensure lock file is readable by any user
+        try:
+            os.chmod(lock_path, 0o666)
+        except OSError:
+            pass
+        fcntl.flock(_lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Write our PID for diagnostic purposes
+        _lock_fh.write(str(os.getpid()) + "\n")
+        _lock_fh.flush()
+        return True
+    except BlockingIOError:
+        # Another instance holds the lock
+        try:
+            pid = open(lock_path).read().strip()
+        except OSError:
+            pid = "unknown"
+        logger.error(
+            "ZeroWatch agent is already running (pid=%s). "
+            "Only one instance may run at a time. Exiting.",
+            pid,
+        )
+        return False
+    except OSError as exc:
+        # Lock file not writable (edge case) — log and continue without lock
+        logger.warning("Could not acquire instance lock (%s) — proceeding without lock", exc)
+        return True
 
 
 # ── FDA check: detect if Full Disk Access is likely missing ───────────────────
@@ -276,10 +365,20 @@ class MacOSAgentSession:
         Encrypt via MacOSSecureStore (Keychain tagged-reference).
         Falls back to None if Keychain is unavailable (e.g. not on macOS,
         or Keychain locked in daemon context without FDA).
+
+        Always validates the returned token before returning — prevents writing
+        corrupt non-token bytes to disk which would cause decrypt failures later.
         """
         try:
             result = self._platform.secure_store.encrypt(data)
             if result is not None:
+                # Validate the token is a proper ZW_KC reference or RAW fallback
+                if not (result.startswith(b"ZW_KC::") or result.startswith(b"RAW::")):
+                    logger.error(
+                        "encrypt() returned unexpected token format (len=%d) — "
+                        "discarding to prevent corrupt disk state", len(result)
+                    )
+                    return None
                 return result
             # Keychain unavailable — store raw bytes as base64 in state dir
             logger.warning(
@@ -817,6 +916,13 @@ def main() -> int:
     if not BASE_API_URL:
         print("[ERROR] No API URL configured.")
         print("        Run via run_agent.sh or set ZEROWATCH_API_URL environment variable.")
+        return 1
+
+    # ── Single-instance guard ─────────────────────────────────────────────────
+    # Ensures that only one copy of the agent runs at a time, whether launched
+    # as root (sudo) or as a normal user. The second invocation exits cleanly.
+    _configure_logging()
+    if not _acquire_single_instance_lock():
         return 1
 
     agent = MacOSAgent()

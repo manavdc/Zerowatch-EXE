@@ -216,9 +216,29 @@ def collect_app_bundles() -> List[SoftwareItem]:
     """
     Scan all known Application directories for .app bundles.
     Reads Info.plist via plistlib — no external processes.
+
+    When running as root (daemon via sudo), also scans /Users/*/Applications
+    since each user may have apps installed in their own home directory.
     """
+    scan_dirs = list(_app_dirs_to_scan())
+
+    # When running as root, add every human user's ~/Applications
+    if os.geteuid() == 0:
+        try:
+            with os.scandir("/Users") as it:
+                for entry in it:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if entry.name.startswith("_") or entry.name.lower() in ("shared", "guest"):
+                        continue
+                    user_apps = os.path.join(entry.path, "Applications")
+                    if os.path.isdir(user_apps) and user_apps not in scan_dirs:
+                        scan_dirs.append(user_apps)
+        except OSError:
+            pass
+
     items: List[SoftwareItem] = []
-    for app_dir in _app_dirs_to_scan():
+    for app_dir in scan_dirs:
         try:
             batch = _scan_app_dir(app_dir)
             items.extend(batch)
@@ -330,12 +350,39 @@ def collect_pkgutil() -> List[SoftwareItem]:
 
 # ── C. Homebrew ───────────────────────────────────────────────────────────────
 
-# Explicit paths — not assumed to be in $PATH when running as a daemon
+# Explicit paths — not assumed to be in $PATH when running as a daemon.
+# Covers Apple Silicon (/opt/homebrew), Intel (/usr/local), and per-user installs.
 _BREW_PATHS = [
-    "/opt/homebrew/bin/brew",   # Apple Silicon
-    "/usr/local/bin/brew",       # Intel
+    "/opt/homebrew/bin/brew",   # Apple Silicon (system-wide)
+    "/usr/local/bin/brew",       # Intel (system-wide)
     "/home/linuxbrew/.linuxbrew/bin/brew",  # Linuxbrew (guard for cross-platform)
 ]
+
+
+def _all_user_brew_paths() -> list:
+    """
+    When running as root, enumerate possible per-user Homebrew installations.
+    Returns a list of candidate brew binary paths from all human user home dirs.
+    """
+    candidates = []
+    try:
+        users_dir = "/Users"
+        if not os.path.isdir(users_dir):
+            return candidates
+        with os.scandir(users_dir) as it:
+            for entry in it:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                # Skip system users (start with _) and shared/guest
+                if entry.name.startswith("_") or entry.name.lower() in ("shared", "guest"):
+                    continue
+                for rel in ("/opt/homebrew/bin/brew", "/.homebrew/bin/brew"):
+                    p = entry.path + rel
+                    if os.path.isfile(p) and os.access(p, os.X_OK):
+                        candidates.append((entry.name, p))
+    except OSError:
+        pass
+    return candidates
 
 
 def _find_brew() -> Optional[str]:
@@ -346,9 +393,52 @@ def _find_brew() -> Optional[str]:
     return shutil.which("brew")  # Final fallback for interactive shells
 
 
-def _brew_json_info(brew: str) -> str:
-    """Run `brew info --json=v2 --installed` and return stdout."""
-    return _run([brew, "info", "--json=v2", "--installed"], timeout=60)
+def _brew_env() -> dict:
+    """Build a safe environment for running brew, suppressing auto-update."""
+    env = dict(os.environ)
+    env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+    env["HOMEBREW_NO_ENV_HINTS"] = "1"
+    env["HOMEBREW_NO_COLOR"] = "1"
+    # Ensure Homebrew paths are in PATH
+    path = env.get("PATH", "")
+    for p in ("/opt/homebrew/bin", "/usr/local/bin"):
+        if p not in path:
+            path = p + ":" + path
+    env["PATH"] = path
+    return env
+
+
+def _brew_json_info(brew: str, run_as_user: Optional[str] = None) -> str:
+    """
+    Run `brew info --json=v2 --installed` and return stdout.
+    When run_as_user is set (root context), uses `sudo -u <user> -H` so Homebrew
+    doesn't complain about running as root.
+    """
+    env = _brew_env()
+    if run_as_user:
+        cmd = ["sudo", "-u", run_as_user, "-H", brew, "info", "--json=v2", "--installed"]
+    else:
+        cmd = [brew, "info", "--json=v2", "--installed"]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        if result.returncode == 0:
+            return result.stdout
+        logger.debug("brew info exited %d: %s", result.returncode, result.stderr[:300])
+        return ""
+    except FileNotFoundError:
+        return ""
+    except subprocess.TimeoutExpired:
+        logger.warning("brew info timed out after 60s")
+        return ""
+    except OSError as exc:
+        logger.debug("brew info OS error: %s", exc)
+        return ""
 
 
 def collect_homebrew() -> List[SoftwareItem]:
@@ -358,17 +448,68 @@ def collect_homebrew() -> List[SoftwareItem]:
     Uses `brew info --json=v2 --installed` which returns structured JSON
     instead of human-oriented terminal output. Falls back gracefully
     if Homebrew is not installed.
+
+    When running as root (daemon context via sudo), Homebrew refuses to run.
+    In that case we enumerate per-user Homebrew installations under /Users/*/
+    and run brew as each user via `sudo -u <user> -H brew ...`.
     """
+    running_as_root = (os.geteuid() == 0)
+    all_items: List[SoftwareItem] = []
+    sources_tried = 0
+
+    # ── Non-root path (normal interactive user) ───────────────────────────
+    if not running_as_root:
+        brew = _find_brew()
+        if not brew:
+            logger.debug("Homebrew not found — skipping Homebrew collection")
+            return []
+        raw = _brew_json_info(brew)
+        if not raw:
+            logger.info("brew info returned no output (Homebrew installed but no packages, or Homebrew issue)")
+            return []
+        return _parse_brew_json(raw)
+
+    # ── Root path: try system-wide brew first, then per-user ─────────────
+    # System-wide brew (Apple Silicon: /opt/homebrew, Intel: /usr/local)
     brew = _find_brew()
-    if not brew:
-        logger.debug("Homebrew not found — skipping Homebrew collection")
-        return []
+    if brew:
+        raw = _brew_json_info(brew)
+        if raw:
+            items = _parse_brew_json(raw)
+            if items:
+                all_items.extend(items)
+                sources_tried += 1
 
-    raw = _brew_json_info(brew)
-    if not raw:
-        logger.warning("brew info returned no output")
-        return []
+    # Per-user Homebrew installations (common on developer machines)
+    for username, user_brew in _all_user_brew_paths():
+        if user_brew == brew:
+            continue  # already tried this path above
+        raw = _brew_json_info(user_brew, run_as_user=username)
+        if raw:
+            items = _parse_brew_json(raw)
+            if items:
+                all_items.extend(items)
+                sources_tried += 1
+                logger.debug("Homebrew: collected %d items from user %s", len(items), username)
 
+    if sources_tried == 0:
+        logger.info("Homebrew: not installed or no packages found (running as root — checked system-wide and per-user paths)")
+
+    # Deduplicate by dedup_key
+    seen: set = set()
+    deduped: List[SoftwareItem] = []
+    for item in all_items:
+        k = item.dedup_key() if hasattr(item, "dedup_key") else (item.name, item.version)
+        if k not in seen:
+            seen.add(k)
+            deduped.append(item)
+
+    logger.info("collect_homebrew: %d formulae + casks", len(deduped))
+    return deduped
+
+
+def _parse_brew_json(raw: str) -> List[SoftwareItem]:
+    """Parse the JSON output of `brew info --json=v2 --installed` into SoftwareItems."""
     items: List[SoftwareItem] = []
     try:
         data = json.loads(raw)
@@ -376,13 +517,12 @@ def collect_homebrew() -> List[SoftwareItem]:
         logger.warning("brew info JSON parse failed: %s", exc)
         return []
 
-    # ── Formulae ──────────────────────────────────────────────────────────────
+    # ── Formulae ─────────────────────────────────────────────────────────
     for formula in data.get("formulae", []):
         try:
             name = formula.get("name") or formula.get("full_name") or ""
             if not name:
                 continue
-            # installed versions — may be a list of {"version": ...} dicts
             installed = formula.get("installed", [])
             version = installed[0].get("version", "") if installed else ""
 
@@ -397,11 +537,10 @@ def collect_homebrew() -> List[SoftwareItem]:
         except Exception as exc:
             logger.debug("Homebrew formula parse failed: %s", exc)
 
-    # ── Casks ─────────────────────────────────────────────────────────────────
+    # ── Casks ─────────────────────────────────────────────────────────────
     for cask in data.get("casks", []):
         try:
             name = cask.get("name")
-            # 'name' field in casks is a list; token/full_name is the ID
             if isinstance(name, list):
                 display_name = name[0] if name else ""
             else:
@@ -424,10 +563,6 @@ def collect_homebrew() -> List[SoftwareItem]:
         except Exception as exc:
             logger.debug("Homebrew cask parse failed: %s", exc)
 
-    logger.info(
-        "collect_homebrew: %d formulae + casks",
-        len(items),
-    )
     return items
 
 
