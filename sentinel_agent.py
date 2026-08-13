@@ -7207,7 +7207,6 @@ class UnifiedSentinelGUI(tk.Tk):
         # Set icon if available
         try:
             import os
-            import sys
             
             # Possible locations for the icon file
             if sys.platform == "win32":
