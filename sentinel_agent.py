@@ -7524,6 +7524,33 @@ def prompt_consent(base_dir, force_show=False):
 
 def run_interactive():
     """Redesigned interactive entry point."""
+    # ── Headless Linux / macOS guard ─────────────────────────────────────────
+    # On Linux and macOS the binary is intended to run as a background daemon.
+    # If no display server is available (headless server, SSH, WSL without
+    # X-forwarding), do not attempt to open a tkinter window — give the user
+    # a clear, actionable message instead of a cryptic TclError.
+    if sys.platform != "win32":
+        has_display = bool(
+            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        )
+        if not has_display:
+            exe = sys.argv[0] if sys.argv else "./SentinelAgent"
+            print("")
+            print("  ZeroWatch SentinelAgent — Headless / CLI mode detected")
+            print("")
+            print("  No display server found ($DISPLAY / $WAYLAND_DISPLAY not set).")
+            print("  The agent runs as a background daemon on Linux and macOS.")
+            print("")
+            print("  ┌─ Quick Start ──────────────────────────────────────────────┐")
+            print(f"  │  sudo {exe} --daemon                                      │")
+            print("  └────────────────────────────────────────────────────────────┘")
+            print("")
+            print("  After the first run, start the background service with:")
+            print("    sudo systemctl start zerowatch-agent     (Linux)")
+            print("    (LaunchDaemon starts automatically on macOS)")
+            print("")
+            sys.exit(0)
+
     if tk is None:
         print("Interactive GUI mode requires tkinter. Please install python3-tk on Linux (e.g., sudo apt install python3-tk).")
         sys.exit(1)
