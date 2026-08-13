@@ -96,6 +96,8 @@ def _build_plist(
       RunAtLoad        — start the daemon immediately when the plist is bootstrapped
       KeepAlive        — launchd respawns the process if it exits unexpectedly
       WorkingDirectory — set to dirname(exe_path) or provided override
+      EnvironmentVariables — forwards ZEROWATCH_API_URL so launchd-managed
+                             restarts connect to the same server as the first run
       StandardOutPath  — stdout log file (if provided)
       StandardErrorPath — stderr log file (if provided)
     """
@@ -111,8 +113,8 @@ def _build_plist(
             if not isinstance(arg, str):
                 raise ValueError(f"daemon_args must be List[str], got {type(arg)}: {arg!r}")
         program_arguments.extend(daemon_args)
-    else:
-        program_arguments.append("--daemon")
+    # Note: no default --daemon flag — the macOS agent always runs its
+    # blocking monitor loop directly and has no CLI argument parser.
 
     plist: dict = {
         "Label":            LAUNCHD_LABEL,
@@ -121,6 +123,12 @@ def _build_plist(
         "KeepAlive":        True,
         "WorkingDirectory": working_dir or os.path.dirname(exe_path) or "/",
     }
+
+    # Persist the API URL so launchd-managed restarts (after reboot or crash)
+    # connect to the same server that was configured at enrollment time.
+    api_url = os.environ.get("ZEROWATCH_API_URL", "").strip()
+    if api_url:
+        plist["EnvironmentVariables"] = {"ZEROWATCH_API_URL": api_url}
 
     if stdout_path:
         plist["StandardOutPath"] = stdout_path

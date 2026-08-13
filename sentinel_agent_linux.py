@@ -205,8 +205,52 @@ def _get_state_dir() -> str:
     return local_dir
 
 
+# ── Single-instance lock ─────────────────────────────────────────────────────
+
+_lock_fh = None   # module-level handle — keeps fd open for the process lifetime
+
+def _acquire_single_instance_lock(state_dir: str) -> bool:
+    """
+    Acquire an exclusive non-blocking flock on the ZeroWatch lock file.
+    Returns True if this process is the only running instance.
+    """
+    global _lock_fh
+    import fcntl
+
+    lock_path = os.path.join(state_dir, ".zerowatch.lock")
+    try:
+        os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+
+    try:
+        _lock_fh = open(lock_path, "w")
+        try:
+            os.chmod(lock_path, 0o666)
+        except OSError:
+            pass
+        fcntl.flock(_lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fh.write(str(os.getpid()) + "\n")
+        _lock_fh.flush()
+        return True
+    except BlockingIOError:
+        try:
+            pid = open(lock_path).read().strip()
+        except OSError:
+            pid = "unknown"
+        logger.error(
+            "ZeroWatch agent is already running (pid=%s). "
+            "Only one instance may run at a time. Exiting.",
+            pid,
+        )
+        return False
+    except OSError as exc:
+        logger.warning("Could not acquire instance lock (%s) — proceeding without lock", exc)
+        return True
+
 
 # ── Device ID ─────────────────────────────────────────────────────────────────
+
 
 def _get_device_id(platform) -> str:
     """Return a stable device ID using the Linux hardware fingerprint."""
@@ -353,10 +397,15 @@ class LinuxAgent:
     Mirrors the Windows agent daemon flow but uses Linux platform implementations.
     """
 
-    def __init__(self):
+    def __init__(self, state_dir: str | None = None):
         _configure_logging()
         self._stop_event = threading.Event()
-        self._state_dir  = _get_state_dir()
+        self._state_dir  = state_dir if state_dir is not None else _get_state_dir()
+
+        # ── Single-instance guard ─────────────────────────────────────────────
+        if not _acquire_single_instance_lock(self._state_dir):
+            sys.exit(1)
+
         logger.info("ZeroWatch Linux Agent %s starting", AGENT_VERSION)
         logger.info("API URL:    %s", BASE_API_URL)
         logger.info("State dir:  %s", self._state_dir)
@@ -386,8 +435,32 @@ class LinuxAgent:
         from linux.protection.process_guard import get_shutdown_event
         self._shutdown_event = get_shutdown_event()
 
+        # Register systemd persistence (runs on first boot, idempotent)
+        self._register_persistence()
+
         # Socket.IO client
         self._sio = None
+
+    # ── Persistence ────────────────────────────────────────────────────────────
+
+    def _register_persistence(self) -> None:
+        """Install the systemd unit so the agent starts on boot."""
+        try:
+            if not self._platform.persistence_manager.is_persistence_active():
+                exe_path = os.path.abspath(sys.argv[0])
+                ok = self._platform.persistence_manager.register_startup(exe_path)
+                if ok:
+                    logger.info("systemd startup registered: agent will start on boot.")
+                else:
+                    logger.warning(
+                        "systemd startup registration failed — may require root privileges. "
+                        "Run with: sudo %s", exe_path
+                    )
+            else:
+                logger.info("systemd startup already registered.")
+        except Exception as exc:
+            logger.debug("Persistence registration skipped: %s", exc)
+
 
     def _register_or_authenticate(self) -> bool:
         """Join the device or authenticate with saved JWT."""

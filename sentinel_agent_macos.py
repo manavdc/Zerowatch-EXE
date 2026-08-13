@@ -515,6 +515,10 @@ class MacOSAgent:
         self._stop_event = threading.Event()
         self._state_dir  = _get_state_dir()
 
+        # ── Single-instance guard ─────────────────────────────────────────────
+        if not _acquire_single_instance_lock():
+            sys.exit(1)
+
         logger.info("ZeroWatch macOS Agent %s starting", AGENT_VERSION)
         logger.info("API URL:   %s", BASE_API_URL)
         logger.info("State dir: %s", self._state_dir)
@@ -916,13 +920,6 @@ def main() -> int:
     if not BASE_API_URL:
         print("[ERROR] No API URL configured.")
         print("        Run via run_agent.sh or set ZEROWATCH_API_URL environment variable.")
-        return 1
-
-    # ── Single-instance guard ─────────────────────────────────────────────────
-    # Ensures that only one copy of the agent runs at a time, whether launched
-    # as root (sudo) or as a normal user. The second invocation exits cleanly.
-    _configure_logging()
-    if not _acquire_single_instance_lock():
         return 1
 
     agent = MacOSAgent()

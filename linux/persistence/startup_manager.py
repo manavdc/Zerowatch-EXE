@@ -40,8 +40,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={exe_path} {args}
-Restart=on-failure
+ExecStart={exe_path}{args}
+{env_line}Restart=on-failure
 RestartSec=15s
 StandardOutput=journal
 StandardError=journal
@@ -74,7 +74,17 @@ def _write_unit(unit_dir: str, exe_path: str, daemon_args: str) -> Optional[str]
     try:
         os.makedirs(unit_dir, mode=0o755, exist_ok=True)
         unit_path = os.path.join(unit_dir, _SERVICE_NAME)
-        content = _UNIT_TEMPLATE.format(exe_path=exe_path, args=daemon_args)
+        # Prepend a space separator only when args are non-empty so ExecStart
+        # does not have a trailing space (which is technically valid for systemd
+        # but untidy and may confuse some tooling).
+        args_suffix = (" " + daemon_args) if daemon_args.strip() else ""
+        # Persist ZEROWATCH_API_URL into the unit so the agent reconnects to
+        # the same server after a reboot when the shell env var is gone.
+        api_url = os.environ.get("ZEROWATCH_API_URL", "").strip()
+        # Place Environment= on its own line before Restart=.
+        # When no URL is set (production binary), env_line is empty string.
+        env_line = f"Environment=ZEROWATCH_API_URL={api_url}\n" if api_url else ""
+        content = _UNIT_TEMPLATE.format(exe_path=exe_path, args=args_suffix, env_line=env_line)
         with open(unit_path, "w", encoding="utf-8") as fh:
             fh.write(content)
         os.chmod(unit_path, 0o644)
@@ -93,7 +103,10 @@ class LinuxPersistenceManager(PersistenceManager):
         exe_path: str,
         daemon_args: Optional[List[str]] = None,
     ) -> bool:
-        args_str = " ".join(daemon_args) if daemon_args else "--daemon"
+        # The Linux agent binary has no --daemon flag — it always runs its
+        # blocking monitor loop directly.  Pass an empty string so ExecStart
+        # only contains the binary path.
+        args_str = " ".join(daemon_args) if daemon_args else ""
 
         # Try system-wide install (requires root)
         unit_path = _write_unit(_SYSTEM_UNIT_DIR, exe_path, args_str)
@@ -140,3 +153,10 @@ class LinuxPersistenceManager(PersistenceManager):
             success = True
 
         return success
+
+    def is_persistence_active(self) -> bool:
+        """Check whether the systemd unit file is currently installed on disk."""
+        system_path = os.path.join(_SYSTEM_UNIT_DIR, _SERVICE_NAME)
+        user_path = os.path.join(_USER_UNIT_DIR_TEMPLATE, _SERVICE_NAME)
+        return os.path.isfile(system_path) or os.path.isfile(user_path)
+

@@ -22,3 +22,9 @@ class PersistenceManager(ABC):
     def unregister_startup(self) -> bool:
         """Remove agent executable from system automatic startup mechanisms."""
         ...
+
+    @abstractmethod
+    def is_persistence_active(self) -> bool:
+        """Check whether persistence registration is currently active/installed on disk."""
+        ...
+
