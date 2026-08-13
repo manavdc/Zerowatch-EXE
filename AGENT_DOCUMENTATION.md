@@ -1,6 +1,6 @@
 # SentinelAgent Endpoint Sensor Documentation
 
-This document provides a comprehensive, in‑depth overview of the Windows endpoint agent code located in `endpoint_agent/`. The primary implementation is `sentinel_agent.py`. A lightweight prototype (`agent.py`) is also included but is no longer used by the build pipeline.
+This document provides a comprehensive, in‑depth overview of the cross-platform endpoint agent code located in `Endpoint-Agent/`. The primary platform entry points are [sentinel_agent.py](file:///e:/Deepcytes/Endpoint-Agent/sentinel_agent.py) (Windows), [sentinel_agent_linux.py](file:///e:/Deepcytes/Endpoint-Agent/sentinel_agent_linux.py) (Linux), and [sentinel_agent_macos.py](file:///e:/Deepcytes/Endpoint-Agent/sentinel_agent_macos.py) (macOS). A lightweight prototype (`agent.py`) is also included but is no longer used by the build pipeline.
 
 > **Note:** build artifacts (`.exe`, build directories) are not documented here; they are generated automatically by the build script and are implicit from the source code.
 
@@ -340,7 +340,28 @@ methods above.
 
 ---
 
-The above description should provide exhaustive insight into every
-function, flow control decision, and interaction within the endpoint
-agent codebase. Use this as reference when debugging, extending, or
-integrating the agent with the backend.
+## 10. Cross-Platform Support (Linux & macOS)
+
+To support non-Windows endpoints, the agent includes dedicated entry points and platform compositions for Linux and macOS. The core orchestrator (`scanner/fs_walker.py`, `scanner/orchestrator.py`) remains platform-agnostic, while platform-specific behaviors are composed via a `PlatformFactory`.
+
+### 10.1 Platform Entry Points
+- **Linux (`sentinel_agent_linux.py`)**: Designed for modern Linux distributions. It uses systemd-compatible signals (SIGTERM/SIGINT) for clean shutdowns.
+- **macOS (`sentinel_agent_macos.py`)**: Tailored for macOS (supporting both Intel and Apple Silicon), handling Full Disk Access (FDA) verification and Keychain access.
+
+### 10.2 Single-Instance Locks
+Unlike the Windows agent which uses named mutexes, Linux and macOS employ POSIX file locks via `fcntl.flock` on `.zerowatch.lock` located inside the active state directory:
+- It attempts to open and acquire an exclusive, non-blocking lock (`LOCK_EX | LOCK_NB`).
+- If successful, it writes the current PID to the file and continues.
+- If it fails due to `BlockingIOError`, it logs the PID of the existing running process and exits cleanly.
+- The lock file descriptor is kept open for the process lifetime and released automatically by the OS upon process exit.
+
+### 10.3 Persistence Managers
+- **Linux (`LinuxPersistenceManager`)**: Registers a systemd unit (`zerowatch-agent.service`). If run as root, it registers system-wide under `/etc/systemd/system/`. If run as a standard user, it falls back to a user-level service under `~/.config/systemd/user/`.
+- **macOS (`MacOSPersistenceManager`)**: Registers a launchd plist (`io.deepcytes.zerowatch.agent.plist`) under `/Library/LaunchDaemons/` and bootstraps it into the system domain using `launchctl bootstrap`.
+
+### 10.4 Environment Propagation
+When persistence is registered, if `ZEROWATCH_API_URL` is set in the current shell, it is dynamically baked into the persistence configuration (`Environment=` directive for systemd, or `EnvironmentVariables` dictionary for launchd plist). This ensures the agent maintains connection to custom or local server URLs across system reboots or crash restarts.
+
+---
+
+The above description should provide exhaustive insight into every function, flow control decision, and interaction within the endpoint agent codebase. Use this as reference when debugging, extending, or integrating the agent with the backend.
