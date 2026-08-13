@@ -2263,7 +2263,6 @@ def get_exe_path():
 
     # 3. Try sys.modules['__main__'] __compiled__ original_argv0
     try:
-        import sys
         main_mod = sys.modules.get('__main__')
         compiled_obj = getattr(main_mod, '__compiled__', None)
         if compiled_obj:
@@ -3528,8 +3527,6 @@ def is_auto_start_enabled():
 def set_auto_start_enabled(enabled):
     try:
         import winreg
-        import sys
-        import os
         key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
         if enabled:
             exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
