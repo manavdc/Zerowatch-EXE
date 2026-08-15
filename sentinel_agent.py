@@ -3229,7 +3229,9 @@ def register_startup_registry():
         try:
             from platforms import PlatformFactory
             plat = PlatformFactory.create()
-            plat.persistence_manager.register_startup(get_exe_path())
+            plat.persistence_manager.register_startup(
+                get_exe_path(), daemon_args=["--daemon"]
+            )
             return
         except Exception as e:
             logging.warning("Linux autostart registration failed: %s", e)
@@ -4160,6 +4162,17 @@ def _spawn_daemon_process():
         return False, None
 
 
+def _gui_display_available() -> bool:
+    """Return whether the current session can open the native GUI."""
+    # Aqua does not use DISPLAY; requiring it makes every normal macOS
+    # desktop session look headless. Linux uses X11 or Wayland variables.
+    if sys.platform == "darwin":
+        return True
+    if sys.platform.startswith("linux"):
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return True
+
+
 
 def unregister_startup_registry():
     """Removes SentinelAgent startup entry from the Run key.
@@ -4411,8 +4424,9 @@ def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
     Runs the full post-enrollment scan sequence:
       1. Layer 0 registry sync (fast, immediate)
       2. Cache flush: push cached filesystem items as initial delta
-      3. Reset orchestrator cold-start flag so next periodic run = deep scan
-      4. Restart periodic scans (will immediately deep-scan)
+      3. Reset orchestrator cold-start flag so the next periodic run starts
+         with the fast priority scan
+      4. Restart periodic scans; the full-drive scan remains scheduled later
     Called after every re-enrollment event (unlink, auth failure, license renewal).
     """
     try:
@@ -5194,7 +5208,9 @@ def main_agent():
             from platforms import PlatformFactory
             plat = PlatformFactory.create()
             if hasattr(plat, "persistence_manager") and hasattr(plat.persistence_manager, "register_startup"):
-                plat.persistence_manager.register_startup(get_exe_path())
+                plat.persistence_manager.register_startup(
+                    get_exe_path(), daemon_args=["--daemon"]
+                )
         except Exception as _p_err:
             logging.debug("Non-Windows persistence setup: %s", _p_err)
 
@@ -7526,11 +7542,8 @@ def run_interactive():
     # If no display server is available (headless server, SSH, WSL without
     # X-forwarding), do not attempt to open a tkinter window — give the user
     # a clear, actionable message instead of a cryptic TclError.
-    if sys.platform != "win32":
-        has_display = bool(
-            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-        )
-        if not has_display:
+    if sys.platform != "win32" and not _gui_display_available():
+        if sys.platform.startswith("linux"):
             exe = sys.argv[0] if sys.argv else "./SentinelAgent"
             print("")
             print("  ZeroWatch SentinelAgent — Headless / CLI mode detected")
@@ -7546,7 +7559,7 @@ def run_interactive():
             print("    sudo systemctl start zerowatch-agent     (Linux)")
             print("    (LaunchDaemon starts automatically on macOS)")
             print("")
-            sys.exit(0)
+        sys.exit(0)
 
     if tk is None:
         print("Interactive GUI mode requires tkinter. Please install python3-tk on Linux (e.g., sudo apt install python3-tk).")

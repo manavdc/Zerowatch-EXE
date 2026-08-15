@@ -570,7 +570,9 @@ class MacOSAgent:
         try:
             if not self._platform.persistence_manager.is_persistence_active():
                 exe_path = os.path.abspath(sys.argv[0])
-                ok = self._platform.persistence_manager.register_startup(exe_path)
+                ok = self._platform.persistence_manager.register_startup(
+                    exe_path, daemon_args=["--daemon"]
+                )
                 if ok:
                     logger.info("LaunchDaemon registered: agent will start on boot.")
                 else:

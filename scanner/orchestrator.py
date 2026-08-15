@@ -802,8 +802,9 @@ class ScanOrchestrator:
         def _periodic_worker() -> None:
             nonlocal is_cold_start
 
-            # On first ever run, do a deep scan immediately to populate the
-            # cache.  On warm starts, the priority scan runs first.
+            # On a cold start, scan high-value software locations first so
+            # enrollment is not held up by a full-drive walk. The deep scan
+            # remains scheduled after the configured interval.
             last_priority_scan = 0.0
             last_deep_scan = 0.0
 
@@ -820,11 +821,9 @@ class ScanOrchestrator:
                 now = time.time()
 
                 run_deep     = (
-                    is_cold_start
-                    or (
-                        self._deep_scan_interval > 0
-                        and now - last_deep_scan >= self._deep_scan_interval
-                    )
+                    not is_cold_start
+                    and self._deep_scan_interval > 0
+                    and now - last_deep_scan >= self._deep_scan_interval
                 )
                 run_priority = (
                     not run_deep
@@ -855,6 +854,13 @@ class ScanOrchestrator:
                         )
                         self._emit_fs_delta(new_items, removed_items, on_delta)
                         last_priority_scan = time.time()
+                        if is_cold_start:
+                            # The fast first pass initializes the cache. Do
+                            # not force a full-drive scan on every restart or
+                            # re-enrollment; keep the normal deep-scan cadence.
+                            self._cache.set_meta("last_fs_scan_at", self._utc_now_iso())
+                            last_deep_scan = last_priority_scan
+                            is_cold_start = False
                     except Exception as exc:
                         logger.error("Priority scan error: %s", exc, exc_info=True)
 

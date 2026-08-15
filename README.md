@@ -74,27 +74,27 @@ export ZEROWATCH_API_URL=http://<your-server-ip>:3001
 chmod +x SentinelAgent-linux-x64
 ```
 
-### 3. Run Once to Enroll & Register
-Run the binary once as `sudo` to complete initial device enrollment and automatically install the systemd unit file:
+### 3. Launch the GUI and Enroll
+Run the binary as the logged-in desktop user. This opens the ZeroWatch GUI:
 ```bash
-sudo ./SentinelAgent-linux-x64
+./zerowatch-agent-linux-x64
 ```
-*Note: If run without `sudo` (standard user), it will write a user-scoped service unit under `~/.config/systemd/user/` instead.*
+Complete enrollment in the GUI. After enrollment, the GUI starts the detached background agent automatically. Closing the GUI or terminal does not stop it.
 
-Look for the log output: `systemd startup registered: agent will start on boot.` 
-Once you see this, you can terminate the interactive screen with `Ctrl+C`.
-
-### 4. Start the Background Service
-Kick off the background execution thread immediately (the terminal can now be safely closed):
+For a system-wide service installation, run the daemon setup with administrator privileges after enrollment:
 ```bash
-sudo systemctl start zerowatch-agent
+sudo ./zerowatch-agent-linux-x64 --daemon
 ```
-*(Or use `systemctl --user start zerowatch-agent` if registered as a standard user.)*
+For a normal user installation, the background process can be started directly:
+```bash
+./zerowatch-agent-linux-x64 --daemon
+```
 
 ### Service Control Commands
-* **Status**: `sudo systemctl status zerowatch-agent`
-* **Live Logs**: `sudo journalctl -u zerowatch-agent -f`
-* **Stop Daemon**: `sudo systemctl stop zerowatch-agent`
+* **Status**: `sudo systemctl status zerowatch-agent` (system install)
+* **User status**: `systemctl --user status zerowatch-agent`
+* **Live logs**: `sudo journalctl -u zerowatch-agent -f` (system install)
+* **Stop daemon**: `sudo systemctl stop zerowatch-agent`
 
 ---
 
@@ -111,17 +111,17 @@ export ZEROWATCH_API_URL=http://<your-server-ip>:3001
 chmod +x SentinelAgent-macos-arm64
 ```
 
-### 3. Run and Bootstrap LaunchDaemon
-Run the agent once using `sudo` to register the launchd LaunchDaemon plist:
+### 3. Launch the GUI and Enroll
+Run the binary as the logged-in macOS user. This opens the ZeroWatch GUI:
 ```bash
-sudo ./SentinelAgent-macos-arm64
+./zerowatch-agent-macos
 ```
-This automatically:
-1. Validates macOS Full Disk Access (FDA) permissions.
-2. Registers a LaunchDaemon plist under `/Library/LaunchDaemons/io.deepcytes.zerowatch.agent.plist`.
-3. Bootstraps it immediately with `RunAtLoad` and `KeepAlive` parameters.
+Complete enrollment in the GUI. The GUI then starts the detached background agent; closing the GUI or terminal does not stop it.
 
-The agent is now detached and running. You can close your terminal window.
+For LaunchDaemon installation and startup across reboots, run the daemon once with administrator privileges after enrollment:
+```bash
+sudo ./zerowatch-agent-macos --daemon
+```
 
 ### Service Control Commands
 * **Logs**: `tail -f /var/log/zerowatch-agent.log`
@@ -140,7 +140,7 @@ If you do not want to install native system startup utilities (systemd or launch
 
 ```bash
 export ZEROWATCH_API_URL=http://<your-server-ip>:3001
-nohup ./SentinelAgent-linux-x64 > agent_output.log 2>&1 &
+nohup ./zerowatch-agent-linux-x64 --daemon > agent_output.log 2>&1 &
 ```
-* **Stop Process**: `pkill -f SentinelAgent-linux-x64`
+* **Stop Process**: `pkill -f zerowatch-agent-linux-x64`
 * **Read Logs**: `tail -f agent_output.log`
