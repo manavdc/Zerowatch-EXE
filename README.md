@@ -48,12 +48,6 @@ Double-click `SentinelAgent.exe` or execute it from Command Prompt / PowerShell.
 SentinelAgent.exe
 ```
 
-### Background Daemon Mode
-To start the agent in headless background mode and register it as an auto-starting service (via UAC Registry Run key or Task Scheduler):
-```cmd
-SentinelAgent.exe --daemon
-```
-
 ### Setup Demo Video
 Below is a demonstration of installing, configuring, and running the Windows endpoint agent:
 
@@ -63,18 +57,12 @@ https://github.com/user-attachments/assets/77a62549-01ed-4cab-a0dd-2f37109f0a86
 
 ## 🐧 Linux Setup & Execution
 
-### 1. Set the Server Connection (Optional)
-If connecting to a custom local or private ZeroWatch instance, export the environment variable (production releases default automatically to the cloud platform):
-```bash
-export ZEROWATCH_API_URL=http://<your-server-ip>:3001
-```
-
-### 2. Make the Binary Executable
+### 1. Make the Binary Executable
 ```bash
 chmod +x SentinelAgent-linux-x64
 ```
 
-### 3. Launch the GUI and Enroll
+### 2. Launch the GUI and Enroll
 Run the binary as the logged-in desktop user. This opens the ZeroWatch GUI:
 ```bash
 ./zerowatch-agent-linux-x64
@@ -100,18 +88,13 @@ For a normal user installation, the background process can be started directly:
 
 ## 🍎 macOS Setup & Execution
 
-### 1. Set the Server Connection (Optional)
-Export the backend URL if running a custom local deployment:
-```bash
-export ZEROWATCH_API_URL=http://<your-server-ip>:3001
-```
 
-### 2. Make the Binary Executable
+### 1. Make the Binary Executable
 ```bash
 chmod +x SentinelAgent-macos-arm64
 ```
 
-### 3. Launch the GUI and Enroll
+### 2. Launch the GUI and Enroll
 Run the binary as the logged-in macOS user. This opens the ZeroWatch GUI:
 ```bash
 ./zerowatch-agent-macos
@@ -122,25 +105,4 @@ For LaunchDaemon installation and startup across reboots, run the daemon once wi
 ```bash
 sudo ./zerowatch-agent-macos --daemon
 ```
-
-### Service Control Commands
-* **Logs**: `tail -f /var/log/zerowatch-agent.log`
-* **Stop**: `sudo launchctl bootout system /Library/LaunchDaemons/io.deepcytes.zerowatch.agent.plist`
-* **Uninstall**:
-  ```bash
-  sudo launchctl bootout system /Library/LaunchDaemons/io.deepcytes.zerowatch.agent.plist
-  sudo rm /Library/LaunchDaemons/io.deepcytes.zerowatch.agent.plist
-  ```
-
----
-
-## 🛠️ CLI Alternative: Process Detachment (Linux / macOS)
-
-If you do not want to install native system startup utilities (systemd or launchd), you can run the binary directly and detach it from your shell session using `nohup`:
-
-```bash
-export ZEROWATCH_API_URL=http://<your-server-ip>:3001
-nohup ./zerowatch-agent-linux-x64 --daemon > agent_output.log 2>&1 &
-```
-* **Stop Process**: `pkill -f zerowatch-agent-linux-x64`
-* **Read Logs**: `tail -f agent_output.log`
+`tail -f agent_output.log`
