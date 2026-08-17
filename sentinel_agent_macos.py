@@ -119,6 +119,29 @@ def _configure_logging() -> None:
 logger = logging.getLogger("macos.agent")
 
 
+def _daemonize_if_needed() -> None:
+    """Detach the macOS agent from the terminal when launched in daemon mode."""
+    if "--daemon" not in sys.argv:
+        return
+    try:
+        if os.getppid() == 1:
+            return
+        pid = os.fork()
+        if pid > 0:
+            raise SystemExit(0)
+        os.setsid()
+        with open(os.devnull, "rb", buffering=0) as devnull:
+            os.dup2(devnull.fileno(), sys.stdin.fileno())
+        log_dir = os.path.join(_get_state_dir(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "agent-daemon.log")
+        with open(log_path, "ab", buffering=0) as log_handle:
+            os.dup2(log_handle.fileno(), sys.stdout.fileno())
+            os.dup2(log_handle.fileno(), sys.stderr.fileno())
+    except Exception:
+        logger.warning("Daemonization was requested but could not be completed; continuing in foreground.", exc_info=True)
+
+
 # ── State directory ───────────────────────────────────────────────────────────
 
 # Identity files that must be portable between state directories on Linux/macOS
@@ -874,6 +897,11 @@ class MacOSAgent:
         # Initial scan (L0 fast, then L1+L2)
         self._initial_scan_and_sync()
 
+        # Start periodic filesystem scans (priority + deep) so macOS does a
+        # true folder/file deep scan instead of only hardware/software inventory.
+        self._orchestrator.start_periodic_scans(on_delta=self._on_fs_delta)
+        logger.info("Periodic filesystem scan started (priority every 4h / deep every 24h).")
+
         # Start background monitor thread
         monitor = threading.Thread(
             target=self._monitor_loop,
@@ -896,6 +924,10 @@ class MacOSAgent:
 
         logger.info("Shutdown signal received — stopping macOS agent")
         self._stop_event.set()
+        try:
+            self._orchestrator.stop_periodic_scans(timeout=10)
+        except Exception as exc:
+            logger.debug("Orchestrator stop error (non-fatal): %s", exc)
         monitor.join(timeout=10)
         if ota_monitor is not None:
             ota_monitor.stop()
@@ -924,6 +956,7 @@ def main() -> int:
         print("        Run via run_agent.sh or set ZEROWATCH_API_URL environment variable.")
         return 1
 
+    _daemonize_if_needed()
     agent = MacOSAgent()
     return agent.run()
 

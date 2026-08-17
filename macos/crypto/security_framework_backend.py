@@ -320,6 +320,7 @@ class _NativeSecurityBindings:
             "kSecAttrService":              load(sec, "kSecAttrService"),
             "kSecAttrAccount":              load(sec, "kSecAttrAccount"),
             "kSecAttrAccessible":           load(sec, "kSecAttrAccessible"),
+            "kSecUseKeychain":              load(sec, "kSecUseKeychain"),
             "kSecAttrSynchronizable":       load(sec, "kSecAttrSynchronizable"),
             "kSecAttrSynchronizableAny":    load(sec, "kSecAttrSynchronizableAny"),
             # kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
@@ -427,19 +428,22 @@ class _NativeSecurityBindings:
 
         svc_ref  = self._cf_string(service)
         acct_ref = self._cf_string(account)
+        keychain_ref = self._cf_string("/Library/Keychains/System.keychain")
 
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecClass"]),
                                    ctypes.c_void_p(c["kSecClassGenericPassword"]))
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecAttrService"]),  ctypes.c_void_p(svc_ref))
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecAttrAccount"]),  ctypes.c_void_p(acct_ref))
+        cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecUseKeychain"]), ctypes.c_void_p(keychain_ref))
         # Disable iCloud sync — agent credentials are device-specific
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecAttrSynchronizable"]),
                                    ctypes.c_void_p(c["kCFBooleanFalse"]))
 
-        # Note: svc_ref and acct_ref are retained by the dict (CF retain semantics)
-        # We release our own references now that the dict holds them.
+        # Note: svc_ref, acct_ref, and keychain_ref are retained by the dict
+        # (CF retain semantics). Release our temporary references now.
         cf.CFRelease(svc_ref)
         cf.CFRelease(acct_ref)
+        cf.CFRelease(keychain_ref)
 
         return d
 

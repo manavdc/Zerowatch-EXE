@@ -440,6 +440,17 @@ def _state_path(base_dir, filename):
     return os.path.join(_secure_state_dir(base_dir), filename)
 
 
+def _daemon_lock_path(base_dir):
+    """Return the canonical daemon lock path for this platform.
+
+    macOS intentionally uses the same shared state directory for normal-user and
+    sudo-launched agents so the GUI and daemon share a single lock and state set.
+    """
+    if sys.platform == "darwin":
+        return os.path.join(_secure_state_dir(base_dir), "daemon.lock")
+    return os.path.join(base_dir, "state", "daemon.lock")
+
+
 def _legacy_state_path(base_dir, filename):
     return os.path.join(base_dir, filename)
 
@@ -2338,7 +2349,7 @@ def enforce_single_instance():
     """
     if sys.platform != "win32":
         import fcntl
-        lock_path = os.path.join(get_base_dir(), "state", "daemon.lock")
+        lock_path = _daemon_lock_path(get_base_dir())
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         try:
             f = open(lock_path, "w")
@@ -2365,7 +2376,7 @@ def enforce_single_daemon_instance():
     """
     if sys.platform != "win32":
         import fcntl
-        lock_path = os.path.join(get_base_dir(), "state", "daemon.lock")
+        lock_path = _daemon_lock_path(get_base_dir())
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         try:
             f = open(lock_path, "w")
@@ -4087,7 +4098,7 @@ def _is_agent_active(zw_client):
 
 def _is_daemon_running():
     if sys.platform != "win32":
-        lock_path = os.path.join(get_base_dir(), "state", "daemon.lock")
+        lock_path = _daemon_lock_path(get_base_dir())
         if os.path.exists(lock_path):
             try:
                 with open(lock_path, "r") as f:
@@ -4139,6 +4150,8 @@ def _spawn_daemon_process():
 
     try:
         if sys.platform != "win32":
+            if sys.platform == "darwin":
+                os.makedirs(os.path.dirname(_daemon_lock_path(get_base_dir())), exist_ok=True)
             daemon_proc = subprocess.Popen(
                 daemon_cmd,
                 stdout=subprocess.DEVNULL,
@@ -5600,7 +5613,7 @@ class EnrollmentFrame(tk.Frame):
             self.state = "PENDING"
             self.team_code = (self.zw_client.join_state or {}).get("teamCode") or ""
         else:
-            self.state = "TEAM_CODE" # TEAM_CODE -> METADATA -> PENDING
+            self.state = "START" # START -> TEAM_CODE/INDIVIDUAL_CODE -> METADATA -> PENDING
             
         self.team_code = ""
         self.individual_code = ""
@@ -5632,12 +5645,22 @@ class EnrollmentFrame(tk.Frame):
         
         # Create screens as frames inside self.card
         self.screens = {}
+        self.screens["START"] = self._create_start_screen()
         self.screens["TEAM_CODE"] = self._create_team_code_screen()
         self.screens["INDIVIDUAL_CODE"] = self._create_individual_code_screen()
         self.screens["METADATA"] = self._create_metadata_screen()
         self.screens["PENDING"] = self._create_pending_screen()
             
         self.show_screen(self.state)
+
+        version_label = tk.Label(
+            main_content,
+            text=f"Agent version {AGENT_VERSION}",
+            fg=self.c_gray,
+            bg=self.c_bg_main,
+            font=("Arial", 9),
+        )
+        version_label.pack(side=tk.BOTTOM, pady=(0, 18))
 
     def show_screen(self, state):
         self.state = state
@@ -5646,6 +5669,88 @@ class EnrollmentFrame(tk.Frame):
                 frame.pack(fill=tk.BOTH, expand=True)
             else:
                 frame.pack_forget()
+
+    def _create_start_screen(self):
+        frame = tk.Frame(self.card, bg=self.c_card_bg)
+
+        tk.Label(
+            frame,
+            text="WELCOME TO ZEROWATCH SENTINEL AGENT",
+            fg=self.c_white,
+            bg=self.c_card_bg,
+            font=self.f_card_title,
+        ).pack()
+        tk.Label(
+            frame,
+            text="Choose how this device should be registered.",
+            fg=self.c_gray,
+            bg=self.c_card_bg,
+            font=self.f_card_sub,
+        ).pack(pady=(8, 36))
+
+        options = tk.Frame(frame, bg=self.c_card_bg)
+        options.pack(fill=tk.X)
+
+        def create_option(parent, title, description, command):
+            option = tk.Frame(
+                parent,
+                bg=self.c_input_bg,
+                highlightbackground=self.c_input_border,
+                highlightcolor=self.c_cyan,
+                highlightthickness=1,
+                padx=24,
+                pady=20,
+                cursor="hand2",
+            )
+            option.pack(fill=tk.X, pady=(0, 16))
+
+            title_label = tk.Label(
+                option,
+                text=title,
+                fg=self.c_white,
+                bg=self.c_input_bg,
+                font=("Arial", 14, "bold"),
+                cursor="hand2",
+            )
+            title_label.pack(anchor="w")
+
+            desc_label = tk.Label(
+                option,
+                text=description,
+                fg=self.c_gray,
+                bg=self.c_input_bg,
+                font=self.f_normal,
+                cursor="hand2",
+            )
+            desc_label.pack(anchor="w", pady=(8, 0))
+
+            def on_enter(_event):
+                option.configure(highlightbackground=self.c_cyan)
+
+            def on_leave(_event):
+                option.configure(highlightbackground=self.c_input_border)
+
+            for widget in (option, title_label, desc_label):
+                widget.bind("<Button-1>", lambda _event: command())
+                widget.bind("<Enter>", on_enter)
+                widget.bind("<Leave>", on_leave)
+
+            return option
+
+        create_option(
+            options,
+            "Personal Device",
+            "Register this device to your ZeroWatch account.",
+            lambda: self.show_screen("INDIVIDUAL_CODE"),
+        )
+        create_option(
+            options,
+            "Register under team",
+            "Connect this device using a team code.",
+            lambda: self.show_screen("TEAM_CODE"),
+        )
+
+        return frame
 
     def _create_team_code_screen(self):
         frame = tk.Frame(self.card, bg=self.c_card_bg)
@@ -5702,10 +5807,10 @@ class EnrollmentFrame(tk.Frame):
         btn_label = tk.Label(btn_frame, text="◎ NEXT", fg="black", bg=self.c_cyan, font=self.f_btn)
         btn_label.pack()
 
-        link_label = tk.Label(frame, text="Don't have a team? Register your asset here.", fg=self.c_cyan, bg=self.c_card_bg, font=("Arial", 10, "underline"), cursor="hand2")
+        link_label = tk.Label(frame, text="Back to registration options", fg=self.c_cyan, bg=self.c_card_bg, font=("Arial", 10, "underline"), cursor="hand2")
         link_label.pack(pady=(15, 0))
-        def go_to_individual(e): self.show_screen("INDIVIDUAL_CODE")
-        link_label.bind("<Button-1>", go_to_individual)
+        def go_to_start(e): self.show_screen("START")
+        link_label.bind("<Button-1>", go_to_start)
 
         self.status_label_team = tk.Label(frame, text="", fg=self.c_gray, bg=self.c_card_bg, font=("Arial", 10))
         self.status_label_team.pack(pady=(16, 0))
@@ -5769,7 +5874,7 @@ class EnrollmentFrame(tk.Frame):
             self._stop_event.set()
             self._polling_active = False
             self.zw_client.cancel_join_request() # notify server & clear local state
-            self.show_screen("TEAM_CODE")
+            self.show_screen("START")
             
         cancel_btn = tk.Button(frame, text="Cancel Request", bg=self.c_card_bg, fg=self.c_gray, font=self.f_normal, bd=0, activebackground=self.c_card_bg, activeforeground=self.c_white, cursor="hand2", command=on_cancel)
         cancel_btn.pack(pady=(20, 0))
@@ -5799,9 +5904,9 @@ class EnrollmentFrame(tk.Frame):
         canvas_line.create_line(390, 10, 500, 10, fill=self.c_card_border)
         
         tk.Label(frame, text="WELCOME TO ZEROWATCH SENTINEL AGENT", fg=self.c_white, bg=self.c_card_bg, font=self.f_card_title).pack()
-        tk.Label(frame, text="Premium Individual Registration", fg=self.c_white, bg=self.c_card_bg, font=self.f_card_sub).pack(pady=(5, 40))
+        tk.Label(frame, text="Personal Device Registration", fg=self.c_white, bg=self.c_card_bg, font=self.f_card_sub).pack(pady=(5, 40))
         
-        tk.Label(frame, text="ENTER REGISTRATION CODE", fg=self.c_cyan, bg=self.c_card_bg, font=self.f_badge).pack(pady=(0, 18))
+        tk.Label(frame, text="ENTER ASSET CODE", fg=self.c_cyan, bg=self.c_card_bg, font=self.f_badge).pack(pady=(0, 18))
         
         input_frame = tk.Frame(frame, bg=self.c_card_bg)
         input_frame.pack(pady=(0, 40))
@@ -5840,10 +5945,10 @@ class EnrollmentFrame(tk.Frame):
         btn_label = tk.Label(btn_frame, text="◎ NEXT", fg="black", bg=self.c_cyan, font=self.f_btn)
         btn_label.pack()
 
-        link_label = tk.Label(frame, text="Back to Team Registration", fg=self.c_cyan, bg=self.c_card_bg, font=("Arial", 10, "underline"), cursor="hand2")
+        link_label = tk.Label(frame, text="Back to registration options", fg=self.c_cyan, bg=self.c_card_bg, font=("Arial", 10, "underline"), cursor="hand2")
         link_label.pack(pady=(15, 0))
-        def go_to_team(e): self.show_screen("TEAM_CODE")
-        link_label.bind("<Button-1>", go_to_team)
+        def go_to_start(e): self.show_screen("START")
+        link_label.bind("<Button-1>", go_to_start)
 
         self.status_label_indiv = tk.Label(frame, text="", fg=self.c_gray, bg=self.c_card_bg, font=("Arial", 10))
         self.status_label_indiv.pack(pady=(16, 0))
@@ -7443,13 +7548,13 @@ def prompt_consent(base_dir, force_show=False):
 
     root = tk.Tk()
     root.title("ZeroWatch Agent - Consent Required")
-    root.geometry("600x400")
+    root.geometry("660x460")
     root.configure(bg="#0d0f14")
     
     root.update_idletasks()
-    x = (root.winfo_screenwidth() // 2) - (600 // 2)
-    y = (root.winfo_screenheight() // 2) - (400 // 2)
-    root.geometry(f"600x400+{x}+{y}")
+    x = (root.winfo_screenwidth() // 2) - (660 // 2)
+    y = (root.winfo_screenheight() // 2) - (460 // 2)
+    root.geometry(f"660x460+{x}+{y}")
 
     result = [False]
 
@@ -7476,7 +7581,8 @@ def prompt_consent(base_dir, force_show=False):
         "- Hostname & Username\n"
         "- MAC Address & IP Address\n"
         "- Hardware Identifiers (CPU ID, Disk Serial, BIOS UUID, Motherboard Serial)\n"
-        "- Installed Software & Versions (via Registry)\n\n"
+        "- Installed Software & Versions\n"
+        "- Deep file scans of executable paths, package manifests, and binaries\n\n"
         "This data is securely transmitted to your organization's ZeroWatch dashboard.\n"
         "By clicking Accept, you consent to this data collection."
     )
