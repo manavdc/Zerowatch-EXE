@@ -157,6 +157,8 @@ _SHARED_IDENTITY_FILES = (
     "dashboard_cache.dat",
 )
 
+_SHARED_STATE_FILE_MODE = 0o666
+
 def _get_state_dir() -> str:
     """
     Return the canonical shared state directory for ZeroWatch on macOS.
@@ -190,6 +192,17 @@ def _get_state_dir() -> str:
                 os.chmod(canonical, 0o1777)
         except OSError:
             pass
+        # A previous sudo launch may have left identity files owned by root
+        # with restrictive modes. Repair them while privileged so later
+        # normal-user launches can continue using the same enrollment.
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            for name in _SHARED_IDENTITY_FILES:
+                path = os.path.join(canonical, name)
+                if os.path.isfile(path):
+                    try:
+                        os.chmod(path, _SHARED_STATE_FILE_MODE)
+                    except OSError:
+                        pass
         # Verify it's writable
         _probe = os.path.join(canonical, ".write_probe")
         with open(_probe, "w") as _fh:
@@ -452,7 +465,9 @@ class MacOSAgentSession:
             try:
                 with open(self._jwt_path, "wb") as fh:
                     fh.write(enc)
-                os.chmod(self._jwt_path, 0o600)
+                # The agent can run as root (launchd/sudo) or as the logged-in
+                # user; both modes must read the same enrollment token.
+                os.chmod(self._jwt_path, _SHARED_STATE_FILE_MODE)
             except OSError as exc:
                 logger.warning("JWT save failed: %s", exc)
 
