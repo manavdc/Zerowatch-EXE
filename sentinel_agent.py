@@ -3528,6 +3528,9 @@ def set_inventory_scan_enabled(enabled):
 
 
 def is_auto_start_enabled():
+    if sys.platform != "win32":
+        return True
+
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
@@ -5876,7 +5879,7 @@ class EnrollmentFrame(tk.Frame):
             self.zw_client.cancel_join_request() # notify server & clear local state
             self.show_screen("START")
             
-        cancel_btn = tk.Button(frame, text="Cancel Request", bg=self.c_card_bg, fg=self.c_gray, font=self.f_normal, bd=0, activebackground=self.c_card_bg, activeforeground=self.c_white, cursor="hand2", command=on_cancel)
+        cancel_btn = tk.Button(frame, text="Cancel Request", bg=self.c_card_bg, fg=self.c_gray, font=self.f_normal, bd=0, relief=tk.FLAT, overrelief=tk.FLAT, highlightthickness=0, activebackground=self.c_card_bg, activeforeground=self.c_white, disabledforeground=self.c_gray, cursor="hand2", command=on_cancel)
         cancel_btn.pack(pady=(20, 0))
         
         return frame
@@ -6440,7 +6443,7 @@ class DashboardFrame(tk.Frame):
                 else:
                     messagebox.showerror("Unlink Failed", f"Failed to unlink device: {msg}")
 
-        unlink_btn = tk.Button(top3, text="Unlink", bg=self.c_red, fg=self.c_white, font=self.f_normal_bold, bd=0, activebackground=self.c_bg_card, activeforeground=self.c_red, cursor="hand2", command=on_unlink_click)
+        unlink_btn = tk.Button(top3, text="Unlink", bg=self.c_red, fg=self.c_white, font=self.f_normal_bold, bd=0, relief=tk.FLAT, overrelief=tk.FLAT, highlightthickness=0, activebackground="#da3633", activeforeground=self.c_white, disabledforeground=self.c_gray, cursor="hand2", command=on_unlink_click)
         unlink_btn.pack(side=tk.RIGHT)
         
         tk.Label(card3, text="Disconnect this device from the currently linked team.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
@@ -6488,13 +6491,19 @@ class DashboardFrame(tk.Frame):
         update_now_btn = tk.Button(
             ctrl_frame, text="⚡ Update Now",
             bg="#00c4db", fg="black", font=self.f_normal_bold, bd=0,
-            cursor="hand2", state="disabled", pady=4, padx=8,
+            relief=tk.FLAT, overrelief=tk.FLAT, highlightthickness=0,
+            activebackground="#00a8bd", activeforeground="black",
+            disabledforeground="#4f5964", cursor="hand2", state="disabled",
+            pady=4, padx=8,
         )
         update_now_btn.pack(side=tk.LEFT, padx=4)
 
         check_btn = tk.Button(
             ctrl_frame, text="Check for Updates",
             bg=self.c_bg_sidebar, fg=self.c_white, font=self.f_small, bd=1,
+            relief=tk.FLAT, overrelief=tk.FLAT, highlightthickness=0,
+            activebackground=self.c_cyan, activeforeground="black",
+            disabledforeground=self.c_gray,
             cursor="hand2", pady=4, padx=8,
         )
         check_btn.pack(side=tk.LEFT, padx=4)
@@ -7591,10 +7600,10 @@ def prompt_consent(base_dir, force_show=False):
     btn_frame = tk.Frame(root, bg="#0d0f14")
     btn_frame.pack(side=tk.BOTTOM, pady=30)
 
-    btn_accept = tk.Button(btn_frame, text="Accept & Continue", fg="#ffffff", bg="#2ea043", font=("Arial", 10, "bold"), width=15, command=on_accept)
+    btn_accept = tk.Button(btn_frame, text="Accept & Continue", fg="#ffffff", bg="#2ea043", font=("Arial", 10, "bold"), width=15, relief=tk.FLAT, overrelief=tk.FLAT, highlightthickness=0, activebackground="#238636", activeforeground="#ffffff", disabledforeground="#8b949e", command=on_accept)
     btn_accept.pack(side=tk.LEFT, padx=10)
 
-    btn_decline = tk.Button(btn_frame, text="Decline & Exit", fg="#ffffff", bg="#f85149", font=("Arial", 10, "bold"), width=15, command=on_decline)
+    btn_decline = tk.Button(btn_frame, text="Decline & Exit", fg="#ffffff", bg="#f85149", font=("Arial", 10, "bold"), width=15, relief=tk.FLAT, overrelief=tk.FLAT, highlightthickness=0, activebackground="#da3633", activeforeground="#ffffff", disabledforeground="#8b949e", command=on_decline)
     btn_decline.pack(side=tk.LEFT, padx=10)
 
     # Load icon if possible
