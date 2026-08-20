@@ -612,8 +612,14 @@ class MacOSAgent:
 
     def _register_or_authenticate(self) -> bool:
         """Join the device or authenticate with saved JWT."""
-        hw          = _build_hardware_profile(self._platform)
-        fingerprint = self._platform.hardware_collector.collect_fingerprint()
+        # Keep authentication independent from the expensive hardware profile.
+        # The profile is collected immediately after authentication and sent
+        # with the first inventory sync.
+        try:
+            fingerprint = self._platform.hardware_collector.collect_fingerprint()
+        except Exception as exc:
+            logger.warning("Fingerprint collection failed during authentication: %s", exc)
+            fingerprint = {"device_id": self._device_id}
         hostname    = socket.gethostname()
         username    = os.environ.get("USER", os.environ.get("USERNAME", "root"))
 
@@ -823,10 +829,14 @@ class MacOSAgent:
         """
         logger.info("Running initial L0 scan (app bundles, pkgutil, Homebrew, macOS version)...")
         try:
-            items = self._orchestrator.run_full_scan(
-                include_filesystem=False,   # L0 only on cold start
-                stop_event=self._shutdown_event,
-            )
+            # The shared orchestrator upgrades a cold run_full_scan(False) into
+            # a full-drive walk. Publish the fast inventory first on macOS;
+            # the periodic scanner handles filesystem data in the background.
+            layer0_items = self._orchestrator._run_layer0()
+            items = [
+                item.to_api_dict()
+                for item in self._orchestrator._deduplicate(layer0_items)
+            ]
             logger.info("Initial L0 scan: %d software items", len(items))
             hw = _build_hardware_profile(self._platform)
             self._sync_full_with_retry(items, hw)
