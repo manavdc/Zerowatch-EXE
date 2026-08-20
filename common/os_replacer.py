@@ -348,9 +348,10 @@ def _swap_macos(new_binary: str, current_exe: str, zw_client=None) -> bool:
     macOS notarization-compliant swap:
       1. xattr -d com.apple.quarantine (strip Gatekeeper quarantine)
       2. codesign --verify --deep --strict (validate Apple code signature)
-      3. shutil.copy2 → .bak
-      4. os.replace() atomic swap
-      5. launchctl kickstart -k system/io.deepcytes.zerowatch.agent
+    3. Restore executable permissions on the downloaded file
+    4. shutil.copy2 → .bak
+    5. os.replace() atomic swap
+    6. launchctl kickstart -k system/io.deepcytes.zerowatch.agent
 
     The new agent cleans up .bak on its own startup via startup_bak_cleanup().
     """
@@ -362,14 +363,25 @@ def _swap_macos(new_binary: str, current_exe: str, zw_client=None) -> bool:
     # 2. Validate code signature (advisory — not all builds are notarized)
     _codesign_verify_macos(new_binary)
 
-    # 3. Backup
+    # 3. Downloads do not reliably preserve the executable bit. Without this
+    # explicit chmod, launchd reports Permission denied after the swap and the
+    # updated agent remains installed but stopped until manually relaunched.
+    try:
+        current_mode = os.stat(current_exe).st_mode
+        executable_mode = current_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+        os.chmod(new_binary, executable_mode & 0o7777)
+        logger.info("[MACOS SWAP] Executable permissions restored: %o", executable_mode & 0o7777)
+    except OSError as exc:
+        raise SwapError(f"Could not set executable permissions on update: {exc}") from exc
+
+    # 4. Backup
     try:
         shutil.copy2(current_exe, bak_path)
         logger.info("[MACOS SWAP] Backup: %s → %s", current_exe, bak_path)
     except OSError as exc:
         raise SwapError(f"Backup failed: {exc}") from exc
 
-    # 4. Atomic POSIX replace
+    # 5. Atomic POSIX replace
     try:
         os.replace(new_binary, current_exe)
         logger.info("[MACOS SWAP] Atomic replace complete: %s", current_exe)
@@ -381,7 +393,7 @@ def _swap_macos(new_binary: str, current_exe: str, zw_client=None) -> bool:
             logger.critical("[MACOS SWAP] Rollback failed: %s", rb_exc)
         raise SwapError(f"os.replace failed: {exc}") from exc
 
-    # 5. Kick launchd — the new agent will call startup_bak_cleanup()
+    # 6. Kick launchd — the new agent will call startup_bak_cleanup()
     _launchctl_kickstart()
 
     return True
