@@ -3483,7 +3483,7 @@ def register_windows_service():
             # Set service description
             subprocess.run(
                 ["sc", "description", "SentinelAgent",
-                 "ZeroWatch endpoint protection and asset monitoring agent."],
+                 "ZeroWatch endpoint protection and device monitoring agent."],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -4102,7 +4102,7 @@ def resolve_asset_name(base_dir, prompt=False, default_hostname=None):
         _save_identity_to_fingerprint(base_dir, asset_name=default_asset_name)
         return default_asset_name
 
-    entered = input(f"{C.CYAN}Asset Name [{default_asset_name}]: {C.R}").strip()
+    entered = input(f"{C.CYAN}Device Name [{default_asset_name}]: {C.R}").strip()
     final_asset_name = _sanitize_asset_name(entered or default_asset_name)
     _save_identity_to_fingerprint(base_dir, asset_name=final_asset_name)
     return final_asset_name
@@ -4609,7 +4609,7 @@ def enrollment_cli(zw_client):
     _top("DEVICE ENROLLMENT")
     _blank()
     _row(f"{C.WHITE}Welcome to ZeroWatch SentinelAgent{C.R}", align="center")
-    _row(f"{C.MUTED}Enterprise endpoint protection and asset monitoring{C.R}", align="center")
+    _row(f"{C.MUTED}Enterprise endpoint protection and device monitoring{C.R}", align="center")
     _blank()
     _div()
     _blank()
@@ -4650,7 +4650,7 @@ def enrollment_cli(zw_client):
             default_asset_name = _sanitize_asset_name(
                 getattr(zw_client, "asset_name", "") or zw_client.hostname
             )
-            entered_asset_name = input(f"{C.CYAN}Asset Name [{default_asset_name}]: {C.R}").strip()
+            entered_asset_name = input(f"{C.CYAN}Device Name [{default_asset_name}]: {C.R}").strip()
             final_asset_name = _sanitize_asset_name(entered_asset_name or default_asset_name)
             zw_client.asset_name = final_asset_name
             _save_identity_to_fingerprint(zw_client.base_dir, asset_name=final_asset_name, hostname=zw_client.hostname)
@@ -4725,7 +4725,7 @@ def _show_status_screen(zw_client):
     _badge("Enrolled", "YES" if enrolled else "NO", ok=enrolled)
     _badge("Organization", zw_client.organization_display_name(), ok=None)
     _badge("Username", _sanitize_username(getattr(zw_client, "operator_username", "Unknown")), ok=None)
-    _badge("Asset Name", _sanitize_asset_name(getattr(zw_client, "asset_name", "Unknown")), ok=None)
+    _badge("Device Name", _sanitize_asset_name(getattr(zw_client, "asset_name", "Unknown")), ok=None)
     _badge("Agent version", AGENT_VERSION, ok=None)
     _badge("Timestamp", now_utc, ok=None)
 
@@ -4741,7 +4741,7 @@ def _show_status_screen(zw_client):
     if asset_info and "stats" in asset_info:
         a_stats = asset_info["stats"]
         _div()
-        _row(f"  {C.CYAN}REAL-TIME ASSET METRICS{C.R}")
+        _row(f"  {C.CYAN}REAL-TIME DEVICE METRICS{C.R}")
         _badge("Top Severe", a_stats.get("topSevere", [{}])[0].get("cveId", "N/A"), ok=None)
         _badge("Most Affected", a_stats.get("mostAffectedProduct", "N/A"), ok=None)
         _badge("Critical", str(a_stats.get("open_critical", 0)), ok=None)
@@ -4958,7 +4958,7 @@ def main_cli(zw_client):
         _badge("Enrolled", "YES" if enrolled else "NO", ok=enrolled)
         _badge("Organization", zw_client.organization_display_name(), ok=None)
         _badge("Username", _sanitize_username(getattr(zw_client, "operator_username", "Unknown")), ok=None)
-        _badge("Asset Name", _sanitize_asset_name(getattr(zw_client, "asset_name", "Unknown")), ok=None)
+        _badge("Device Name", _sanitize_asset_name(getattr(zw_client, "asset_name", "Unknown")), ok=None)
         _badge("Version", AGENT_VERSION, ok=None)
         _div()
         _blank()
@@ -5811,7 +5811,7 @@ class EnrollmentFrame(tk.Frame):
         canvas_line.create_line(370, 10, 500, 10, fill=self.c_card_border)
         
         tk.Label(frame, text="WELCOME TO ZEROWATCH SENTINEL AGENT", fg=self.c_white, bg=self.c_card_bg, font=self.f_card_title).pack()
-        tk.Label(frame, text="Enterprise Asset Monitoring", fg=self.c_white, bg=self.c_card_bg, font=self.f_card_sub).pack(pady=(5, 40))
+        tk.Label(frame, text="Enterprise Device Monitoring", fg=self.c_white, bg=self.c_card_bg, font=self.f_card_sub).pack(pady=(5, 40))
         
         tk.Label(frame, text="ENTER TEAM CODE", fg=self.c_cyan, bg=self.c_card_bg, font=self.f_badge).pack(pady=(0, 18))
         
@@ -5870,7 +5870,7 @@ class EnrollmentFrame(tk.Frame):
         frame = tk.Frame(self.card, bg=self.c_card_bg)
         
         tk.Label(frame, text="DEVICE IDENTITY", fg=self.c_white, bg=self.c_card_bg, font=self.f_card_title).pack()
-        tk.Label(frame, text="Configure how this asset appears on your dashboard", fg=self.c_gray, bg=self.c_card_bg, font=self.f_card_sub).pack(pady=(5, 30))
+        tk.Label(frame, text="Configure how this device appears on your dashboard", fg=self.c_gray, bg=self.c_card_bg, font=self.f_card_sub).pack(pady=(5, 30))
         
         # User Name
         tk.Label(frame, text="USER NAME", fg=self.c_cyan, bg=self.c_card_bg, font=self.f_badge).pack(anchor="w")
@@ -5881,7 +5881,7 @@ class EnrollmentFrame(tk.Frame):
         self.user_entry.insert(0, self.zw_client.operator_username)
 
         # Device Name
-        tk.Label(frame, text="DEVICE / ASSET NAME", fg=self.c_cyan, bg=self.c_card_bg, font=self.f_badge).pack(anchor="w")
+        tk.Label(frame, text="DEVICE NAME", fg=self.c_cyan, bg=self.c_card_bg, font=self.f_badge).pack(anchor="w")
         d_frame = tk.Frame(frame, bg=self.c_input_bg, highlightbackground=self.c_input_border, highlightthickness=1)
         d_frame.pack(fill=tk.X, pady=(10, 40))
         self.device_entry = tk.Entry(d_frame, fg=self.c_white, bg=self.c_input_bg, font=self.f_normal, bd=0, highlightthickness=0, insertbackground=self.c_cyan)
@@ -5951,7 +5951,7 @@ class EnrollmentFrame(tk.Frame):
         tk.Label(frame, text="WELCOME TO ZEROWATCH SENTINEL AGENT", fg=self.c_white, bg=self.c_card_bg, font=self.f_card_title).pack()
         tk.Label(frame, text="Personal Device Registration", fg=self.c_white, bg=self.c_card_bg, font=self.f_card_sub).pack(pady=(5, 40))
         
-        tk.Label(frame, text="ENTER ASSET CODE", fg=self.c_cyan, bg=self.c_card_bg, font=self.f_badge).pack(pady=(0, 18))
+        tk.Label(frame, text="ENTER DEVICE CODE", fg=self.c_cyan, bg=self.c_card_bg, font=self.f_badge).pack(pady=(0, 18))
         
         input_frame = tk.Frame(frame, bg=self.c_card_bg)
         input_frame.pack(pady=(0, 40))
@@ -6429,10 +6429,8 @@ class DashboardFrame(tk.Frame):
         branch_name = str(team_info.get("branchName") or join_state.get("branchName") or "").strip()
         plan_type = str(team_info.get("planType") or join_state.get("planType") or "").strip().lower()
 
-        # Device info
-        device_id = getattr(self.zw_client, "device_id", None) or "Unknown"
-        hostname = getattr(self.zw_client, "hostname", None) or "Unknown"
-        device_display = f"{device_id} ({hostname})"
+        # Device name / hostname (avoid exposing raw DB device ID)
+        device_name = str(getattr(self.zw_client, "asset_name", "") or getattr(self.zw_client, "hostname", "") or "Unknown").strip()
 
         # Enrollment status badge
         is_enrolled = False
@@ -6528,7 +6526,7 @@ class DashboardFrame(tk.Frame):
                 self.c_white if team_code else "#f85149"
             ))
 
-        # Always add Enrollment Status and Device & Hostname
+        # Always add Enrollment Status and Device Name
         fields.append((
             "Enrollment Status",
             status_text,
@@ -6536,9 +6534,9 @@ class DashboardFrame(tk.Frame):
             status_color
         ))
         fields.append((
-            "Device & Hostname",
-            device_display,
-            "Unique device hardware ID and assigned operating system hostname.",
+            "Device Name",
+            device_name,
+            "Assigned device name / hostname for this endpoint device.",
             self.c_white
         ))
 
@@ -7091,7 +7089,7 @@ class DashboardFrame(tk.Frame):
         fields += [
             ("Hostname",
              _fval("hostname") or self.zw_client.hostname or "N/A",
-             "Device network hostname used for asset identification."),
+             "Device network hostname used for device identification."),
             ("Username",
              _fval("username", "operator_username"),
              "Operating system user account name for the enrolled operator."),
