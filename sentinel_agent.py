@@ -1070,33 +1070,50 @@ class ZeroWatchClient:
         state = self.join_state if isinstance(self.join_state, dict) else None
         if not state:
             return None
-        team_name = str(state.get("teamName") or "").strip()
-        team_code = str(state.get("teamCode") or "").strip()
-        team_id = str(state.get("teamId") or "").strip()
-        if not (team_name or team_code or team_id):
+        team_name = str(state.get("teamName") or state.get("team_name") or "").strip()
+        team_code = str(state.get("teamCode") or state.get("team_code") or "").strip()
+        team_id = str(state.get("teamId") or state.get("team_id") or "").strip()
+        organization_name = str(state.get("organizationName") or state.get("organization_name") or state.get("org_name") or "").strip()
+        region_name = str(state.get("regionName") or state.get("region_name") or "").strip()
+        branch_name = str(state.get("branchName") or state.get("branch_name") or "").strip()
+        plan_type = str(state.get("planType") or state.get("plan_type") or "").strip()
+        if not (team_name or team_code or team_id or organization_name or region_name or branch_name):
             return None
         return {
             "teamName": team_name or None,
             "teamCode": team_code or None,
             "teamId": team_id or None,
+            "organizationName": organization_name or None,
+            "regionName": region_name or None,
+            "branchName": branch_name or None,
+            "planType": plan_type or None,
         }
 
     def _update_team_info_from_payload(self, payload):
         if not isinstance(payload, dict):
             return
-        team_name = str(payload.get("teamName") or "").strip()
-        team_code = str(payload.get("teamCode") or "").strip()
-        team_id = str(payload.get("teamId") or "").strip()
-        organization_name = str(payload.get("organizationName") or "").strip()
-        if not (team_name or team_code or team_id):
+        team_name = str(payload.get("teamName") or payload.get("team_name") or "").strip()
+        team_code = str(payload.get("teamCode") or payload.get("team_code") or "").strip()
+        team_id = str(payload.get("teamId") or payload.get("team_id") or "").strip()
+        organization_name = str(payload.get("organizationName") or payload.get("organization_name") or payload.get("org_name") or "").strip()
+        region_name = str(payload.get("regionName") or payload.get("region_name") or "").strip()
+        branch_name = str(payload.get("branchName") or payload.get("branch_name") or "").strip()
+        plan_type = str(payload.get("planType") or payload.get("plan_type") or "").strip()
+        if not (team_name or team_code or team_id or organization_name or region_name or branch_name):
             if organization_name:
                 self.organization_name = _sanitize_organization_name(organization_name)
                 _save_identity_to_fingerprint(self.base_dir, organization_name=self.organization_name)
             return
+        
+        existing = self.team_info or {}
         self.team_info = {
-            "teamName": team_name or None,
-            "teamCode": team_code or None,
-            "teamId": team_id or None,
+            "teamName": team_name or existing.get("teamName") or None,
+            "teamCode": team_code or existing.get("teamCode") or None,
+            "teamId": team_id or existing.get("teamId") or None,
+            "organizationName": organization_name or existing.get("organizationName") or None,
+            "regionName": region_name or existing.get("regionName") or None,
+            "branchName": branch_name or existing.get("branchName") or None,
+            "planType": plan_type or existing.get("planType") or None,
         }
         display_org = organization_name or team_name
         if display_org:
@@ -1137,13 +1154,18 @@ class ZeroWatchClient:
         key = str(self.device_id or "unknown-device").encode("utf-8")
         return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    def _build_join_state(self, status, team_code=None, request_id=None, team_id=None, team_name=None):
+    def _build_join_state(self, status, team_code=None, request_id=None, team_id=None, team_name=None,
+                          organization_name=None, region_name=None, branch_name=None, plan_type=None):
         state = {
             "version": 1,
             "deviceId": self.device_id,
             "teamName": str(team_name or "").strip() or None,
             "teamCode": str(team_code or "").strip() or None,
             "teamId": str(team_id or "").strip() or None,
+            "organizationName": str(organization_name or "").strip() or None,
+            "regionName": str(region_name or "").strip() or None,
+            "branchName": str(branch_name or "").strip() or None,
+            "planType": str(plan_type or "").strip() or None,
             "requestId": str(request_id or "").strip() or None,
             "status": str(status or "none").strip().lower(),
             "updatedAt": self._utc_now_iso(),
@@ -1151,7 +1173,8 @@ class ZeroWatchClient:
         state["checksum"] = self._join_state_checksum(state)
         return state
 
-    def _save_join_state(self, status, team_code=None, request_id=None, team_id=None, team_name=None):
+    def _save_join_state(self, status, team_code=None, request_id=None, team_id=None, team_name=None,
+                         organization_name=None, region_name=None, branch_name=None, plan_type=None):
         temp_path = f"{self.join_state_file}.{uuid.uuid4().hex}.tmp"
         try:
             os.makedirs(self.state_dir, exist_ok=True)
@@ -1161,6 +1184,10 @@ class ZeroWatchClient:
                 request_id=request_id,
                 team_id=team_id,
                 team_name=team_name,
+                organization_name=organization_name,
+                region_name=region_name,
+                branch_name=branch_name,
+                plan_type=plan_type,
             )
             payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
             encrypted = encrypt_data(payload)
@@ -1297,6 +1324,10 @@ class ZeroWatchClient:
                     team_code=data.get("teamCode") or current_state.get("teamCode"),
                     request_id=request_id,
                     team_id=data.get("teamId") or current_state.get("teamId"),
+                    organization_name=data.get("organizationName") or current_state.get("organizationName"),
+                    region_name=data.get("regionName") or current_state.get("regionName"),
+                    branch_name=data.get("branchName") or current_state.get("branchName"),
+                    plan_type=data.get("planType") or current_state.get("planType"),
                 )
                 self._update_team_info_from_payload(data)
                 return {"status": "approved", "jwt": data.get("jwt")}
@@ -1622,6 +1653,10 @@ class ZeroWatchClient:
                         team_code=data.get("teamCode") or team_code,
                         request_id=data.get("requestId"),
                         team_id=data.get("teamId"),
+                        organization_name=data.get("organizationName"),
+                        region_name=data.get("regionName"),
+                        branch_name=data.get("branchName"),
+                        plan_type=data.get("planType"),
                     )
                     self._update_team_info_from_payload(data)
                 else:
@@ -1631,6 +1666,10 @@ class ZeroWatchClient:
                         team_code=team_code,
                         request_id=data.get("requestId"),
                         team_id=data.get("teamId"),
+                        organization_name=data.get("organizationName"),
+                        region_name=data.get("regionName"),
+                        branch_name=data.get("branchName"),
+                        plan_type=data.get("planType"),
                     )
                     self._update_team_info_from_payload(data)
             return data
@@ -2157,6 +2196,9 @@ class ZeroWatchClient:
                 asset_data = data.get("data")
                 if asset_data:
                     self._save_dashboard_cache({"data": asset_data})
+                    team_payload = asset_data.get("teamInfo") or asset_data
+                    if isinstance(team_payload, dict) and (team_payload.get("teamName") or team_payload.get("organizationName")):
+                        self._update_team_info_from_payload(team_payload)
                 return asset_data
             
             # Fallback to cache on server error
@@ -6274,16 +6316,30 @@ class DashboardFrame(tk.Frame):
             
             if page_name == "dashboard":
                 self.page_info.pack_forget()
+                if hasattr(self, 'page_team_details'):
+                    self.page_team_details.pack_forget()
                 if hasattr(self, 'page_settings'):
                     self.page_settings.pack_forget()
                 self.page_dashboard.pack(fill=tk.BOTH, expand=True)
+            elif page_name == "team_details":
+                self.page_dashboard.pack_forget()
+                self.page_info.pack_forget()
+                if hasattr(self, 'page_settings'):
+                    self.page_settings.pack_forget()
+                if hasattr(self, 'page_team_details'):
+                    self._refresh_team_details()
+                    self.page_team_details.pack(fill=tk.BOTH, expand=True)
             elif page_name == "settings":
                 self.page_dashboard.pack_forget()
                 self.page_info.pack_forget()
+                if hasattr(self, 'page_team_details'):
+                    self.page_team_details.pack_forget()
                 if hasattr(self, 'page_settings'):
                     self.page_settings.pack(fill=tk.BOTH, expand=True)
             else:
                 self.page_dashboard.pack_forget()
+                if hasattr(self, 'page_team_details'):
+                    self.page_team_details.pack_forget()
                 if hasattr(self, 'page_settings'):
                     self.page_settings.pack_forget()
                 self.page_info.pack(fill=tk.BOTH, expand=True)
@@ -6313,19 +6369,205 @@ class DashboardFrame(tk.Frame):
             self.sidebar_items[name] = (item, indicator, label)
             
         create_menu_item("dashboard", "DASHBOARD", is_active=True)
+        create_menu_item("team_details", "TEAM DETAILS", is_active=False)
         create_menu_item("info", "DATA INFO", is_active=False)
         create_menu_item("settings", "SETTINGS", is_active=False)
 
     def build_main_area(self):
         self.page_dashboard = tk.Frame(self.main_area, bg=self.c_bg_base)
+        self.page_team_details = tk.Frame(self.main_area, bg=self.c_bg_base)
         self.page_info = tk.Frame(self.main_area, bg=self.c_bg_base)
         self.page_dashboard.pack(fill=tk.BOTH, expand=True)
         
         self._build_dashboard_content(self.page_dashboard)
+        self._build_team_details_content(self.page_team_details)
         self._build_data_info_content(self.page_info)
         
         self.page_settings = tk.Frame(self.main_area, bg=self.c_bg_base)
         self._build_settings_content(self.page_settings)
+
+    def _build_team_details_content(self, parent_frame):
+        header = tk.Frame(parent_frame, bg=self.c_bg_base)
+        header.pack(fill=tk.X, pady=(0, 20))
+        tk.Label(
+            header, text="TEAM DETAILS",
+            fg=self.c_white, bg=self.c_bg_base, font=("Arial", 18, "bold")
+        ).pack(side=tk.LEFT)
+
+        desc = tk.Label(
+            parent_frame,
+            text="Organizational hierarchy and team enrollment information for this endpoint.",
+            fg=self.c_gray, bg=self.c_bg_base, font=self.f_normal, justify=tk.LEFT, wraplength=760
+        )
+        desc.pack(anchor="w", pady=(0, 20))
+
+        self.team_details_container = tk.Frame(parent_frame, bg=self.c_bg_base)
+        self.team_details_container.pack(fill=tk.BOTH, expand=True)
+
+        self._refresh_team_details()
+
+    def _refresh_team_details(self):
+        if not hasattr(self, "team_details_container"):
+            return
+
+        for widget in self.team_details_container.winfo_children():
+            widget.destroy()
+
+        # Load freshest team info and join state
+        team_info = getattr(self.zw_client, "team_info", None) or {}
+        join_state = getattr(self.zw_client, "join_state", None)
+        if not join_state or not isinstance(join_state, dict):
+            try:
+                join_state = self.zw_client._load_join_state() or {}
+            except Exception:
+                join_state = {}
+
+        team_name = str(team_info.get("teamName") or join_state.get("teamName") or "").strip()
+        team_code = str(team_info.get("teamCode") or join_state.get("teamCode") or "").strip()
+        org_name = str(team_info.get("organizationName") or join_state.get("organizationName") or "").strip()
+        region_name = str(team_info.get("regionName") or join_state.get("regionName") or "").strip()
+        branch_name = str(team_info.get("branchName") or join_state.get("branchName") or "").strip()
+        plan_type = str(team_info.get("planType") or join_state.get("planType") or "").strip().lower()
+
+        # Device info
+        device_id = getattr(self.zw_client, "device_id", None) or "Unknown"
+        hostname = getattr(self.zw_client, "hostname", None) or "Unknown"
+        device_display = f"{device_id} ({hostname})"
+
+        # Enrollment status badge
+        is_enrolled = False
+        try:
+            is_enrolled = self.zw_client.is_enrolled() or bool(self.zw_client.jwt)
+        except Exception:
+            is_enrolled = bool(getattr(self.zw_client, "jwt", None))
+
+        has_pending = False
+        try:
+            has_pending = self.zw_client.has_pending_join()
+        except Exception:
+            has_pending = False
+
+        if is_enrolled:
+            status_text = "Active (Enrolled)"
+            status_color = self.c_green
+        elif has_pending:
+            status_text = "Pending Approval"
+            status_color = self.c_yellow
+        else:
+            status_text = "Not Enrolled"
+            status_color = self.c_gray
+
+        # Determine mode:
+        is_individual = (plan_type == "individual" or team_name.lower() == "individual plan")
+        is_premium_team = (plan_type == "premium_team" or (not org_name and not region_name and not branch_name and not is_individual))
+
+        fields = []
+        if is_individual:
+            fields.append((
+                "Organization Name",
+                "Individual",
+                "Personal workstation monitoring plan without organizational hierarchy.",
+                self.c_white
+            ))
+            fields.append((
+                "Team Name",
+                "Individual Plan",
+                "Workstation endpoint protection for individual user.",
+                self.c_white
+            ))
+            fields.append((
+                "Team Code",
+                team_code or "000000",
+                "Personal plan registration code.",
+                self.c_white
+            ))
+        elif is_premium_team:
+            # DO NOT SHOW Organization, Region, Branch fields for premium_team
+            fields.append((
+                "Team Name",
+                team_name or "N/A",
+                "The security team assigned to monitor and manage this device.",
+                self.c_white if team_name else "#f85149"
+            ))
+            fields.append((
+                "Team Code",
+                team_code or "N/A",
+                "Unique alphanumeric identifier for the enrolled team.",
+                self.c_white if team_code else "#f85149"
+            ))
+        else:
+            # Enterprise hierarchy mode
+            fields.append((
+                "Organization Name",
+                org_name or "N/A",
+                "Top-level enterprise organization governing this endpoint policy.",
+                self.c_white if org_name and org_name != "N/A" else "#f85149"
+            ))
+            fields.append((
+                "Region Name",
+                region_name or "N/A",
+                "Geographical or operational region assigned to this branch.",
+                self.c_white if region_name and region_name != "N/A" else "#f85149"
+            ))
+            fields.append((
+                "Branch Name",
+                branch_name or "N/A",
+                "Branch office or facility associated with this team.",
+                self.c_white if branch_name and branch_name != "N/A" else "#f85149"
+            ))
+            fields.append((
+                "Team Name",
+                team_name or "N/A",
+                "The security team assigned to monitor and manage this device.",
+                self.c_white if team_name else "#f85149"
+            ))
+            fields.append((
+                "Team Code",
+                team_code or "N/A",
+                "Unique alphanumeric identifier for the enrolled team.",
+                self.c_white if team_code else "#f85149"
+            ))
+
+        # Always add Enrollment Status and Device & Hostname
+        fields.append((
+            "Enrollment Status",
+            status_text,
+            "Current authorization and synchronization status with the ZeroWatch backend.",
+            status_color
+        ))
+        fields.append((
+            "Device & Hostname",
+            device_display,
+            "Unique device hardware ID and assigned operating system hostname.",
+            self.c_white
+        ))
+
+        # Render cards
+        for title, val, explanation, val_color in fields:
+            card = tk.Frame(
+                self.team_details_container, bg=self.c_bg_card,
+                highlightbackground=self.c_border, highlightthickness=1,
+                padx=20, pady=15
+            )
+            card.pack(fill=tk.X, pady=5)
+
+            top = tk.Frame(card, bg=self.c_bg_card)
+            top.pack(fill=tk.X)
+
+            tk.Label(
+                top, text=title,
+                fg=self.c_cyan, bg=self.c_bg_card, font=self.f_normal_bold
+            ).pack(side=tk.LEFT)
+            tk.Label(
+                top, text=val,
+                fg=val_color, bg=self.c_bg_card, font=self.f_normal_bold
+            ).pack(side=tk.RIGHT)
+
+            tk.Label(
+                card, text=explanation,
+                fg=self.c_gray, bg=self.c_bg_card,
+                font=self.f_small, justify=tk.LEFT, wraplength=700
+            ).pack(anchor="w", pady=(8, 0))
 
     def _build_settings_content(self, parent_frame):
         header = tk.Frame(parent_frame, bg=self.c_bg_base)
