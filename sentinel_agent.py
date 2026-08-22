@@ -1914,6 +1914,13 @@ class ZeroWatchClient:
     # ----------------------------------------------------------------
     def sync_full(self, software_list, hardware_info=None):
         if not self.jwt or not self.license_active: return False
+        if not hardware_info:
+            try:
+                hardware_info = get_detailed_hardware_profile()
+            except Exception as hw_exc:
+                logging.warning("Auto hardware profile collection failed: %s", hw_exc)
+                hardware_info = {}
+
         payload = {
             "device_id": self.device_id,
             "deviceId": self.device_id,

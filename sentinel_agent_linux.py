@@ -596,17 +596,27 @@ class LinuxAgent:
 
         return False
 
-    def _sync_full(self, software: list) -> bool:
-        """Push full software inventory to backend."""
+    def _sync_full(self, software: list, hardware: dict | None = None) -> bool:
+        """Push full software inventory and hardware profile to backend."""
+        if hardware is None:
+            try:
+                hardware = self._platform.hardware_collector.get_detailed_hardware_profile()
+            except Exception as hw_exc:
+                logger.warning("Hardware profile collection failed: %s", hw_exc)
+                hardware = {}
+
         payload = {
-            "deviceId": self._device_id,
-            "software": software,
+            "deviceId":  self._device_id,
+            "device_id": self._device_id,
+            "software":  software,
+            "inventory": software,
+            "hardware":  hardware,
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         }
         try:
             resp = self._session.post("/agent/sync/full", payload, timeout=60)
             if resp.status_code in (200, 201, 204):
-                logger.info("Full sync: %d items synced", len(software))
+                logger.info("Full sync: %d items and hardware profile synced", len(software))
                 return True
             logger.warning("Full sync failed: HTTP %d", resp.status_code)
         except Exception as exc:
@@ -648,12 +658,12 @@ class LinuxAgent:
             logger.debug("Heartbeat error: %s", exc)
             return False
 
-    def _sync_full_with_retry(self, software: list) -> bool:
-        """Push full software inventory to backend, retrying up to 3 times on failure."""
+    def _sync_full_with_retry(self, software: list, hardware: dict | None = None) -> bool:
+        """Push full software inventory and hardware profile to backend, retrying up to 3 times on failure."""
         for attempt in range(3):
             if self._shutdown_event.is_set():
                 return False
-            if self._sync_full(software):
+            if self._sync_full(software, hardware):
                 return True
             logger.warning("Full sync attempt %d/3 failed. Retrying in 15s...", attempt + 1)
             self._shutdown_event.wait(timeout=15)
@@ -697,12 +707,19 @@ class LinuxAgent:
 
         completed_in_time = full_scan_done.wait(timeout=_FULL_SCAN_TIMEOUT)
 
+        # Collect full hardware profile
+        try:
+            hardware = self._platform.hardware_collector.get_detailed_hardware_profile()
+        except Exception as hw_exc:
+            logger.warning("Hardware collection failed: %s", hw_exc)
+            hardware = {}
+
         if completed_in_time and not full_scan_error:
             logger.info(
                 "Full scan completed within %ds — syncing %d items in one shot.",
                 _FULL_SCAN_TIMEOUT, len(full_items),
             )
-            self._sync_full_with_retry(full_items)
+            self._sync_full_with_retry(full_items, hardware)
             return
 
         # ── Timeout (or error) path: fall back to fast L0-only sync ──────────
@@ -739,7 +756,7 @@ class LinuxAgent:
                     pass
 
             logger.info("Fallback L0 scan: %d items — syncing now.", len(items))
-            self._sync_full_with_retry(items)
+            self._sync_full_with_retry(items, hardware)
 
             # Seed orchestrator snapshot so subsequent deltas are accurate
             try:
