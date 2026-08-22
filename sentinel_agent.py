@@ -2859,14 +2859,34 @@ def get_full_software_inventory(base_dir=None, include_filesystem=True):
 
 def get_installed_software_registry():
     """
-    Primary software scanner: reads the Windows Registry Uninstall keys or Linux package databases.
+    Primary software scanner: reads the Windows Registry Uninstall keys or Linux/macOS package databases.
     """
     if sys.platform != "win32":
         try:
             from platforms import PlatformFactory
             plat = PlatformFactory.create()
-            return plat.software_collector.collect_software()
-        except Exception:
+            raw_items = plat.software_collector.collect_software()
+            results = []
+            for item in raw_items:
+                if hasattr(item, "to_api_dict"):
+                    results.append(item.to_api_dict())
+                elif hasattr(item, "to_dict"):
+                    results.append(item.to_dict())
+                elif isinstance(item, dict):
+                    results.append(item)
+                else:
+                    results.append({
+                        "name": getattr(item, "name", ""),
+                        "version": getattr(item, "version", ""),
+                        "vendor": getattr(item, "vendor", ""),
+                        "source": getattr(item, "source", "package"),
+                        "category": getattr(item, "category", "software"),
+                        "install_date": getattr(item, "install_date", ""),
+                        "install_location": getattr(item, "install_location", ""),
+                    })
+            return results
+        except Exception as exc:
+            logging.warning("Non-Windows software collection fallback failed: %s", exc)
             return []
 
     results = []
