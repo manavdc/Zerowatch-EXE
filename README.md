@@ -67,16 +67,11 @@ Run the binary as the logged-in desktop user. This opens the ZeroWatch GUI:
 ```bash
 ./zerowatch-agent-linux-x64
 ```
-Complete enrollment in the GUI. After enrollment, the GUI starts the detached background agent automatically. Closing the GUI or terminal does not stop it.
+Complete enrollment in the GUI. The same launch now auto-registers startup persistence and starts the detached background agent automatically (works for both normal-user and sudo launches). No second daemon command is required.
 
-For a system-wide service installation, run the daemon setup with administrator privileges after enrollment:
-```bash
-sudo ./zerowatch-agent-linux-x64 --daemon
-```
-For a normal user installation, the background process can be started directly:
-```bash
-./zerowatch-agent-linux-x64 --daemon
-```
+Linux persistence behavior:
+- Normal user launch: installs a user systemd unit (`systemctl --user`) and auto-starts the daemon.
+- `sudo` launch: installs a system-wide unit (`/etc/systemd/system`) and auto-starts the daemon.
 
 ### Service Control Commands
 * **Status**: `sudo systemctl status zerowatch-agent` (system install)
@@ -101,8 +96,9 @@ Run the binary as the logged-in macOS user. This opens the ZeroWatch GUI:
 ```
 Complete enrollment in the GUI. The GUI then starts the detached background agent; closing the GUI or terminal does not stop it.
 
-For LaunchDaemon installation and startup across reboots, run the daemon once with administrator privileges after enrollment:
-```bash
-sudo ./zerowatch-agent-macos --daemon
-```
+macOS persistence behavior:
+- Normal user launch: installs a per-user LaunchAgent in `~/Library/LaunchAgents` and auto-starts it.
+- `sudo` launch: installs a system LaunchDaemon in `/Library/LaunchDaemons` and auto-starts it.
+
+No separate daemon command is required after GUI enrollment.
 `tail -f agent_output.log`

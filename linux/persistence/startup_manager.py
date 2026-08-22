@@ -50,7 +50,7 @@ KillSignal=SIGTERM
 TimeoutStopSec=30s
 
 [Install]
-WantedBy=multi-user.target
+WantedBy={wanted_by}
 """
 
 
@@ -69,7 +69,7 @@ def _systemctl(*args: str, system: bool = True) -> bool:
         return False
 
 
-def _write_unit(unit_dir: str, exe_path: str, daemon_args: str) -> Optional[str]:
+def _write_unit(unit_dir: str, exe_path: str, daemon_args: str, wanted_by: str) -> Optional[str]:
     """Write the systemd unit file; return the path on success."""
     try:
         os.makedirs(unit_dir, mode=0o755, exist_ok=True)
@@ -84,7 +84,12 @@ def _write_unit(unit_dir: str, exe_path: str, daemon_args: str) -> Optional[str]
         # Place Environment= on its own line before Restart=.
         # When no URL is set (production binary), env_line is empty string.
         env_line = f"Environment=ZEROWATCH_API_URL={api_url}\n" if api_url else ""
-        content = _UNIT_TEMPLATE.format(exe_path=exe_path, args=args_suffix, env_line=env_line)
+        content = _UNIT_TEMPLATE.format(
+            exe_path=exe_path,
+            args=args_suffix,
+            env_line=env_line,
+            wanted_by=wanted_by,
+        )
         with open(unit_path, "w", encoding="utf-8") as fh:
             fh.write(content)
         os.chmod(unit_path, 0o644)
@@ -108,8 +113,31 @@ class LinuxPersistenceManager(PersistenceManager):
         # only contains the binary path.
         args_str = " ".join(daemon_args) if daemon_args else ""
 
+        # If a system-wide unit already exists, do not create a user unit.
+        # This prevents duplicate daemon instances across sudo and non-sudo runs.
+        system_unit_path = os.path.join(_SYSTEM_UNIT_DIR, _SERVICE_NAME)
+        is_root = hasattr(os, "geteuid") and os.geteuid() == 0
+        if not is_root and os.path.isfile(system_unit_path):
+            # Best-effort cleanup of legacy user unit from older builds.
+            user_unit_path = os.path.join(_USER_UNIT_DIR_TEMPLATE, _SERVICE_NAME)
+            try:
+                _systemctl("disable", _SERVICE_NAME, system=False)
+            except Exception:
+                pass
+            try:
+                if os.path.isfile(user_unit_path):
+                    os.remove(user_unit_path)
+                    _systemctl("daemon-reload", system=False)
+            except OSError:
+                pass
+            logger.info(
+                "System-wide unit already present (%s). Skipping user unit registration.",
+                system_unit_path,
+            )
+            return True
+
         # Try system-wide install (requires root)
-        unit_path = _write_unit(_SYSTEM_UNIT_DIR, exe_path, args_str)
+        unit_path = _write_unit(_SYSTEM_UNIT_DIR, exe_path, args_str, wanted_by="multi-user.target")
         if unit_path:
             _systemctl("daemon-reload", system=True)
             ok = _systemctl("enable", _SERVICE_NAME, system=True)
@@ -120,9 +148,9 @@ class LinuxPersistenceManager(PersistenceManager):
 
         # Fallback: user-scope (~/.config/systemd/user/)
         user_unit_dir = _USER_UNIT_DIR_TEMPLATE
-        unit_path = _write_unit(user_unit_dir, exe_path, args_str)
+        unit_path = _write_unit(user_unit_dir, exe_path, args_str, wanted_by="default.target")
         if unit_path:
-            _systemctl("--user", "daemon-reload", system=False)
+            _systemctl("daemon-reload", system=False)
             ok = _systemctl("enable", _SERVICE_NAME, system=False)
             if ok:
                 logger.info("systemd startup registered (user-scoped)")

@@ -4143,14 +4143,56 @@ def _is_agent_active(zw_client):
 
 def _is_daemon_running():
     if sys.platform != "win32":
-        lock_path = _daemon_lock_path(get_base_dir())
-        if os.path.exists(lock_path):
+        base_dir = get_base_dir()
+        # Linux daemon writes .zerowatch.lock in the shared secure state dir.
+        # Keep daemon.lock as a legacy fallback for older builds.
+        lock_candidates = [
+            os.path.join(_secure_state_dir(base_dir), ".zerowatch.lock"),
+            "/var/lib/zerowatch/state/.zerowatch.lock",
+            _daemon_lock_path(base_dir),
+        ]
+        for lock_path in lock_candidates:
+            if not os.path.exists(lock_path):
+                continue
             try:
-                with open(lock_path, "r") as f:
+                with open(lock_path, "r", encoding="utf-8") as f:
                     pid = int(f.read().strip())
                 os.kill(pid, 0)
                 return True
             except (OSError, ValueError):
+                continue
+
+        # Final safety net: detect any already-running daemon process regardless
+        # of owning user so sudo and non-sudo launches do not fork duplicates.
+        if sys.platform.startswith("linux"):
+            try:
+                exe_base = os.path.basename(get_exe_path()).lower()
+                proc = subprocess.run(
+                    ["ps", "-eo", "pid=,args="],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if proc.returncode == 0:
+                    self_pid = os.getpid()
+                    for line in proc.stdout.splitlines():
+                        row = line.strip()
+                        if not row:
+                            continue
+                        parts = row.split(None, 1)
+                        if len(parts) < 2:
+                            continue
+                        pid_str, cmd = parts
+                        try:
+                            pid = int(pid_str)
+                        except ValueError:
+                            continue
+                        if pid == self_pid:
+                            continue
+                        cmd_l = cmd.lower()
+                        if "--daemon" in cmd_l and exe_base and exe_base in cmd_l:
+                            return True
+            except Exception:
                 pass
         return False
 
@@ -4218,6 +4260,29 @@ def _spawn_daemon_process():
     except Exception as e:
         logging.error(f"Failed to spawn daemon: {e}")
         return False, None
+
+
+def _auto_bootstrap_background_agent() -> None:
+    """Ensure startup persistence and background daemon are active for GUI sessions."""
+    if sys.platform == "win32":
+        return
+
+    # Make startup persistence idempotent so a single GUI launch is enough.
+    try:
+        register_startup_registry()
+    except Exception as exc:
+        logging.warning("Autostart registration failed: %s", exc)
+
+    # Start daemon if not already running.
+    try:
+        if not _is_daemon_running():
+            started, pid = _spawn_daemon_process()
+            if started:
+                logging.info("Auto-started background daemon (pid=%s).", pid)
+            else:
+                logging.warning("Daemon auto-start command executed but process did not stay alive.")
+    except Exception as exc:
+        logging.warning("Background daemon auto-start failed: %s", exc)
 
 
 def _gui_display_available() -> bool:
@@ -7976,12 +8041,9 @@ def run_interactive():
         else:
             prompt_consent(base_dir, force_show=False)
 
-        # Ensure a daemon is running so background monitoring persists.
-        try:
-            if not _is_daemon_running():
-                _spawn_daemon_process()
-        except Exception:
-            pass
+        # Single-command UX: launching GUI also ensures background daemon and
+        # startup persistence are active for both sudo and non-sudo launches.
+        _auto_bootstrap_background_agent()
 
         # Default routing logic with a 2-second "Server Veto"
         is_enrolled_locally = zw_client.is_enrolled()

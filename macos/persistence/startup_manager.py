@@ -68,6 +68,11 @@ PLIST_FILENAME = f"{LAUNCHD_LABEL}.plist"
 DAEMON_DIR = "/Library/LaunchDaemons"
 PLIST_PATH = os.path.join(DAEMON_DIR, PLIST_FILENAME)
 
+LAUNCHAGENT_LABEL = "io.deepcytes.zerowatch.agent.user"
+LAUNCHAGENT_FILENAME = f"{LAUNCHAGENT_LABEL}.plist"
+LAUNCHAGENT_DIR = os.path.expanduser("~/Library/LaunchAgents")
+LAUNCHAGENT_PATH = os.path.join(LAUNCHAGENT_DIR, LAUNCHAGENT_FILENAME)
+
 # Plist file permissions — must NOT be world-writable for launchd to load it.
 PLIST_FILE_MODE = 0o644   # rw-r--r--
 PLIST_DIR_MODE  = 0o755   # rwxr-xr-x
@@ -251,6 +256,23 @@ def _bootstrap(plist_path: str) -> bool:
     return ok
 
 
+def _bootstrap_user(plist_path: str) -> bool:
+    """Bootstrap a LaunchAgent for the current user session."""
+    uid = os.getuid()
+    domain_targets = [f"gui/{uid}", f"user/{uid}"]
+    for domain in domain_targets:
+        ok, stdout, stderr = _launchctl("bootstrap", domain, plist_path)
+        if ok:
+            logger.info("launchd bootstrap succeeded for user domain %s: %s", domain, LAUNCHAGENT_LABEL)
+            return True
+        if "already" in stderr.lower() or "exists" in stderr.lower():
+            logger.info("User service already bootstrapped — treating as success: %s", LAUNCHAGENT_LABEL)
+            return True
+        logger.debug("launchd bootstrap for %s failed: %s", domain, stderr.strip())
+    logger.error("launchd bootstrap failed for all user domains: %s", domain_targets)
+    return False
+
+
 def _bootout(plist_path: str) -> bool:
     """
     Remove a LaunchDaemon from the system domain.
@@ -275,6 +297,29 @@ def _bootout(plist_path: str) -> bool:
             return True
         logger.warning("launchd bootout returned non-zero: %s", stderr.strip())
     return ok
+
+
+def _bootout_user(plist_path: str) -> bool:
+    """Remove a user LaunchAgent from common user launchd domains."""
+    uid = os.getuid()
+    domain_targets = [f"gui/{uid}", f"user/{uid}"]
+    any_success = False
+    for domain in domain_targets:
+        ok, stdout, stderr = _launchctl("bootout", domain, plist_path)
+        if ok:
+            any_success = True
+            continue
+        stderr_lower = stderr.lower()
+        if (
+            "no such process" in stderr_lower
+            or "not loaded" in stderr_lower
+            or "does not exist" in stderr_lower
+            or "no such file" in stderr_lower
+            or "no job" in stderr_lower
+        ):
+            any_success = True
+            continue
+    return any_success
 
 
 # ── Path validation ────────────────────────────────────────────────────────────
@@ -327,18 +372,53 @@ class MacOSPersistenceManager(PersistenceManager):
         if not _validate_exe_path(exe_path):
             return False
 
+        # If a system LaunchDaemon is already installed, skip user LaunchAgent
+        # registration to prevent duplicate root+user background processes.
+        if os.geteuid() != 0 and os.path.isfile(PLIST_PATH):
+            # Best-effort cleanup of legacy per-user agent from older builds.
+            try:
+                _bootout_user(LAUNCHAGENT_PATH)
+            except Exception:
+                pass
+            try:
+                if os.path.isfile(LAUNCHAGENT_PATH):
+                    os.remove(LAUNCHAGENT_PATH)
+            except OSError:
+                pass
+            logger.info(
+                "System LaunchDaemon already present (%s). Skipping user LaunchAgent registration.",
+                PLIST_PATH,
+            )
+            return True
+
+        if os.geteuid() == 0:
+            plist_data = _build_plist(
+                exe_path=exe_path,
+                daemon_args=daemon_args,
+                stdout_path="/var/log/zerowatch-agent.log",
+                stderr_path="/var/log/zerowatch-agent-error.log",
+            )
+            plist_path = _write_plist(plist_data, PLIST_PATH)
+            if plist_path is None:
+                return False
+            return _bootstrap(plist_path)
+
+        # Non-root fallback: persist as LaunchAgent for the current user.
+        user_logs_dir = os.path.expanduser("~/Library/Logs")
+        try:
+            os.makedirs(user_logs_dir, mode=0o755, exist_ok=True)
+        except OSError:
+            pass
         plist_data = _build_plist(
             exe_path=exe_path,
             daemon_args=daemon_args,
-            stdout_path="/var/log/zerowatch-agent.log",
-            stderr_path="/var/log/zerowatch-agent-error.log",
+            stdout_path=os.path.join(user_logs_dir, "zerowatch-agent.log"),
+            stderr_path=os.path.join(user_logs_dir, "zerowatch-agent-error.log"),
         )
-
-        plist_path = _write_plist(plist_data, PLIST_PATH)
+        plist_path = _write_plist(plist_data, LAUNCHAGENT_PATH)
         if plist_path is None:
             return False
-
-        return _bootstrap(plist_path)
+        return _bootstrap_user(plist_path)
 
     def unregister_startup(self) -> bool:
         """
@@ -351,6 +431,7 @@ class MacOSPersistenceManager(PersistenceManager):
         Returns True if the agent is no longer registered after this call.
         """
         ok = _bootout(PLIST_PATH)
+        user_ok = _bootout_user(LAUNCHAGENT_PATH)
 
         # Remove the plist even if bootout failed (cleanup is best-effort)
         if os.path.isfile(PLIST_PATH):
@@ -367,11 +448,18 @@ class MacOSPersistenceManager(PersistenceManager):
             except OSError as exc:
                 logger.warning("Failed to remove plist %s: %s", PLIST_PATH, exc)
 
-        return ok
+        if os.path.isfile(LAUNCHAGENT_PATH):
+            try:
+                os.remove(LAUNCHAGENT_PATH)
+                logger.info("Removed plist: %s", LAUNCHAGENT_PATH)
+            except OSError as exc:
+                logger.warning("Failed to remove plist %s: %s", LAUNCHAGENT_PATH, exc)
+
+        return ok or user_ok
 
     def is_persistence_active(self) -> bool:
         """
         Check whether the ZeroWatch plist is currently installed on disk.
         Does NOT verify whether launchd has the service bootstrapped.
         """
-        return os.path.isfile(PLIST_PATH)
+        return os.path.isfile(PLIST_PATH) or os.path.isfile(LAUNCHAGENT_PATH)
