@@ -808,7 +808,21 @@ class LinuxAgent:
             logger.error("Could not authenticate after %d attempts — exiting", max_retries)
             return 1
 
-        # Initial L0 scan (fast — package managers only)
+        # ── Send immediate heartbeat right after enrollment/auth ──────────────
+        # This keeps lastSeen fresh while the initial scan (up to 60s) runs.
+        # Without this, the backend marks the device Offline before the first
+        # heartbeat from _monitor_loop fires (which starts only after the scan).
+        logger.info("Sending immediate post-enrollment heartbeat...")
+        self._heartbeat()
+
+        # ── Start monitor thread BEFORE the scan ──────────────────────────────
+        # The scan can block for up to 60s. Starting heartbeats early ensures
+        # the backend never drops the device to Offline during that window.
+        monitor = threading.Thread(target=self._monitor_loop, daemon=True, name="linux-monitor")
+        monitor.start()
+        logger.info("Heartbeat monitor started (interval=%ds).", HEARTBEAT_INTERVAL)
+
+        # Initial combined scan (L0+L1+L2, 60s deadline)
         self._initial_scan_and_sync()
 
         # Start background L1/L2 filesystem scans (4h priority / 24h deep)
@@ -822,10 +836,6 @@ class LinuxAgent:
             )
         except Exception:
             logger.exception("Failed to start daemon OTA monitor; continuing without OTA")
-
-        # Start background L0 monitor thread (heartbeat + 60s registry delta)
-        monitor = threading.Thread(target=self._monitor_loop, daemon=True, name="linux-monitor")
-        monitor.start()
 
         logger.info("ZeroWatch Linux Agent running. Press Ctrl+C to stop.")
 
