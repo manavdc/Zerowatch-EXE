@@ -6354,6 +6354,7 @@ class DashboardFrame(tk.Frame):
     def build_sidebar(self):
         tk.Frame(self.sidebar, bg=self.c_bg_sidebar, height=20).pack()
         self.sidebar_items = {}
+        self._current_page = "dashboard"
         
         def switch_page(page_name):
             if page_name == "settings":
@@ -6369,6 +6370,7 @@ class DashboardFrame(tk.Frame):
                     mb.showerror("Access Denied", "This feature can only be accessed with administrator access.")
                     return
             
+            self._current_page = page_name
             for name, (item_frame, indicator, label) in self.sidebar_items.items():
                 if name == page_name:
                     item_frame.config(bg=self.c_cyan_dark, highlightthickness=1)
@@ -6413,6 +6415,8 @@ class DashboardFrame(tk.Frame):
             self.update_idletasks()
             self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
 
+        self.switch_page = switch_page
+
         def create_menu_item(name, text, is_active=False):
             bg_col = self.c_cyan_dark if is_active else self.c_bg_sidebar
             fg_col = self.c_cyan if is_active else self.c_gray
@@ -6437,6 +6441,46 @@ class DashboardFrame(tk.Frame):
         create_menu_item("team_details", "TEAM DETAILS", is_active=False)
         create_menu_item("info", "DATA INFO", is_active=False)
         create_menu_item("settings", "SETTINGS", is_active=False)
+
+        self._update_sidebar_menu()
+
+    def _is_individual_plan(self):
+        team_info = getattr(self.zw_client, "team_info", None) or {}
+        join_state = getattr(self.zw_client, "join_state", None)
+        if not join_state or not isinstance(join_state, dict):
+            try:
+                join_state = self.zw_client._load_join_state() or {}
+            except Exception:
+                join_state = {}
+
+        team_name = str(team_info.get("teamName") or join_state.get("teamName") or "").strip().lower()
+        team_code = str(team_info.get("teamCode") or join_state.get("teamCode") or "").strip()
+        plan_type = str(team_info.get("planType") or join_state.get("planType") or "").strip().lower()
+        org_name = str(team_info.get("organizationName") or join_state.get("organizationName") or "").strip().lower()
+
+        if plan_type in ("individual", "premium_individual", "free"):
+            return True
+        if team_name in ("individual", "individual plan") or org_name == "individual":
+            return True
+        if team_code == "000000":
+            return True
+        return False
+
+    def _update_sidebar_menu(self):
+        if not hasattr(self, "sidebar_items") or "team_details" not in self.sidebar_items:
+            return
+        
+        item, indicator, label = self.sidebar_items["team_details"]
+        if self._is_individual_plan():
+            item.pack_forget()
+            if getattr(self, "_current_page", "dashboard") == "team_details":
+                self.switch_page("dashboard")
+        else:
+            if "info" in self.sidebar_items:
+                info_item = self.sidebar_items["info"][0]
+                item.pack(before=info_item, fill=tk.X, pady=2)
+            else:
+                item.pack(fill=tk.X, pady=2)
 
     def build_main_area(self):
         self.page_dashboard = tk.Frame(self.main_area, bg=self.c_bg_base)
@@ -7312,6 +7356,8 @@ class DashboardFrame(tk.Frame):
         self._update_pie_chart(stats)
         self._update_cve_list("recent", stats.get("topRecent", []))
         self._update_cve_list("severe", stats.get("topSevere", []))
+        self._update_sidebar_menu()
+        self._refresh_team_details()
 
     def _update_metric(self, key, value):
         label = self.metric_labels.get(key)
