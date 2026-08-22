@@ -820,10 +820,12 @@ class ScanOrchestrator:
             while not self._bg_stop.is_set():
                 now = time.time()
 
-                run_deep     = (
-                    not is_cold_start
-                    and self._deep_scan_interval > 0
-                    and now - last_deep_scan >= self._deep_scan_interval
+                run_deep = (
+                    is_cold_start
+                    or (
+                        self._deep_scan_interval > 0
+                        and now - last_deep_scan >= self._deep_scan_interval
+                    )
                 )
                 run_priority = (
                     not run_deep

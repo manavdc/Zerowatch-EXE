@@ -2010,7 +2010,7 @@ class ZeroWatchClient:
 
         def _sync_worker():
             try:
-                software = get_installed_software_registry()
+                software = get_full_software_inventory(self.base_dir, include_filesystem=True)
                 hardware_data = get_detailed_hardware_profile()
                 sync_ok = self.sync_full(software, hardware_data)
                 if sync_ok:
@@ -2831,6 +2831,31 @@ def _parse_registry_install_date(raw_value):
         "source": "unparsed",
         "confidence": "low",
     }
+
+def get_full_software_inventory(base_dir=None, include_filesystem=True):
+    """
+    Complete software scanner: executes Layer 0 (Registry, Store, drivers, OS)
+    and Layer 1 + Layer 2 (PE binaries and manifests across the filesystem).
+    """
+    try:
+        from scanner import ScanOrchestrator
+        from platforms import PlatformFactory
+        if not base_dir:
+            base_dir = get_base_dir()
+        platform = PlatformFactory.create(get_installed_software_registry)
+        orch = ScanOrchestrator(
+            base_dir=base_dir,
+            existing_registry_fn=get_installed_software_registry,
+            agent_version=AGENT_VERSION,
+            software_collector=platform.software_collector,
+            binary_inspector=platform.binary_inspector,
+            filesystem_walker=platform.filesystem_walker,
+        )
+        orch.load_snapshot_from_cache()
+        return orch.run_full_scan(include_filesystem=include_filesystem)
+    except Exception as exc:
+        logging.warning("Full software inventory scan fallback to registry: %s", exc)
+        return get_installed_software_registry()
 
 def get_installed_software_registry():
     """
@@ -4553,14 +4578,14 @@ def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
     Called after every re-enrollment event (unlink, auth failure, license renewal).
     """
     try:
-        # Step 1: Layer 0 inventory sync
+        # Step 1: Full inventory sync (Layer 0 + Layer 1 + Layer 2)
         if orchestrator is not None:
-            software = orchestrator.run_full_scan(include_filesystem=False)
+            software = orchestrator.run_full_scan(include_filesystem=True)
         else:
-            software = get_installed_software_registry()
+            software = get_full_software_inventory(base_dir, include_filesystem=True)
         hardware_data = get_detailed_hardware_profile()
         zw_client.sync_full(software, hardware_data)
-        logging.info("[RE-ENROLL] Layer 0 sync complete.")
+        logging.info("[RE-ENROLL] Full inventory sync complete.")
 
         if orchestrator is not None:
             # Step 2: Flush cached filesystem items as delta
@@ -5419,10 +5444,9 @@ def main_agent():
         logging.info("Running full software + hardware inventory...")
 
         if _orchestrator is not None:
-            # Phase A: Layer 0 only (registry, Store, drivers, OS version).
-            # Completes in <1s — submit to backend immediately so the first
-            # heartbeat is never delayed by a slow filesystem walk.
-            software = _orchestrator.run_full_scan(include_filesystem=False)
+            # Phase A: Full scan including Layer 0 (registry, Store, drivers, OS)
+            # and Layer 1 + 2 (deep filesystem, PE binaries, manifests).
+            software = _orchestrator.run_full_scan(include_filesystem=True)
         else:
             # Fallback: existing registry scanner (unchanged behaviour).
             software = get_installed_software_registry()
@@ -7312,8 +7336,8 @@ class DashboardFrame(tk.Frame):
                 # Fallback sync if daemon is not running
                 if not getattr(self, "inventory_synced", False):
                     if not _is_daemon_running():
-                        logging.info("GUI: Daemon not running. Triggering fallback full sync...")
-                        software = get_installed_software_registry()
+                        logging.info("GUI: Daemon not running. Triggering fallback full deep scan sync...")
+                        software = get_full_software_inventory(self.zw_client.base_dir, include_filesystem=True)
                         hardware_data = get_detailed_hardware_profile()
                         self.zw_client.sync_full(software, hardware_data)
                         self.inventory_synced = True
