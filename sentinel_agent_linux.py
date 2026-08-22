@@ -661,17 +661,97 @@ class LinuxAgent:
         return False
 
     def _initial_scan_and_sync(self) -> None:
-        """Run full L0 scan and push to backend immediately."""
-        logger.info("Running initial full scan (L0 — registry/packages)...")
-        try:
-            items = self._orchestrator.run_full_scan(
-                include_filesystem=False,  # L0 only; filesystem handled by start_periodic_scans()
-                stop_event=self._shutdown_event,
+        """Run a combined L0 + L1/L2 scan and push complete inventory immediately.
+
+        Strategy:
+          1. Attempt a full scan (all layers) with a 60-second deadline.
+          2. If it finishes in time → sync everything in one payload.
+          3. If the deadline is exceeded → immediately sync L0-only results so the
+             device goes Active right away; background periodic scans will follow
+             up with L1/L2 deltas.
+        """
+        _FULL_SCAN_TIMEOUT = 60  # seconds
+
+        full_items: list = []
+        full_scan_done = threading.Event()
+        full_scan_error: list = []  # mutable container to capture exception from thread
+
+        def _run_full():
+            try:
+                result = self._orchestrator.run_full_scan(
+                    include_filesystem=True,  # L0 + L1 + L2
+                    stop_event=self._shutdown_event,
+                )
+                full_items.extend(result)
+            except Exception as exc:
+                full_scan_error.append(exc)
+            finally:
+                full_scan_done.set()
+
+        logger.info(
+            "Initial scan: attempting full L0+L1+L2 scan (timeout=%ds)...",
+            _FULL_SCAN_TIMEOUT,
+        )
+        scan_thread = threading.Thread(target=_run_full, daemon=True, name="initial-full-scan")
+        scan_thread.start()
+
+        completed_in_time = full_scan_done.wait(timeout=_FULL_SCAN_TIMEOUT)
+
+        if completed_in_time and not full_scan_error:
+            logger.info(
+                "Full scan completed within %ds — syncing %d items in one shot.",
+                _FULL_SCAN_TIMEOUT, len(full_items),
             )
-            logger.info("Initial L0 scan: %d software items", len(items))
+            self._sync_full_with_retry(full_items)
+            return
+
+        # ── Timeout (or error) path: fall back to fast L0-only sync ──────────
+        if not completed_in_time:
+            logger.warning(
+                "Full scan exceeded %ds timeout — falling back to L0-only immediate sync. "
+                "L1/L2 results will arrive via background delta.",
+                _FULL_SCAN_TIMEOUT,
+            )
+        else:
+            logger.warning(
+                "Full scan encountered an error (%s) — falling back to L0-only sync.",
+                full_scan_error[0],
+            )
+
+        try:
+            raw_items = self._platform.software_collector.collect_software()
+            items = []
+            for item in raw_items:
+                try:
+                    if hasattr(item, "to_api_dict"):
+                        items.append(item.to_api_dict())
+                    elif isinstance(item, dict):
+                        items.append(item)
+                    else:
+                        items.append({
+                            "name":     getattr(item, "name", ""),
+                            "version":  getattr(item, "version", ""),
+                            "vendor":   getattr(item, "vendor", ""),
+                            "source":   getattr(item, "source", "package"),
+                            "category": getattr(item, "category", "software"),
+                        })
+                except Exception:
+                    pass
+
+            logger.info("Fallback L0 scan: %d items — syncing now.", len(items))
             self._sync_full_with_retry(items)
+
+            # Seed orchestrator snapshot so subsequent deltas are accurate
+            try:
+                with self._orchestrator._snapshot_lock:
+                    for item in raw_items:
+                        if hasattr(item, "dedup_key"):
+                            self._orchestrator._last_snapshot[item.dedup_key()] = item
+            except Exception as seed_exc:
+                logger.debug("Snapshot seed skipped (non-fatal): %s", seed_exc)
+
         except Exception as exc:
-            logger.error("Initial scan failed: %s", exc, exc_info=True)
+            logger.error("Fallback L0 scan failed: %s", exc, exc_info=True)
 
     def _on_fs_delta(self, added_items: list, removed_items: list) -> None:
         """
