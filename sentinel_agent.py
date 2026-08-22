@@ -1916,14 +1916,18 @@ class ZeroWatchClient:
         if not self.jwt or not self.license_active: return False
         payload = {
             "device_id": self.device_id,
+            "deviceId": self.device_id,
             "username": self.operator_username,
             "inventory": [],
+            "software": [],
             "hardware": hardware_info
         }
         try:
             formatted_software = []
             for item in (software_list or []):
-                if hasattr(item, "to_dict"):
+                if hasattr(item, "to_api_dict"):
+                    d = item.to_api_dict()
+                elif hasattr(item, "to_dict"):
                     d = item.to_dict()
                 elif isinstance(item, dict):
                     d = item
@@ -1936,11 +1940,13 @@ class ZeroWatchClient:
                     "version": d.get("version"),
                     "vendor": d.get("vendor"),
                     "install_date": d.get("install_date"),
-                    "source": d.get("source")
+                    "source": d.get("source"),
+                    "category": d.get("category", "software")
                 })
 
             payload["inventory"] = formatted_software
-            resp = self.session.post(f"{AGENT_API_URL}/sync/full", headers=self._auth_headers(), json=payload, timeout=30)
+            payload["software"] = formatted_software
+            resp = self.session.post(f"{AGENT_API_URL}/sync/full", headers=self._auth_headers(), json=payload, timeout=60)
             self.last_server_status = resp.status_code
             data = self._parse_server_payload(resp)
             if self._handle_unlinked_response(resp, data):
@@ -7355,9 +7361,16 @@ class DashboardFrame(tk.Frame):
         self.after(30000, self.fetch_dashboard_data)
 
     def _fetch_worker(self):
-        """Internal threaded data fetch."""
+        """Internal threaded data fetch and heartbeat ping."""
         def _worker():
             try:
+                # 1. Continuous heartbeat to backend so device stays Active on backend
+                if self.zw_client.jwt:
+                    try:
+                        self.zw_client.heartbeat()
+                    except Exception as hb_err:
+                        logging.debug("GUI heartbeat ping error: %s", hb_err)
+
                 info = self.zw_client.get_asset_info()
                 if info == "unlinked":
                     logging.warning("Device unlinked by admin. Redirecting to enrollment.")
@@ -7365,26 +7378,73 @@ class DashboardFrame(tk.Frame):
                     self.after(0, self.master.show_enrollment)
                     return
 
-                # Ensure initial inventory scan & sync runs if server has no software
+                # 2. Ensure initial inventory scan & sync runs if server has no software
                 if not getattr(self, "inventory_synced", False):
                     product_count = (info.get("stats", {}) or {}).get("productCount") if isinstance(info, dict) else None
                     if product_count is None or product_count == 0:
-                        logging.info("GUI: No server inventory detected. Triggering full software scan & sync...")
-                        try:
-                            software = get_full_software_inventory(self.zw_client.base_dir, include_filesystem=True)
-                            hardware_data = get_detailed_hardware_profile()
-                            if self.zw_client.sync_full(software, hardware_data):
+                        logging.info("GUI: No server inventory detected. Triggering full scan (60s deadline)...")
+                        hardware_data = get_detailed_hardware_profile()
+                        
+                        _FULL_SCAN_TIMEOUT = 60  # seconds
+                        full_items = []
+                        full_scan_done = threading.Event()
+                        full_scan_err = []
+
+                        def _run_full():
+                            try:
+                                res = get_full_software_inventory(self.zw_client.base_dir, include_filesystem=True)
+                                if isinstance(res, list):
+                                    full_items.extend(res)
+                            except Exception as exc:
+                                full_scan_err.append(exc)
+                            finally:
+                                full_scan_done.set()
+
+                        scan_thread = threading.Thread(target=_run_full, daemon=True, name="gui-initial-full-scan")
+                        scan_thread.start()
+
+                        # Wait up to 60 seconds for full scan to complete
+                        completed_in_time = full_scan_done.wait(timeout=_FULL_SCAN_TIMEOUT)
+
+                        if completed_in_time and not full_scan_err and full_items:
+                            logging.info("GUI: Full scan completed within %ds — syncing %d items in one shot.", _FULL_SCAN_TIMEOUT, len(full_items))
+                            if self.zw_client.sync_full(full_items, hardware_data):
                                 self.inventory_synced = True
-                                logging.info(
-                                    "GUI: Initial full scan & sync completed (%d items).",
-                                    len(software) if isinstance(software, list) else 0,
-                                )
-                                # Re-fetch asset info immediately to show fresh stats
-                                fresh_info = self.zw_client.get_asset_info()
-                                if isinstance(fresh_info, dict):
-                                    info = fresh_info
-                        except Exception as sync_exc:
-                            logging.warning("GUI: Initial full scan & sync failed: %s", sync_exc)
+                        else:
+                            # 60s deadline exceeded or error: fallback to fast L0 sync immediately
+                            if not completed_in_time:
+                                logging.warning("GUI: Full scan exceeded %ds timeout — falling back to L0-only immediate sync.", _FULL_SCAN_TIMEOUT)
+                            else:
+                                logging.warning("GUI: Full scan error (%s) — falling back to L0-only sync.", full_scan_err[0] if full_scan_err else "unknown")
+
+                            try:
+                                l0_software = get_installed_software_registry()
+                                if self.zw_client.sync_full(l0_software, hardware_data):
+                                    self.inventory_synced = True
+                                    logging.info("GUI: Fallback L0 sync completed (%d items).", len(l0_software) if isinstance(l0_software, list) else 0)
+
+                                # Follow up with deep scan deltas once the background thread completes
+                                def _bg_wait_and_delta():
+                                    full_scan_done.wait()
+                                    if full_items:
+                                        try:
+                                            self.zw_client.sync_full(full_items, hardware_data)
+                                            logging.info("GUI: Background full scan sync completed (%d items).", len(full_items))
+                                        except Exception as bg_err:
+                                            logging.debug("GUI background sync error: %s", bg_err)
+
+                                threading.Thread(target=_bg_wait_and_delta, daemon=True, name="gui-bg-followup").start()
+
+                            except Exception as fb_exc:
+                                logging.error("GUI: Fallback L0 sync failed: %s", fb_exc)
+
+                        # Re-fetch asset info immediately to show fresh stats
+                        try:
+                            fresh_info = self.zw_client.get_asset_info()
+                            if isinstance(fresh_info, dict):
+                                info = fresh_info
+                        except Exception:
+                            pass
                     else:
                         self.inventory_synced = True
 
@@ -8258,6 +8318,52 @@ def main():
     # 1. Immediate Console Hiding
     if "--password-prompt" not in sys.argv and "--reset" not in sys.argv:
         hide_console()
+
+    # 1.1  macOS sudo → user session re-launch
+    #
+    # When invoked as `sudo ./SentinelAgent` on macOS the process runs as root,
+    # which has no access to the user's window server (Aqua). We detect this and
+    # immediately re-exec into the real user's login session via
+    # `launchctl asuser <uid>` — the standard macOS mechanism for this.
+    #
+    # This applies ONLY to GUI-mode invocations (not --daemon / --watchdog),
+    # and ensures root and normal-user execution paths are 100% identical:
+    # the same binary, same args, same consent dialog, same everything.
+    if (
+        sys.platform == "darwin"
+        and hasattr(os, "geteuid") and os.geteuid() == 0
+        and "--daemon" not in sys.argv
+        and "--watchdog" not in sys.argv
+    ):
+        import subprocess
+        sudo_user = os.environ.get("SUDO_USER", "").strip()
+        if sudo_user and sudo_user != "root":
+            try:
+                # Resolve the numeric UID of the console user
+                import pwd
+                console_uid = pwd.getpwnam(sudo_user).pw_uid
+                exe = os.path.abspath(sys.argv[0])
+                # launchctl asuser <uid> runs the process inside the user's
+                # bootstrap/window-server session — identical to the user
+                # double-clicking the binary from Finder.
+                cmd = ["launchctl", "asuser", str(console_uid), exe] + sys.argv[1:]
+                logging.info(
+                    "macOS GUI: re-launching as user '%s' (uid=%d) via launchctl asuser",
+                    sudo_user, console_uid,
+                )
+                result = subprocess.run(cmd, check=False)
+                sys.exit(result.returncode)
+            except Exception as exc:
+                logging.warning(
+                    "macOS GUI: launchctl re-launch failed (%s). "
+                    "Falling back — run as: ./SentinelAgent-macos-arm64 (no sudo) for the GUI.",
+                    exc,
+                )
+        elif not sudo_user:
+            logging.warning(
+                "macOS GUI: running as root with no SUDO_USER. "
+                "GUI may not open. Run without sudo for the GUI, use sudo --daemon for the background agent."
+            )
 
     # 1.5  Post-update .bak cleanup — runs in the NEW agent after an OTA swap.
     #      startup_bak_cleanup() is a no-op if no .bak exists (normal start).
