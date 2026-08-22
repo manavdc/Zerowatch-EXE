@@ -202,17 +202,15 @@ def inspect_elf_file(
         if cached is not None:
             return cached
 
-    # System shared libraries in standard system paths are already fully captured
-    # at the package level in Layer 0 (e.g. dpkg/rpm/pacman). Avoid spawning thousands
+    # Binaries and shared libraries in standard system paths are already fully captured
+    # at the package level in Layer 0 (e.g. dpkg/rpm/pacman/snap). Avoid spawning thousands
     # of redundant subprocesses for them.
-    source = _source_for_path(filepath)
-    if source == SOURCE_ELF_LIB and filepath.startswith(("/usr/lib", "/lib", "/usr/lib64", "/lib64", "/usr/share")):
+    if filepath.startswith(("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/lib", "/lib", "/usr/lib64", "/lib64", "/usr/share")):
         if cache is not None:
             cache.store(filepath, mtime_ns, size_bytes, [], layer=1)
         return []
 
-    # Try package ownership — dpkg (Debian/Ubuntu) → rpm (RHEL/Fedora) →
-    # pacman (Arch/Manjaro) → apk (Alpine) — first match wins.
+    # Try package ownership for non-system/custom binaries — dpkg → rpm → pacman → apk
     owner = _dpkg_owner(filepath) or _rpm_owner(filepath) or _pacman_owner(filepath) or _apk_owner(filepath)
 
     if owner:

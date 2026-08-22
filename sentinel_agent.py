@@ -1503,11 +1503,14 @@ class ZeroWatchClient:
 
     def _load_jwt(self):
         _append_gui_log(self.base_dir, f"Attempting to load JWT from {self.token_file}")
-        token_paths = [self.token_file]
+        token_paths = [
+            self.token_file,
+            os.path.join(os.path.dirname(self.token_file), "agent_token.enc"),
+        ]
         # Linux legacy state is migrated into the shared directory before this
         # method runs. Do not fall back to a per-user token there, otherwise a
         # permission problem could silently create a second linked identity.
-        if not sys.platform.startswith("linux"):
+        if not sys.platform.startswith("linux") and sys.platform != "darwin":
             token_paths.append(_legacy_state_path(self.base_dir, "zerowatch_token.dat"))
         for token_path in token_paths:
             if os.path.exists(token_path):
@@ -1546,6 +1549,15 @@ class ZeroWatchClient:
                     f.write(encrypted)
                 _append_gui_log(self.base_dir, f"Successfully saved JWT (size={len(encrypted)})")
                 self.jwt = jwt_str
+                # Also save to agent_token.enc for macOS/Linux daemon compatibility
+                if sys.platform != "win32":
+                    try:
+                        agent_token_path = os.path.join(os.path.dirname(self.token_file), "agent_token.enc")
+                        with open(agent_token_path, "wb") as f_enc:
+                            f_enc.write(encrypted)
+                        os.chmod(agent_token_path, 0o666)
+                    except Exception:
+                        pass
                 return True
             else:
                 _append_gui_log(self.base_dir, "Failed to encrypt JWT (encrypt_data returned None)")
@@ -7353,16 +7365,27 @@ class DashboardFrame(tk.Frame):
                     self.after(0, self.master.show_enrollment)
                     return
 
-                # Fallback sync if daemon is not running
+                # Ensure initial inventory scan & sync runs if server has no software
                 if not getattr(self, "inventory_synced", False):
-                    if not _is_daemon_running():
-                        logging.info("GUI: Daemon not running. Triggering fallback full deep scan sync...")
-                        software = get_full_software_inventory(self.zw_client.base_dir, include_filesystem=True)
-                        hardware_data = get_detailed_hardware_profile()
-                        self.zw_client.sync_full(software, hardware_data)
-                        self.inventory_synced = True
+                    product_count = (info.get("stats", {}) or {}).get("productCount") if isinstance(info, dict) else None
+                    if product_count is None or product_count == 0:
+                        logging.info("GUI: No server inventory detected. Triggering full software scan & sync...")
+                        try:
+                            software = get_full_software_inventory(self.zw_client.base_dir, include_filesystem=True)
+                            hardware_data = get_detailed_hardware_profile()
+                            if self.zw_client.sync_full(software, hardware_data):
+                                self.inventory_synced = True
+                                logging.info(
+                                    "GUI: Initial full scan & sync completed (%d items).",
+                                    len(software) if isinstance(software, list) else 0,
+                                )
+                                # Re-fetch asset info immediately to show fresh stats
+                                fresh_info = self.zw_client.get_asset_info()
+                                if isinstance(fresh_info, dict):
+                                    info = fresh_info
+                        except Exception as sync_exc:
+                            logging.warning("GUI: Initial full scan & sync failed: %s", sync_exc)
                     else:
-                        logging.info("GUI: Daemon is running. Skipping fallback sync.")
                         self.inventory_synced = True
 
                 if info:

@@ -248,8 +248,10 @@ def _walk_dir(
                     pass
                 continue
 
-            # Shared libraries
+            # Shared libraries (skip system library dirs already covered by Layer 0)
             if _is_shared_lib(name):
+                if dirpath.startswith(("/usr/lib", "/lib", "/usr/lib64", "/lib64", "/usr/share")):
+                    continue
                 try:
                     st = entry.stat(follow_symlinks=False)
                     if 0 < st.st_size <= MAX_BINARY_SIZE_BYTES:
@@ -258,8 +260,10 @@ def _walk_dir(
                     pass
                 continue
 
-            # ELF executables (executable bit set)
+            # ELF executables (skip standard system distro paths already in Layer 0)
             if _is_elf_binary(entry):
+                if dirpath.startswith(("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/usr/lib", "/lib")):
+                    continue
                 try:
                     st = entry.stat(follow_symlinks=False)
                     if 0 < st.st_size <= MAX_BINARY_SIZE_BYTES:

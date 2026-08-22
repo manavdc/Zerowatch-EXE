@@ -311,17 +311,25 @@ class LinuxAgentSession:
 
     def load_jwt(self) -> bool:
         """Load and decrypt saved JWT. Returns True if valid token found."""
-        if not os.path.exists(self._jwt_path):
-            return False
-        try:
-            with open(self._jwt_path, "rb") as fh:
-                enc = fh.read()
-            raw = self._decrypt(enc)
-            if raw:
-                self._jwt = raw.decode("utf-8").strip()
-                return bool(self._jwt)
-        except Exception as exc:
-            logger.debug("JWT load failed: %s", exc)
+        candidate_paths = [
+            self._jwt_path,
+            os.path.join(self._state_dir, "zerowatch_token.dat"),
+        ]
+        for path in candidate_paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    enc = fh.read()
+                raw = self._decrypt(enc)
+                if raw:
+                    self._jwt = raw.decode("utf-8").strip()
+                    if self._jwt:
+                        if path != self._jwt_path:
+                            self.save_jwt(self._jwt)
+                        return True
+            except Exception as exc:
+                logger.debug("JWT load failed from %s: %s", path, exc)
         return False
 
     def save_jwt(self, token: str) -> None:
@@ -329,19 +337,21 @@ class LinuxAgentSession:
         self._jwt = token
         enc = self._encrypt(token.encode("utf-8"))
         if enc:
-            try:
-                with open(self._jwt_path, "wb") as fh:
-                    fh.write(enc)
-                os.chmod(self._jwt_path, 0o600)
-            except OSError as exc:
-                logger.warning("JWT save failed: %s", exc)
+            for path in (self._jwt_path, os.path.join(self._state_dir, "zerowatch_token.dat")):
+                try:
+                    with open(path, "wb") as fh:
+                        fh.write(enc)
+                    os.chmod(path, 0o600)
+                except OSError as exc:
+                    logger.warning("JWT save failed for %s: %s", path, exc)
 
     def clear_jwt(self) -> None:
         self._jwt = ""
-        try:
-            os.remove(self._jwt_path)
-        except OSError:
-            pass
+        for path in (self._jwt_path, os.path.join(self._state_dir, "zerowatch_token.dat")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def post(self, path: str, payload: dict, timeout: int = 30) -> requests.Response:
         url = f"{self._api_url}{path}"
