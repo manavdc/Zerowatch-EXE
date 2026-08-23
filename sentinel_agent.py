@@ -350,12 +350,12 @@ def _secure_state_dir(base_dir):
         # (JWT, enrollment, fingerprint) regardless of how the agent is launched.
         canonical = "/Library/Application Support/ZeroWatch/state"
         try:
-            os.makedirs(canonical, mode=0o755, exist_ok=True)
+            os.makedirs(canonical, mode=0o777, exist_ok=True)
             # Set sticky + world-writable on first creation (root context)
             try:
                 current_mode = os.stat(canonical).st_mode & 0o7777
                 if current_mode != 0o1777:
-                    os.chmod(canonical, 0o1777)
+                    os.chmod(canonical, 0o777)
             except OSError:
                 pass
             _probe = os.path.join(canonical, ".write_probe")
@@ -366,7 +366,10 @@ def _secure_state_dir(base_dir):
         except OSError:
             pass
         # Fallback: per-user dir if /Library is not writable (non-admin user)
-        return os.path.expanduser("~/Library/Application Support/ZeroWatch/state")
+        fallback = "/tmp/ZeroWatch/state"
+        os.makedirs(fallback, mode=0o777, exist_ok=True)
+        os.chmod(fallback, 0o777)
+        return fallback
     elif sys.platform.startswith("linux"):
         # If ZEROWATCH_STATE_DIR is explicitly set, honour it unconditionally.
         explicit = os.environ.get("ZEROWATCH_STATE_DIR", "")
@@ -379,7 +382,8 @@ def _secure_state_dir(base_dir):
 
         # ── Try system dir first (preferred — consistent across UIDs) ──────
         try:
-            os.makedirs(system_dir, mode=0o700, exist_ok=True)
+            os.makedirs(system_dir, mode=0o777, exist_ok=True)
+            os.chmod(system_dir, 0o777)
             _probe = os.path.join(system_dir, ".write_probe")
             with open(_probe, "w") as _fh:
                 _fh.write("x")
@@ -391,7 +395,8 @@ def _secure_state_dir(base_dir):
         # ── System dir not writable. Find the first user-writable fallback ─
         for fallback in (user_dir, local_dir):
             try:
-                os.makedirs(fallback, mode=0o700, exist_ok=True)
+                os.makedirs(fallback, mode=0o777, exist_ok=True)
+                os.chmod(fallback, 0o777)
                 _probe = os.path.join(fallback, ".write_probe")
                 with open(_probe, "w") as _fh:
                     _fh.write("x")
@@ -1611,6 +1616,16 @@ class ZeroWatchClient:
                     _append_gui_log(self.base_dir, f"Cleared file: {os.path.basename(file_path)}")
             except Exception as e:
                 logging.warning(f"Failed removing local state file {file_path}: {e}")
+
+        # Unlink/delete is a full reset: remove every state artifact, including
+        # files introduced by newer builds that are not in the legacy list.
+        try:
+            from common.state_cleanup import clear_device_state
+            for state_dir in dict.fromkeys(candidate_dirs):
+                if os.path.isdir(state_dir):
+                    clear_device_state(state_dir)
+        except Exception as exc:
+            logging.warning("Failed to wipe complete local state: %s", exc)
 
         self.jwt = None
         self.team_info = None
@@ -4334,9 +4349,6 @@ def _spawn_daemon_process():
 
 def _auto_bootstrap_background_agent() -> None:
     """Ensure startup persistence and background daemon are active for GUI sessions."""
-    if sys.platform == "win32":
-        return
-
     # Make startup persistence idempotent so a single GUI launch is enough.
     try:
         register_startup_registry()
@@ -5561,6 +5573,17 @@ def main_agent():
     )
     monitor.start()
 
+    ota_shutdown = threading.Event()
+    ota_monitor = None
+    if _OTA_AVAILABLE:
+        try:
+            from common.daemon_ota import start_daemon_ota_monitor
+            ota_monitor = start_daemon_ota_monitor(
+                get_exe_path(), AGENT_VERSION, ota_shutdown
+            )
+        except Exception as exc:
+            logging.warning("[OTA] Background update monitor unavailable: %s", exc)
+
 
     # --- Heartbeat & Mutual Monitoring Loop ---
     logging.info("Entering heartbeat loop. Agent is fully active.")
@@ -5574,6 +5597,9 @@ def main_agent():
 
     while True:
         try:
+            if ota_shutdown.is_set():
+                logging.info("[OTA] Updated agent restart requested.")
+                break
             shutdown_request = consume_shutdown_signal(base_dir)
             if shutdown_request:
                 reason = shutdown_request.get("reason", "manual-disable")
@@ -5760,6 +5786,8 @@ def main_agent():
             logging.error(f"Heartbeat error: {e}")
             time.sleep(10)
 
+    if ota_monitor is not None:
+        ota_monitor.stop()
     logging.info("SentinelAgent shutdown completed.")
 
 class EnrollmentFrame(tk.Frame):

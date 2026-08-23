@@ -38,6 +38,9 @@ class DaemonOTAMonitor:
             updater.BinaryDownloader().download(info.target, dest)
             from common.os_replacer import perform_update
             if perform_update(dest, self.current_exe):
+                if os.name == "nt":
+                    from common.os_replacer import _relaunch_detached
+                    _relaunch_detached(self.current_exe)
                 logger.info("[OTA] Update applied; supervisor restart requested.")
                 self.shutdown_event.set()
         except Exception as exc:

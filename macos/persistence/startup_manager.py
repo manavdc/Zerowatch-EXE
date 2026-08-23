@@ -51,6 +51,7 @@ NATIVE VALIDATION: NOT PERFORMED. All launchctl behavior is mocked in tests.
 from __future__ import annotations
 
 import logging
+import base64
 import os
 import plistlib
 import shutil
@@ -419,6 +420,37 @@ class MacOSPersistenceManager(PersistenceManager):
         if plist_path is None:
             return False
         return _bootstrap_user(plist_path)
+
+    def register_startup_authorized(
+        self, exe_path: str, daemon_args: Optional[List[str]] = None
+    ) -> bool:
+        """Install the system LaunchDaemon through macOS authorization UI.
+
+        This is used when a normal GUI user launches the agent for the first
+        time and the system LaunchDaemon directory requires administrator
+        privileges. The plist is encoded before being passed to AppleScript;
+        macOS's BSD base64 uses ``-D`` for decoding.
+        """
+        if not _validate_exe_path(exe_path):
+            return False
+        plist = plistlib.dumps(_build_plist(exe_path, daemon_args), fmt=plistlib.FMT_XML)
+        encoded = base64.b64encode(plist).decode("ascii")
+        script = (
+            'do shell script "mkdir -p /Library/LaunchDaemons; '
+            f'echo {encoded} | /usr/bin/base64 -D > {PLIST_PATH}; '
+            f'/bin/chmod 644 {PLIST_PATH}; '
+            f'/bin/launchctl bootstrap system {PLIST_PATH}" '
+            'with administrator privileges'
+        )
+        try:
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-e", script],
+                capture_output=True, text=True, timeout=60,
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.error("Authorized LaunchDaemon installation failed: %s", exc)
+            return False
 
     def unregister_startup(self) -> bool:
         """

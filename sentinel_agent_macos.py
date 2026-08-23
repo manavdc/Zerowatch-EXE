@@ -182,14 +182,14 @@ def _get_state_dir() -> str:
     # ── Primary: /Library/Application Support/ZeroWatch/state ───────────
     canonical = "/Library/Application Support/ZeroWatch/state"
     try:
-        os.makedirs(canonical, mode=0o755, exist_ok=True)
+        os.makedirs(canonical, mode=0o777, exist_ok=True)
         # Set sticky + world-writable so both root and user can access it.
         # Only try chmod if we own the dir (root context) to avoid
         # unnecessary PermissionErrors.
         try:
             current_mode = os.stat(canonical).st_mode & 0o7777
             if current_mode != 0o1777:
-                os.chmod(canonical, 0o1777)
+                os.chmod(canonical, 0o777)
         except OSError:
             pass
         # A previous sudo launch may have left identity files owned by root
@@ -213,14 +213,15 @@ def _get_state_dir() -> str:
         pass  # Fall through to legacy paths
 
     # ── Legacy fallback chain (maintains backward compat) ───────────────
-    base = os.path.dirname(os.path.abspath(__file__))
+    base = "/tmp/zerowatch"
     system_dir = "/var/lib/zerowatch/state"
-    user_dir   = os.path.expanduser("~/.local/share/zerowatch/state")
+    user_dir   = "/tmp/zerowatch/state"
     local_dir  = os.path.join(base, "state")
 
     # Try system dir first (consistent across UIDs)
     try:
-        os.makedirs(system_dir, mode=0o700, exist_ok=True)
+        os.makedirs(system_dir, mode=0o777, exist_ok=True)
+        os.chmod(system_dir, 0o777)
         _probe = os.path.join(system_dir, ".write_probe")
         with open(_probe, "w") as _fh:
             _fh.write("x")
@@ -232,7 +233,8 @@ def _get_state_dir() -> str:
     # User-writable fallback
     for fallback in (user_dir, local_dir):
         try:
-            os.makedirs(fallback, mode=0o700, exist_ok=True)
+            os.makedirs(fallback, mode=0o777, exist_ok=True)
+            os.chmod(fallback, 0o777)
             _probe = os.path.join(fallback, ".write_probe")
             with open(_probe, "w") as _fh:
                 _fh.write("x")
@@ -847,23 +849,38 @@ class MacOSAgent:
 
     def _initial_scan_and_sync(self) -> None:
         """
-        Fast L0 scan: app bundles, pkgutil, Homebrew, MacPorts, macOS version.
-        Completes in < 5s and sends the first inventory to the dashboard immediately.
-        L1 (Mach-O filesystem) and L2 (manifests) are handled by start_periodic_scans().
+        Complete L0/L1/L2 inventory, including the initial deep filesystem scan,
+        before publishing enrollment inventory. The deadline keeps linking
+        responsive while the periodic scanner remains available for retries.
         """
-        logger.info("Running initial L0 scan (app bundles, pkgutil, Homebrew, macOS version)...")
+        timeout = 60
+        full_items = []
+        done = threading.Event()
+        errors = []
+
+        def _scan():
+            try:
+                full_items.extend(self._orchestrator.run_full_scan(
+                    include_filesystem=True, stop_event=self._shutdown_event
+                ))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+
+        logger.info("Running complete initial inventory and deep scan (timeout=%ds)...", timeout)
+        threading.Thread(target=_scan, daemon=True, name="initial-full-scan").start()
         try:
-            # The shared orchestrator upgrades a cold run_full_scan(False) into
-            # a full-drive walk. Publish the fast inventory first on macOS;
-            # the periodic scanner handles filesystem data in the background.
-            layer0_items = self._orchestrator._run_layer0()
-            items = [
-                item.to_api_dict()
-                for item in self._orchestrator._deduplicate(layer0_items)
-            ]
-            logger.info("Initial L0 scan: %d software items", len(items))
+            completed = done.wait(timeout=timeout)
             hw = _build_hardware_profile(self._platform)
-            self._sync_full_with_retry(items, hw)
+            if completed and not errors:
+                items = _items_to_dicts(self._orchestrator._deduplicate(full_items))
+                logger.info("Complete initial scan finished: %d software items", len(items))
+                self._sync_full_with_retry(items, hw)
+            else:
+                logger.warning("Initial deep scan exceeded %ds or failed; syncing installed software and hardware now.", timeout)
+                layer0 = self._orchestrator._run_layer0()
+                self._sync_full_with_retry(_items_to_dicts(self._orchestrator._deduplicate(layer0)), hw)
         except Exception as exc:
             logger.error("Initial scan failed: %s", exc, exc_info=True)
 

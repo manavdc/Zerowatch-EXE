@@ -2,28 +2,26 @@
 
 from __future__ import annotations
 
-import glob
 import logging
 import os
+import shutil
 
 logger = logging.getLogger("agent.state_cleanup")
 
 
 def clear_device_state(state_dir: str) -> None:
-    """Remove credentials, queues, inventory cache, and SQLite sidecars."""
+    """Wipe every entry in the device state directory, retaining the directory."""
     os.makedirs(state_dir, exist_ok=True)
-    names = {
-        "zerowatch_token.dat", "zw_offline_queue.dat", "zw_team_join_state.dat",
-        "consent_accepted.dat", "device_fingerprint.json", "products.csv",
-        "dashboard_cache.dat", "asset_info.json", "unlink.signal",
-        "shutdown.signal", "sentinel_agent.log",
-        "agent_token.enc", "join_state.json",
-    }
-    paths = [os.path.join(state_dir, name) for name in names]
-    paths.extend(glob.glob(os.path.join(state_dir, "scan_cache.db*")))
-    for path in set(paths):
+    for name in os.listdir(state_dir):
+        path = os.path.join(state_dir, name)
         try:
-            if os.path.isfile(path):
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                try:
+                    os.chmod(path, 0o666)
+                except OSError:
+                    pass
                 os.remove(path)
         except OSError as exc:
             logger.warning("Unable to remove device state %s: %s", path, exc)

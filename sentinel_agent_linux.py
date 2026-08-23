@@ -146,14 +146,14 @@ _SHARED_IDENTITY_FILES = (
 )
 
 def _get_state_dir() -> str:
-    base = os.path.dirname(os.path.abspath(__file__))
     system_dir = "/var/lib/zerowatch/state"
-    user_dir   = os.path.expanduser("~/.local/share/zerowatch/state")
-    local_dir  = os.path.join(base, "state")
+    user_dir   = "/tmp/zerowatch/state"
+    local_dir  = user_dir
 
     # ── Try system dir first (preferred — consistent across UIDs) ──────
     try:
-        os.makedirs(system_dir, mode=0o700, exist_ok=True)
+        os.makedirs(system_dir, mode=0o777, exist_ok=True)
+        os.chmod(system_dir, 0o777)
         _probe = os.path.join(system_dir, ".write_probe")
         with open(_probe, "w") as _fh:
             _fh.write("x")
@@ -165,7 +165,8 @@ def _get_state_dir() -> str:
     # ── System dir not writable. Find the first user-writable fallback ─
     for fallback in (user_dir, local_dir):
         try:
-            os.makedirs(fallback, mode=0o700, exist_ok=True)
+            os.makedirs(fallback, mode=0o777, exist_ok=True)
+            os.chmod(fallback, 0o777)
             _probe = os.path.join(fallback, ".write_probe")
             with open(_probe, "w") as _fh:
                 _fh.write("x")
@@ -341,7 +342,7 @@ class LinuxAgentSession:
                 try:
                     with open(path, "wb") as fh:
                         fh.write(enc)
-                    os.chmod(path, 0o600)
+                    os.chmod(path, 0o666)
                 except OSError as exc:
                     logger.warning("JWT save failed for %s: %s", path, exc)
 

@@ -28,11 +28,13 @@ Service coordination:
 from __future__ import annotations
 
 import logging
+import base64
 import os
 import shutil
 import stat
 import subprocess
 import sys
+import shlex
 import threading
 import time
 from typing import Callable, Optional
@@ -391,12 +393,38 @@ def _swap_macos(new_binary: str, current_exe: str, zw_client=None) -> bool:
             shutil.copy2(bak_path, current_exe)
         except OSError as rb_exc:
             logger.critical("[MACOS SWAP] Rollback failed: %s", rb_exc)
+        if _authorized_replace_macos(new_binary, current_exe, bak_path):
+            return True
         raise SwapError(f"os.replace failed: {exc}") from exc
 
     # 6. Kick launchd — the new agent will call startup_bak_cleanup()
     _launchctl_kickstart()
 
     return True
+
+
+def _authorized_replace_macos(new_binary: str, current_exe: str, bak_path: str) -> bool:
+    """Replace a root-owned installed binary through macOS authorization UI."""
+    if shutil.which("osascript") is None:
+        return False
+    command = (
+        f"/bin/cp {shlex.quote(current_exe)} {shlex.quote(bak_path)}; "
+        f"/bin/cp {shlex.quote(new_binary)} {shlex.quote(current_exe)}; "
+        f"/bin/chmod 755 {shlex.quote(current_exe)}; "
+        f"/bin/rm -f {shlex.quote(new_binary)} {shlex.quote(bak_path)}"
+    )
+    encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
+    script = ('do shell script "echo ' + encoded +
+              ' | /usr/bin/base64 -D | /bin/sh" with administrator privileges')
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", script],
+            capture_output=True, text=True, timeout=120,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.error("[MACOS SWAP] Authorized replacement failed: %s", exc)
+        return False
 
 
 def _strip_quarantine_macos(binary_path: str) -> None:
@@ -517,16 +545,10 @@ def startup_bak_cleanup(current_exe: str) -> None:
         bak_path,
     )
 
-    def _cleanup() -> None:
-        # 30-second grace period confirms the agent started successfully.
-        # If the process crashes before this completes, the daemon thread is
-        # killed automatically and .bak remains for manual recovery.
-        time.sleep(30)
-        _commit_update(bak_path)
-        logger.info("[OTA] Post-update cleanup complete.")
-
-    t = threading.Thread(target=_cleanup, name="post-update-cleanup", daemon=True)
-    t.start()
+    # Reaching this function means the replacement process has started. Remove
+    # the backup now so successful updates never leave a .bak artifact behind.
+    _commit_update(bak_path)
+    logger.info("[OTA] Post-update cleanup complete.")
 
 
 def _rollback(
