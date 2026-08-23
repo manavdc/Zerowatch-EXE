@@ -533,7 +533,9 @@ def _items_to_dicts(items) -> list:
     result = []
     for item in items:
         try:
-            if hasattr(item, "to_api_dict"):
+            if isinstance(item, dict):
+                result.append(item)
+            elif hasattr(item, "to_api_dict"):
                 result.append(item.to_api_dict())
             elif hasattr(item, "to_dict"):
                 result.append(item.to_dict())
@@ -932,20 +934,33 @@ class MacOSAgent:
     def run(self) -> int:
         """Main blocking run loop. Returns process exit code."""
         # Authenticate / enroll (with retry backoff)
-        max_retries = 5
-        for attempt in range(max_retries):
+        attempt = 0
+        while not self._shutdown_event.is_set():
             if self._shutdown_event.is_set():
                 return 0
             if self._register_or_authenticate():
                 break
-            wait = min(RECONNECT_DELAY * (2 ** attempt), 120)
-            logger.info("Retrying in %ds (attempt %d/%d)...", wait, attempt + 1, max_retries)
+            wait = min(RECONNECT_DELAY * (2 ** min(attempt, 4)), 120)
+            attempt += 1
+            logger.info("Retrying authentication in %ds (attempt %d; continuing until linked)...", wait, attempt)
             self._shutdown_event.wait(timeout=wait)
-        else:
-            logger.error("Could not authenticate after %d attempts — exiting", max_retries)
+        if self._shutdown_event.is_set():
+            return 0
+        if not self._session._jwt:
+            logger.error("Authentication loop ended without a JWT")
             return 1
 
-        # Initial scan (L0 fast, then L1+L2)
+        # Keep connectivity alive while the initial inventory/deep scan runs.
+        logger.info("Sending immediate post-enrollment heartbeat...")
+        self._heartbeat()
+        monitor = threading.Thread(
+            target=self._monitor_loop,
+            daemon=True,
+            name="macos-monitor",
+        )
+        monitor.start()
+
+        # Initial scan (L0 + L1 + L2)
         self._initial_scan_and_sync()
 
         # Start periodic filesystem scans (priority + deep) so macOS does a
@@ -953,13 +968,6 @@ class MacOSAgent:
         self._orchestrator.start_periodic_scans(on_delta=self._on_fs_delta)
         logger.info("Periodic filesystem scan started (priority every 4h / deep every 24h).")
 
-        # Start background monitor thread
-        monitor = threading.Thread(
-            target=self._monitor_loop,
-            daemon=True,
-            name="macos-monitor",
-        )
-        monitor.start()
         ota_monitor = None
         try:
             ota_monitor = start_daemon_ota_monitor(

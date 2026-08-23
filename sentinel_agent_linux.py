@@ -394,7 +394,10 @@ def _items_to_dicts(items) -> list:
     result = []
     for item in items:
         try:
-            result.append(item.to_dict() if hasattr(item, "to_dict") else item.__dict__)
+            if isinstance(item, dict):
+                result.append(item)
+            else:
+                result.append(item.to_dict() if hasattr(item, "to_dict") else item.__dict__)
         except Exception:
             pass
     return result
@@ -813,17 +816,20 @@ class LinuxAgent:
     def run(self) -> int:
         """Main blocking run loop. Returns process exit code."""
         # Register/authenticate
-        max_retries = 5
-        for attempt in range(max_retries):
+        attempt = 0
+        while not self._shutdown_event.is_set():
             if self._shutdown_event.is_set():
                 return 0
             if self._register_or_authenticate():
                 break
-            wait = min(RECONNECT_DELAY * (2 ** attempt), 120)
-            logger.info("Retrying in %ds (attempt %d/%d)...", wait, attempt + 1, max_retries)
+            wait = min(RECONNECT_DELAY * (2 ** min(attempt, 4)), 120)
+            attempt += 1
+            logger.info("Retrying authentication in %ds (attempt %d; continuing until linked)...", wait, attempt)
             self._shutdown_event.wait(timeout=wait)
-        else:
-            logger.error("Could not authenticate after %d attempts — exiting", max_retries)
+        if self._shutdown_event.is_set():
+            return 0
+        if not self._session._jwt:
+            logger.error("Authentication loop ended without a JWT")
             return 1
 
         # ── Send immediate heartbeat right after enrollment/auth ──────────────

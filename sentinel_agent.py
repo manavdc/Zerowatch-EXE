@@ -1928,7 +1928,7 @@ class ZeroWatchClient:
     # SYNC
     # ----------------------------------------------------------------
     def sync_full(self, software_list, hardware_info=None):
-        if not self.jwt or not self.license_active: return False
+        if not self.jwt: return False
         if not hardware_info:
             try:
                 hardware_info = get_detailed_hardware_profile()
@@ -1989,7 +1989,7 @@ class ZeroWatchClient:
             return False
 
     def sync_delta(self, added, removed, added_hw=None, removed_hw=None, hardware_snapshot=None):
-        if not self.jwt or not self.license_active: return False
+        if not self.jwt: return False
 
         def _to_dict(it):
             if hasattr(it, "to_dict"): return it.to_dict()
@@ -2088,8 +2088,6 @@ class ZeroWatchClient:
     # ----------------------------------------------------------------
     def heartbeat(self):
         if not self.jwt: return False
-        if not self.license_active:
-            return "license_expired"
         try:
             payload = {
                 "device_id": self.device_id,
@@ -2108,11 +2106,13 @@ class ZeroWatchClient:
             data = self._parse_server_payload(resp)
             if self._handle_unlinked_response(resp, data):
                 return "unlinked"
-            if not self.license_active:
-                return "license_expired"
-            
             # If 401/403, return False to increment safety latch
             if resp.status_code in {401, 403}:
+                if resp.status_code == 403:
+                    logging.warning(
+                        "[HEARTBEAT] License policy rejected heartbeat: %s",
+                        self.license_reason or "inactive license",
+                    )
                 return False
                 
             return self._is_acknowledged_response(resp)
@@ -5457,8 +5457,23 @@ def main_agent():
         asset_name=asset_name,
     )
 
-    # If no JWT, attempt join-request flow (team code based enrollment)
-    if not _wait_for_enrollment(zw_client, base_dir):
+    # If no JWT, keep the daemon alive while the join request is pending or
+    # while the backend is temporarily unavailable.  Exiting here leaves the
+    # device stuck in linked_pending_sync until a user manually relaunches it.
+    enrollment_attempt = 0
+    while not zw_client.jwt and not consume_shutdown_signal(base_dir):
+        if _wait_for_enrollment(zw_client, base_dir):
+            break
+        enrollment_attempt += 1
+        retry_delay = min(30 * (2 ** min(enrollment_attempt - 1, 3)), 120)
+        logging.warning(
+            "Enrollment is not complete; retrying in %ds (attempt %d).",
+            retry_delay,
+            enrollment_attempt,
+        )
+        time.sleep(retry_delay)
+
+    if not zw_client.jwt:
         return
 
     # Keep the endpoint alive while the initial inventory is running. Windows
@@ -5779,10 +5794,10 @@ def main_agent():
             if (now - last_heartbeat) >= HEARTBEAT_INTERVAL:
                 last_heartbeat = now
                 license_was_active = zw_client.license_active
-                if license_was_active:
-                    result = zw_client.heartbeat()
-                else:
-                    result = zw_client.check_license_reactivation()
+                # Heartbeat remains a connectivity signal even while licensed
+                # features are inactive; the backend persists lastSeen and
+                # returns the current license state in the response.
+                result = zw_client.heartbeat()
                 license_is_active = zw_client.license_active
 
                 if result is None:
@@ -5813,6 +5828,10 @@ def main_agent():
                     last_heartbeat = 0
                     was_offline = False
                 elif result is False and zw_client.last_server_status in (401, 403):
+                    if zw_client.last_server_status == 403 and not zw_client.license_active:
+                        logging.warning("[LICENSE] Preserving enrollment after license rejection; retrying heartbeat.")
+                        zw_client.auth_failure_count = 0
+                        continue
                     # SAFETY LATCH: Only clear state if failure is persistent (3+ times)
                     # This prevents nuking enrollment on transient clock skew or proxy errors.
                     zw_client.auth_failure_count += 1
