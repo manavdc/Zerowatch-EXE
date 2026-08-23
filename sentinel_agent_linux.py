@@ -600,7 +600,8 @@ class LinuxAgent:
 
         return False
 
-    def _sync_full(self, software: list, hardware: dict | None = None) -> bool:
+    def _sync_full(self, software: list, hardware: dict | None = None,
+                   inventory_scope: str = "complete") -> bool:
         """Push full software inventory and hardware profile to backend."""
         if hardware is None:
             try:
@@ -615,6 +616,8 @@ class LinuxAgent:
             "software":  software,
             "inventory": software,
             "hardware":  hardware,
+            "inventoryScope": inventory_scope,
+            "inventoryRevision": time.time_ns(),
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         }
         try:
@@ -662,12 +665,13 @@ class LinuxAgent:
             logger.debug("Heartbeat error: %s", exc)
             return False
 
-    def _sync_full_with_retry(self, software: list, hardware: dict | None = None) -> bool:
+    def _sync_full_with_retry(self, software: list, hardware: dict | None = None,
+                              inventory_scope: str = "complete") -> bool:
         """Push full software inventory and hardware profile to backend, retrying up to 3 times on failure."""
         for attempt in range(3):
             if self._shutdown_event.is_set():
                 return False
-            if self._sync_full(software, hardware):
+            if self._sync_full(software, hardware, inventory_scope):
                 return True
             logger.warning("Full sync attempt %d/3 failed. Retrying in 15s...", attempt + 1)
             self._shutdown_event.wait(timeout=15)
@@ -723,7 +727,7 @@ class LinuxAgent:
                 "Full scan completed within %ds — syncing %d items in one shot.",
                 _FULL_SCAN_TIMEOUT, len(full_items),
             )
-            self._sync_full_with_retry(full_items, hardware)
+            self._sync_full_with_retry(full_items, hardware, "complete")
             return
 
         # ── Timeout (or error) path: fall back to fast L0-only sync ──────────
@@ -760,7 +764,7 @@ class LinuxAgent:
                     pass
 
             logger.info("Fallback L0 scan: %d items — syncing now.", len(items))
-            self._sync_full_with_retry(items, hardware)
+            self._sync_full_with_retry(items, hardware, "partial")
 
             # Seed orchestrator snapshot so subsequent deltas are accurate
             try:

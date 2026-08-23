@@ -782,12 +782,15 @@ class MacOSAgent:
 
     # ── Sync helpers ───────────────────────────────────────────────────────────
 
-    def _sync_full(self, software: list, hardware: dict) -> bool:
+    def _sync_full(self, software: list, hardware: dict,
+                   inventory_scope: str = "complete") -> bool:
         """Push full software + hardware inventory to backend."""
         payload = {
             "deviceId":  self._device_id,
             "software":  software,
             "hardware":  hardware,
+            "inventoryScope": inventory_scope,
+            "inventoryRevision": time.time_ns(),
             "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         }
         try:
@@ -800,12 +803,13 @@ class MacOSAgent:
             logger.warning("Full sync error: %s", exc)
         return False
 
-    def _sync_full_with_retry(self, software: list, hardware: dict) -> bool:
+    def _sync_full_with_retry(self, software: list, hardware: dict,
+                              inventory_scope: str = "complete") -> bool:
         """Push full inventory, retrying up to 3 times on transient failures."""
         for attempt in range(3):
             if self._shutdown_event.is_set():
                 return False
-            if self._sync_full(software, hardware):
+            if self._sync_full(software, hardware, inventory_scope):
                 return True
             logger.warning("Full sync attempt %d/3 failed. Retrying in 15s...", attempt + 1)
             self._shutdown_event.wait(timeout=15)
@@ -834,6 +838,9 @@ class MacOSAgent:
 
     def _heartbeat(self) -> bool:
         """Send periodic heartbeat to keep the server session alive."""
+        if not getattr(self, "_device_id", None):
+            logger.debug("Heartbeat skipped until device identity is initialized.")
+            return False
         payload = {
             "deviceId":     self._device_id,
             "timestamp":    datetime.datetime.utcnow().isoformat() + "Z",
@@ -878,11 +885,15 @@ class MacOSAgent:
             if completed and not errors:
                 items = _items_to_dicts(self._orchestrator._deduplicate(full_items))
                 logger.info("Complete initial scan finished: %d software items", len(items))
-                self._sync_full_with_retry(items, hw)
+                self._sync_full_with_retry(items, hw, "complete")
             else:
                 logger.warning("Initial deep scan exceeded %ds or failed; syncing installed software and hardware now.", timeout)
                 layer0 = self._orchestrator._run_layer0()
-                self._sync_full_with_retry(_items_to_dicts(self._orchestrator._deduplicate(layer0)), hw)
+                self._sync_full_with_retry(
+                    _items_to_dicts(self._orchestrator._deduplicate(layer0)),
+                    hw,
+                    "partial",
+                )
         except Exception as exc:
             logger.error("Initial scan failed: %s", exc, exc_info=True)
 

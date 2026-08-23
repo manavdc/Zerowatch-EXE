@@ -1927,7 +1927,7 @@ class ZeroWatchClient:
     # ----------------------------------------------------------------
     # SYNC
     # ----------------------------------------------------------------
-    def sync_full(self, software_list, hardware_info=None):
+    def sync_full(self, software_list, hardware_info=None, inventory_scope="complete"):
         if not self.jwt: return False
         if not hardware_info:
             try:
@@ -1942,7 +1942,9 @@ class ZeroWatchClient:
             "username": self.operator_username,
             "inventory": [],
             "software": [],
-            "hardware": hardware_info
+            "hardware": hardware_info,
+            "inventoryScope": inventory_scope,
+            "inventoryRevision": time.time_ns(),
         }
         try:
             formatted_software = []
@@ -4641,7 +4643,7 @@ def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
         else:
             software = get_full_software_inventory(base_dir, include_filesystem=True)
         hardware_data = get_detailed_hardware_profile()
-        zw_client.sync_full(software, hardware_data)
+        zw_client.sync_full(software, hardware_data, inventory_scope="complete")
         logging.info("[RE-ENROLL] Full inventory sync complete.")
 
         if orchestrator is not None:
@@ -5535,6 +5537,7 @@ def main_agent():
     if is_inventory_scan_enabled():
         show_windows_notification("Zerowatch", "Sentinel Agent running in Background")
         logging.info("Running full software + hardware inventory...")
+        inventory_scope = "complete"
 
         if _orchestrator is not None:
             # Phase A: Full scan including Layer 0 (registry, Store, drivers, OS)
@@ -5569,15 +5572,17 @@ def main_agent():
                 scan_stop.set()
                 scan_thread.join(timeout=5)
                 software = get_installed_software_registry()
+                inventory_scope = "partial"
         else:
             # Fallback: existing registry scanner (unchanged behaviour).
             software = get_installed_software_registry()
+            inventory_scope = "partial"
 
         # Get high-fidelity hardware profile (unchanged)
         hardware_data = get_detailed_hardware_profile()
 
         logging.info("Syncing full inventory to backend via JSON...")
-        zw_client.sync_full(software, hardware_data)
+        zw_client.sync_full(software, hardware_data, inventory_scope=inventory_scope)
         show_windows_notification("Zerowatch", "Sentinel Agent stopped scanning")
 
         if _orchestrator is not None:
@@ -7515,7 +7520,7 @@ class DashboardFrame(tk.Frame):
 
                         if completed_in_time and not full_scan_err and full_items:
                             logging.info("GUI: Full scan completed within %ds — syncing %d items in one shot.", _FULL_SCAN_TIMEOUT, len(full_items))
-                            if self.zw_client.sync_full(full_items, hardware_data):
+                            if self.zw_client.sync_full(full_items, hardware_data, inventory_scope="complete"):
                                 self.inventory_synced = True
                         else:
                             # 60s deadline exceeded or error: fallback to fast L0 sync immediately
@@ -7526,7 +7531,7 @@ class DashboardFrame(tk.Frame):
 
                             try:
                                 l0_software = get_installed_software_registry()
-                                if self.zw_client.sync_full(l0_software, hardware_data):
+                                if self.zw_client.sync_full(l0_software, hardware_data, inventory_scope="partial"):
                                     self.inventory_synced = True
                                     logging.info("GUI: Fallback L0 sync completed (%d items).", len(l0_software) if isinstance(l0_software, list) else 0)
 
@@ -7535,7 +7540,7 @@ class DashboardFrame(tk.Frame):
                                     full_scan_done.wait()
                                     if full_items:
                                         try:
-                                            self.zw_client.sync_full(full_items, hardware_data)
+                                            self.zw_client.sync_full(full_items, hardware_data, inventory_scope="complete")
                                             logging.info("GUI: Background full scan sync completed (%d items).", len(full_items))
                                         except Exception as bg_err:
                                             logging.debug("GUI background sync error: %s", bg_err)
