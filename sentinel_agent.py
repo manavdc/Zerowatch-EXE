@@ -5461,6 +5461,27 @@ def main_agent():
     if not _wait_for_enrollment(zw_client, base_dir):
         return
 
+    # Keep the endpoint alive while the initial inventory is running. Windows
+    # inventory can take longer than one heartbeat interval, so the heartbeat
+    # service must not wait for the scan to finish.
+    scan_heartbeat_stop = threading.Event()
+    def _scan_heartbeat_worker():
+        while not scan_heartbeat_stop.is_set():
+            result = zw_client.heartbeat()
+            if result is False and zw_client.last_server_status in (401, 403):
+                logging.warning(
+                    "[HEARTBEAT] Backend rejected heartbeat: HTTP %s",
+                    zw_client.last_server_status,
+                )
+            elif result is True:
+                logging.info("[HEARTBEAT] Pre-scan heartbeat accepted (status=%s).", zw_client.last_server_status)
+            scan_heartbeat_stop.wait(HEARTBEAT_INTERVAL)
+
+    scan_heartbeat_thread = threading.Thread(
+        target=_scan_heartbeat_worker, name="pre-scan-heartbeat", daemon=True
+    )
+    scan_heartbeat_thread.start()
+
     # --- Protect agent files on disk ---
     if hardened_mode:
         protect_agent_files()
@@ -5502,8 +5523,37 @@ def main_agent():
 
         if _orchestrator is not None:
             # Phase A: Full scan including Layer 0 (registry, Store, drivers, OS)
-            # and Layer 1 + 2 (deep filesystem, PE binaries, manifests).
-            software = _orchestrator.run_full_scan(include_filesystem=True)
+            # and Layer 1 + 2 (deep filesystem, PE binaries, manifests). Keep
+            # linking responsive and avoid blocking heartbeat service on a slow
+            # or permission-heavy filesystem walk.
+            scan_result = []
+            scan_error = []
+            scan_stop = threading.Event()
+            scan_done = threading.Event()
+
+            def _run_initial_scan():
+                try:
+                    scan_result.extend(_orchestrator.run_full_scan(
+                        include_filesystem=True, stop_event=scan_stop
+                    ))
+                except Exception as exc:
+                    scan_error.append(exc)
+                finally:
+                    scan_done.set()
+
+            scan_thread = threading.Thread(
+                target=_run_initial_scan, name="windows-initial-scan", daemon=True
+            )
+            scan_thread.start()
+            if scan_done.wait(timeout=55) and not scan_error:
+                software = scan_result
+            else:
+                logging.warning(
+                    "Initial Windows deep scan exceeded 55 seconds; sending fast installed-software inventory."
+                )
+                scan_stop.set()
+                scan_thread.join(timeout=5)
+                software = get_installed_software_registry()
         else:
             # Fallback: existing registry scanner (unchanged behaviour).
             software = get_installed_software_registry()
@@ -5561,6 +5611,9 @@ def main_agent():
 
     else:
         logging.info("Inventory scan is disabled in settings. Skipping initial full scan.")
+
+    scan_heartbeat_stop.set()
+    scan_heartbeat_thread.join(timeout=2)
 
     zw_client.log_event("STARTUP", {"version": AGENT_VERSION, "status": "active"})
 
