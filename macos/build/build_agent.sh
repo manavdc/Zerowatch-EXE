@@ -154,6 +154,7 @@ cp -r "${REPO_ROOT}/platforms" "${BUILD_DIR}/"
 cp -r "${REPO_ROOT}/scanner"   "${BUILD_DIR}/"
 cp -r "${REPO_ROOT}/resources" "${BUILD_DIR}/"
 cp    "${REPO_ROOT}/sentinel_agent.py"       "${BUILD_DIR}/"
+cp    "${REPO_ROOT}/sentinel_agent_macos.py" "${BUILD_DIR}/"
 cp    "${REPO_ROOT}/cert_pinning.py"          "${BUILD_DIR}/"
 
 # ── Write build-time server config ────────────────────────────────────────────
@@ -179,6 +180,8 @@ python3 -m nuitka \
     --include-package=platforms \
     --include-package=scanner \
     --include-module=cert_pinning \
+    --include-module=sentinel_agent_macos \
+    --macos-app-icon="${BUILD_DIR}/resources/favicon.png" \
     --include-data-dir=resources=resources \
     --assume-yes-for-downloads \
     --remove-output \

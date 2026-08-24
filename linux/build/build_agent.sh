@@ -179,6 +179,8 @@ python3 -m nuitka \
     --include-package=platforms \
     --include-package=scanner \
     --include-module=cert_pinning \
+    --include-module=sentinel_agent_linux \
+    --linux-icon="${BUILD_DIR}/resources/favicon.png" \
     --include-data-dir=resources=resources \
     --assume-yes-for-downloads \
     --remove-output \

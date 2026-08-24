@@ -8004,6 +8004,47 @@ class DashboardFrame(tk.Frame):
         self.cve_tables[key] = rows
         return card
 
+def _apply_macos_button_theme(root) -> None:
+    """Make Tk buttons readable under macOS Aqua rendering."""
+    if sys.platform != "darwin":
+        return
+
+    def visit(widget):
+        if isinstance(widget, tk.Button):
+            text = str(widget.cget("text")).lower()
+            if "decline" in text or "unlink" in text:
+                bg, active_bg = "#b4232f", "#d93644"
+                fg, active_fg = "#ffffff", "#ffffff"
+            elif "accept" in text or "complete" in text:
+                bg, active_bg = "#218739", "#2ea043"
+                fg, active_fg = "#ffffff", "#ffffff"
+            elif "update now" in text:
+                bg, active_bg = "#00a9bd", "#00c4db"
+                fg, active_fg = "#071217", "#071217"
+            else:
+                bg, active_bg = "#27313d", "#34475a"
+                fg, active_fg = "#ffffff", "#ffffff"
+            try:
+                widget.configure(
+                    background=bg,
+                    foreground=fg,
+                    activebackground=active_bg,
+                    activeforeground=active_fg,
+                    disabledforeground="#9aa4af",
+                    highlightbackground=bg,
+                    highlightcolor=bg,
+                    borderwidth=0,
+                    relief=tk.FLAT,
+                    overrelief=tk.FLAT,
+                )
+            except tk.TclError:
+                pass
+        for child in widget.winfo_children():
+            visit(child)
+
+    visit(root)
+
+
 class UnifiedSentinelGUI(tk.Tk):
     def __init__(self, zw_client, force_frame=None):
         try:
@@ -8116,6 +8157,8 @@ class UnifiedSentinelGUI(tk.Tk):
         # Start notification listener and socket
         self.zw_client.connect_socket()
         self.process_notifications()
+
+        _apply_macos_button_theme(self)
 
         self.after(50, self._bring_to_front)
         self.after(200, self._force_show_window)
@@ -8302,6 +8345,8 @@ def prompt_consent(base_dir, force_show=False):
 
     btn_decline = tk.Button(btn_frame, text="Decline & Exit", fg="#ffffff", bg="#f85149", font=("Arial", 10, "bold"), width=15, relief=tk.FLAT, overrelief=tk.FLAT, highlightthickness=0, activebackground="#da3633", activeforeground="#ffffff", disabledforeground="#8b949e", command=on_decline)
     btn_decline.pack(side=tk.LEFT, padx=10)
+
+    _apply_macos_button_theme(root)
 
     # Load icon if possible
     try:
