@@ -23,6 +23,49 @@ chmod +x macos/build/build_agent.sh
 - **Data Resources**: Bundles icon and data resources (`--include-data-dir=resources=resources`).
 - **Output Binary**: Outputted to `dist/macos/zerowatch-agent-macos`.
 
+## Finder `.app` packaging
+
+The app bundle is created from an already-built executable; it does not rebuild
+or modify the agent implementation. On a macOS build machine, run:
+
+```bash
+chmod +x macos/build/build_agent.sh macos/build/package_app.sh
+macos/build/build_agent.sh --prod
+macos/build/package_app.sh \
+  dist/macos/zerowatch-agent-macos \
+  dist/macos/SentinelAgent.app
+ditto -c -k --keepParent \
+  dist/macos/SentinelAgent.app \
+  dist/macos/SentinelAgent-macos-arm64.app.zip
+```
+
+The bundle keeps the unchanged executable at
+`Contents/Resources/SentinelAgent`. Finder launches the GUI, daemon, and
+watchdog as the logged-in user. Clicking the Settings page launches an
+administrator-authorized settings view through macOS's standard authorization
+dialog. The password is handled by macOS and is not captured or stored by the
+app.
+
+Bundle layout:
+
+```text
+SentinelAgent.app/
+└── Contents/
+    ├── Info.plist
+    ├── MacOS/
+    │   ├── applet
+    │   └── SentinelAgentLauncher
+    └── Resources/
+        ├── SentinelAgent
+        └── resources/
+```
+
+The existing CLI binary remains available and continues to run as before:
+
+```bash
+sudo ./dist/macos/zerowatch-agent-macos
+```
+
 ### Universal Binary Targets (Optional Multi-Arch)
 - **`arm64` (Apple Silicon — M1/M2/M3/M4)**: Primary target architecture for modern macOS devices.
 - **`x86_64` (Intel Mac)**: Secondary target for legacy Intel hardware.

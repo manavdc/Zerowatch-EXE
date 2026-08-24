@@ -230,11 +230,23 @@ jobs:
       - name: Set executable permissions
         run: chmod +x dist/macos/SentinelAgent-macos-arm64
 
+      - name: Package macOS application bundle
+        run: |
+          chmod +x macos/build/package_app.sh
+          macos/build/package_app.sh \
+            dist/macos/SentinelAgent-macos-arm64 \
+            dist/macos/SentinelAgent.app
+          ditto -c -k --keepParent \
+            dist/macos/SentinelAgent.app \
+            dist/macos/SentinelAgent-macos-arm64.app.zip
+
       - name: Upload macOS binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: binary-macos
-          path: dist/macos/SentinelAgent-macos-arm64
+          path: |
+            dist/macos/SentinelAgent-macos-arm64
+            dist/macos/SentinelAgent-macos-arm64.app.zip
           retention-days: 1
 
   # ===========================================================================
@@ -433,11 +445,13 @@ jobs:
             | Windows x64 | `SentinelAgent-windows-x64.exe` |
             | Linux x64   | `SentinelAgent-linux-x64` |
             | macOS arm64 | `SentinelAgent-macos-arm64` |
+            | macOS app | `SentinelAgent-macos-arm64.app.zip` |
           draft: false
           prerelease: false
           files: |
             dist/binary-windows/SentinelAgent-windows-x64.exe
             dist/binary-linux/SentinelAgent-linux-x64
             dist/binary-macos/SentinelAgent-macos-arm64
+            dist/binary-macos/SentinelAgent-macos-arm64.app.zip
             release-manifest.json
             release-manifest.json.sig

@@ -6647,6 +6647,17 @@ class DashboardFrame(tk.Frame):
                 except Exception:
                     is_admin = False
                 if not is_admin:
+                    if sys.platform == "darwin":
+                        # Keep normal GUI, daemon, and watchdog processes in
+                        # the logged-in user's session. Only Settings is
+                        # relaunched through the app's macOS authorization
+                        # flow.
+                        try:
+                            settings_launcher = os.environ.get("SENTINEL_AGENT_LAUNCHER") or get_exe_path()
+                            subprocess.Popen([settings_launcher, "--settings"])
+                        except Exception as exc:
+                            logging.error("Unable to open authorized settings: %s", exc)
+                        return
                     import tkinter.messagebox as mb
                     mb.showerror("Access Denied", "This feature can only be accessed with administrator access.")
                     return
@@ -8147,6 +8158,9 @@ class UnifiedSentinelGUI(tk.Tk):
             self.show_enrollment()
         elif force_frame == "dashboard":
             self.show_dashboard()
+        elif force_frame == "settings":
+            self.show_dashboard()
+            self.after(0, lambda: self.switch_page("settings"))
         else:
             # Default routing logic: strictly check enrollment status
             if self.zw_client.is_enrolled():
@@ -8480,7 +8494,9 @@ def run_interactive():
 
         # Single-command UX: launching GUI also ensures background daemon and
         # startup persistence are active for both sudo and non-sudo launches.
-        _auto_bootstrap_background_agent()
+        # An authorized settings-only window must not create a second daemon.
+        if "--settings" not in sys.argv:
+            _auto_bootstrap_background_agent()
 
         # Default routing logic with a 2-second "Server Veto"
         is_enrolled_locally = zw_client.is_enrolled()
@@ -8500,7 +8516,10 @@ def run_interactive():
 
         if is_enrolled_locally:
             logging.info("Startup: Proceeding to Dashboard.")
-            app = UnifiedSentinelGUI(zw_client, force_frame="dashboard")
+            app = UnifiedSentinelGUI(
+                zw_client,
+                force_frame="settings" if "--settings" in sys.argv else "dashboard",
+            )
         else:
             logging.info("Startup: Proceeding to Enrollment.")
             app = UnifiedSentinelGUI(zw_client, force_frame="enroll")
@@ -8591,6 +8610,7 @@ def main():
         and os.geteuid() == 0
         and "--daemon" not in sys.argv
         and "--watchdog" not in sys.argv
+        and "--settings" not in sys.argv
     ):
         if not _relaunch_macos_gui_as_console_user():
             logging.warning(
