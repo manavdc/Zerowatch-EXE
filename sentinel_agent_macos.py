@@ -426,8 +426,17 @@ class MacOSAgentSession:
             import base64
             return b"RAW::" + base64.b64encode(data)
         except Exception as exc:
-            logger.warning("SecureStore encrypt failed: %s", exc)
-            return None
+            # A root LaunchDaemon may not be able to access the logged-in
+            # user's Keychain. Keep the agent alive and persist the JWT in the
+            # same shared state directory using the explicit RAW:: fallback.
+            # The fallback is macOS-only; Linux and Windows use their own
+            # session implementations.
+            logger.warning(
+                "SecureStore encrypt failed: %s; using protected-state fallback.",
+                exc,
+            )
+            import base64
+            return b"RAW::" + base64.b64encode(data)
 
     def _decrypt(self, data: bytes) -> bytes | None:
         """
@@ -848,10 +857,19 @@ class MacOSAgent:
             "platform":     "macos",
         }
         try:
-            resp = self._session.post("/agent/heartbeat", payload)
-            return resp.status_code in (200, 204)
+            resp = self._session.post("/agent/heartbeat", payload, timeout=10)
+            ok = resp.status_code in (200, 204)
+            if ok:
+                logger.info("Heartbeat accepted by server (HTTP %d).", resp.status_code)
+            else:
+                logger.warning(
+                    "Heartbeat rejected by server (HTTP %d): %s",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+            return ok
         except Exception as exc:
-            logger.debug("Heartbeat error: %s", exc)
+            logger.warning("Heartbeat error: %s", exc)
             return False
 
     # ── Scan phases ────────────────────────────────────────────────
@@ -877,11 +895,31 @@ class MacOSAgent:
             finally:
                 done.set()
 
+        hardware = {}
+        hardware_done = threading.Event()
+
+        def _collect_hardware():
+            nonlocal hardware
+            try:
+                hardware = _build_hardware_profile(self._platform)
+            finally:
+                hardware_done.set()
+
+        # system_profiler/IOKit can stall under sudo or while TCC prompts are
+        # pending. Run it independently so it cannot prevent inventory sync.
+        threading.Thread(
+            target=_collect_hardware,
+            daemon=True,
+            name="macos-hardware-profile",
+        ).start()
+
         logger.info("Running complete initial inventory and deep scan (timeout=%ds)...", timeout)
         threading.Thread(target=_scan, daemon=True, name="initial-full-scan").start()
         try:
             completed = done.wait(timeout=timeout)
-            hw = _build_hardware_profile(self._platform)
+            if not hardware_done.wait(timeout=30):
+                logger.warning("Hardware profile timed out; syncing inventory without hardware details.")
+            hw = hardware
             if completed and not errors:
                 items = _items_to_dicts(self._orchestrator._deduplicate(full_items))
                 logger.info("Complete initial scan finished: %d software items", len(items))
@@ -917,6 +955,7 @@ class MacOSAgent:
         last_heartbeat  = time.monotonic()
         last_l0_delta   = time.monotonic()
         L0_INTERVAL     = 60   # seconds between L0 app-bundle delta checks
+        logger.info("macOS heartbeat monitor started (interval=%ds).", HEARTBEAT_INTERVAL)
 
         while not self._shutdown_event.is_set() and not self._stop_event.is_set():
             now = time.monotonic()
@@ -938,7 +977,7 @@ class MacOSAgent:
                 except Exception as exc:
                     logger.warning("Delta scan error: %s", exc)
 
-            time.sleep(5)
+            self._shutdown_event.wait(timeout=5)
 
     # ── Main run loop ──────────────────────────────────────────────────────────
 
@@ -963,7 +1002,8 @@ class MacOSAgent:
 
         # Keep connectivity alive while the initial inventory/deep scan runs.
         logger.info("Sending immediate post-enrollment heartbeat...")
-        self._heartbeat()
+        heartbeat_ok = self._heartbeat()
+        logger.info("Immediate post-enrollment heartbeat %s.", "succeeded" if heartbeat_ok else "failed")
         monitor = threading.Thread(
             target=self._monitor_loop,
             daemon=True,
