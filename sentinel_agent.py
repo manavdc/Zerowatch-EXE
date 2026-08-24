@@ -285,7 +285,7 @@ MUTEX_NAME = "Global\\SentinelAgent_ZeroWatch_4F9A2E1B"
 DAEMON_MUTEX_NAME = "Global\\SentinelAgent_Daemon_4F9A2E1B"
 WATCHDOG_MUTEX_NAME = "Global\\SentinelAgent_Watchdog_4F9A2E1B"
 PROMPT_MUTEX_NAME = "Global\\SentinelAgent_Prompt_4F9A2E1B"  # Prevents multiple password prompts
-HEARTBEAT_INTERVAL = 120  # Reduced from 60 to lower CPU
+HEARTBEAT_INTERVAL = 30  # Reduced from 60 to lower CPU
 MONITOR_INTERVAL = 60     # Reduced from 30 to lower CPU
 OFFLINE_FLUSH_MIN_INTERVAL = 15
 OFFLINE_FLUSH_MAX_INTERVAL = 300
@@ -4380,6 +4380,94 @@ def _gui_display_available() -> bool:
     return True
 
 
+def _relaunch_macos_gui_as_console_user() -> bool:
+    """Run a sudo-launched GUI inside the logged-in user's Aqua session.
+
+    ``sudo`` changes the effective user to root, but root is not attached to
+    the user's WindowServer session.  ``launchctl asuser`` selects that
+    bootstrap namespace; the nested ``sudo -u`` also changes the process UID
+    so Tk/Aqua and user-scoped services see the same user context.
+
+    This helper is intentionally macOS-only and is called only for
+    interactive launches.  Linux and Windows do not enter this code path.
+    """
+    if (
+        sys.platform != "darwin"
+        or not hasattr(os, "geteuid")
+        or os.geteuid() != 0
+        or "--daemon" in sys.argv
+        or "--watchdog" in sys.argv
+    ):
+        return False
+
+    import pwd
+    import shutil
+
+    username = os.environ.get("SUDO_USER", "").strip()
+    if not username or username == "root":
+        # SUDO_USER can be absent when the command was started through a
+        # wrapper.  The console owner is the safest fallback for GUI launch.
+        try:
+            username = subprocess.check_output(
+                ["/usr/sbin/stat", "-f", "%Su", "/dev/console"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            ).strip()
+        except (OSError, subprocess.SubprocessError):
+            username = ""
+
+    if not username or username == "root":
+        logging.error(
+            "macOS GUI cannot start as root: no logged-in console user was found. "
+            "Run the GUI without sudo or use sudo --daemon for background mode."
+        )
+        return False
+
+    try:
+        console_uid = pwd.getpwnam(username).pw_uid
+    except KeyError:
+        logging.error("macOS GUI console user %r could not be resolved.", username)
+        return False
+
+    # In source mode argv[0] is the .py file and must be run by Python.  In a
+    # Nuitka/PyInstaller build, argv[0] is the standalone executable.
+    if sys.argv and sys.argv[0].lower().endswith(".py"):
+        executable = os.path.abspath(sys.executable)
+        child_args = [os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+    else:
+        executable = get_exe_path()
+        child_args = list(sys.argv[1:])
+
+    launchctl = shutil.which("launchctl") or "/bin/launchctl"
+    sudo = shutil.which("sudo") or "/usr/bin/sudo"
+    command = [
+        launchctl,
+        "asuser",
+        str(console_uid),
+        sudo,
+        "-u",
+        username,
+        "-H",
+        "--",
+        executable,
+        *child_args,
+    ]
+    logging.info(
+        "macOS GUI: launching as console user %r (uid=%d) via launchctl asuser",
+        username,
+        console_uid,
+    )
+    try:
+        result = subprocess.run(command, check=False)
+    except OSError as exc:
+        logging.error("macOS GUI session launch failed: %s", exc)
+        return False
+
+    # The parent must not continue as root and create a second Tk window.
+    raise SystemExit(result.returncode)
+
+
 
 def unregister_startup_registry():
     """Removes SentinelAgent startup entry from the Run key.
@@ -8431,50 +8519,19 @@ def main():
     if "--password-prompt" not in sys.argv and "--reset" not in sys.argv:
         hide_console()
 
-    # 1.1  macOS sudo → user session re-launch
-    #
-    # When invoked as `sudo ./SentinelAgent` on macOS the process runs as root,
-    # which has no access to the user's window server (Aqua). We detect this and
-    # immediately re-exec into the real user's login session via
-    # `launchctl asuser <uid>` — the standard macOS mechanism for this.
-    #
-    # This applies ONLY to GUI-mode invocations (not --daemon / --watchdog),
-    # and ensures root and normal-user execution paths are 100% identical:
-    # the same binary, same args, same consent dialog, same everything.
+    # 1.1 macOS sudo → user session re-launch.  This is deliberately isolated
+    # from the Linux and Windows entry paths.
     if (
         sys.platform == "darwin"
-        and hasattr(os, "geteuid") and os.geteuid() == 0
+        and hasattr(os, "geteuid")
+        and os.geteuid() == 0
         and "--daemon" not in sys.argv
         and "--watchdog" not in sys.argv
     ):
-        import subprocess
-        sudo_user = os.environ.get("SUDO_USER", "").strip()
-        if sudo_user and sudo_user != "root":
-            try:
-                # Resolve the numeric UID of the console user
-                import pwd
-                console_uid = pwd.getpwnam(sudo_user).pw_uid
-                exe = os.path.abspath(sys.argv[0])
-                # launchctl asuser <uid> runs the process inside the user's
-                # bootstrap/window-server session — identical to the user
-                # double-clicking the binary from Finder.
-                cmd = ["launchctl", "asuser", str(console_uid), exe] + sys.argv[1:]
-                logging.info(
-                    "macOS GUI: re-launching as user '%s' (uid=%d) via launchctl asuser",
-                    sudo_user, console_uid,
-                )
-                result = subprocess.run(cmd, check=False)
-                sys.exit(result.returncode)
-            except Exception as exc:
-                logging.warning(
-                    "macOS GUI: launchctl re-launch failed (%s). "
-                    "Falling back — run as: ./SentinelAgent-macos-arm64 (no sudo) for the GUI.",
-                    exc,
-                )
-        elif not sudo_user:
+        if not _relaunch_macos_gui_as_console_user():
             logging.warning(
-                "macOS GUI: running as root with no SUDO_USER. "
-                "GUI may not open. Run without sudo for the GUI, use sudo --daemon for the background agent."
+                "macOS GUI is still running as root; run without sudo for the GUI "
+                "or use sudo --daemon for background mode."
             )
 
     # 1.5  Post-update .bak cleanup — runs in the NEW agent after an OTA swap.
@@ -8532,12 +8589,29 @@ def main():
         return
           
     # 5. Background Daemon Mode (The real 'Agent')
+       # 5. Background Daemon Mode (The real 'Agent')
     if "--daemon" in sys.argv:
         base_dir = get_base_dir()
-        consent_file = os.path.join(_secure_state_dir(base_dir), "consent_accepted.dat")
-        if not os.path.exists(consent_file):
-            logging.info("Daemon blocked: Consent not accepted yet.")
+        consent_file = os.path.join(
+            _secure_state_dir(base_dir),
+            "consent_accepted.dat"
+        )
+
+        # Check if the agent is already linked
+        token_win = _state_path(base_dir, "zerowatch_token.dat")
+        token_nix = os.path.join(
+            _secure_state_dir(base_dir),
+            "agent_token.enc"
+        )
+
+        is_linked = os.path.exists(token_win) or os.path.exists(token_nix)
+
+        if not is_linked and not os.path.exists(consent_file):
+            logging.info(
+                "Daemon blocked: Consent not accepted yet and agent is not linked."
+            )
             sys.exit(0)
+
         logging.info("Starting background daemon agent.")
         if sys.platform.startswith("linux"):
             from sentinel_agent_linux import LinuxSentinelAgent

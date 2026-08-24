@@ -123,7 +123,7 @@ if ! python3 -c "import tkinter" 2>/dev/null; then
 fi
 echo "[OK] tkinter available."
 
-# ── Install dependencies ──────────────────────────────────────────────────────
+# ── Install dependies ──────────────────────────────────────────────────────
 echo ""
 echo "[1/4] Installing Linux dependencies..."
 pip3 install -q --break-system-packages -r "${REPO_ROOT}/requirements-linux.txt" || \
