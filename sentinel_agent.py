@@ -768,6 +768,12 @@ def encrypt_data(data_bytes):
     if sys.platform == "win32":
         return _windows_dpapi_encrypt(data_bytes)
 
+    # macOS GUI and LaunchDaemon can run in different Keychain contexts.
+    # When Security.framework rejects a root/user Keychain operation, keep the
+    # shared GUI/daemon enrollment state usable with an explicit RAW:: fallback.
+    # This branch is macOS-only; Linux keeps its existing secure-store behavior.
+    macos_fallback = False
+
     if getattr(_in_crypto, "active", False):
         return None
     _in_crypto.active = True
@@ -775,16 +781,29 @@ def encrypt_data(data_bytes):
         from platforms import PlatformFactory
         plat = PlatformFactory.create()
         if plat and plat.secure_store:
-            return plat.secure_store.encrypt(data_bytes)
+            encrypted = plat.secure_store.encrypt(data_bytes)
+            if encrypted is not None:
+                return encrypted
+        macos_fallback = sys.platform == "darwin"
     except Exception:
-        pass
+        macos_fallback = sys.platform == "darwin"
     finally:
         _in_crypto.active = False
+    if macos_fallback:
+        import base64
+        return b"RAW::" + base64.b64encode(data_bytes)
     return None
 
 def decrypt_data(encrypted_bytes):
     if sys.platform == "win32":
         return _windows_dpapi_decrypt(encrypted_bytes)
+
+    if sys.platform == "darwin" and encrypted_bytes.startswith(b"RAW::"):
+        try:
+            import base64
+            return base64.b64decode(encrypted_bytes[5:], validate=True)
+        except Exception:
+            return None
 
     if getattr(_in_crypto, "active", False):
         return None
