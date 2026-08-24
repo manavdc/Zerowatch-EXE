@@ -188,7 +188,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-linux.txt
-          pip install nuitka>=2.0 ordered-set zstandard
+          pip install nuitka>=2.0 ordered-set zstandard imageio
 
       - name: Set binary name
         id: set-names

@@ -129,6 +129,7 @@ if [[ -f "${REPO_ROOT}/requirements.txt" ]]; then
     REQ_FILE="${REPO_ROOT}/requirements.txt"
 fi
 pip3 install -q -r "${REQ_FILE}" || true
+pip3 install -q imageio || true
 
 # ── Validating certificate pinning configuration ──────────────────────────────
 echo ""
