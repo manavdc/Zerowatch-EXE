@@ -57,7 +57,7 @@ jobs:
         run: |
           import os, re
           ref = os.environ.get("GITHUB_REF_NAME", "")
-          api_url = (os.environ.get("ZEROWATCH_API_URL") or "").strip() or "http://127.0.0.1:8000/api"
+          api_url = (os.environ.get("ZEROWATCH_API_URL") or "").strip() or "http://localhost:3001/api"
           # Strip leading "v" — "v3" → "3", "v1.2.2" → "1.2.2"; fallback to "0.0.0"
           version = re.sub(r"^v", "", ref) if re.match(r"^v\d+", ref) else "0.0.0"
           with open("agent_build_config.py", "w") as f:
@@ -131,7 +131,7 @@ jobs:
         run: |
           import os, re
           ref = os.environ.get("GITHUB_REF_NAME", "")
-          api_url = (os.environ.get("ZEROWATCH_API_URL") or "").strip() or "http://127.0.0.1:8000/api"
+          api_url = (os.environ.get("ZEROWATCH_API_URL") or "").strip() or "http://localhost:3001/api"
           # Strip leading "v" — "v3" → "3", "v1.2.2" → "1.2.2"; fallback to "0.0.0"
           version = re.sub(r"^v", "", ref) if re.match(r"^v\d+", ref) else "0.0.0"
           with open("agent_build_config.py", "w") as f:
@@ -199,7 +199,7 @@ jobs:
         run: |
           import os, re
           ref = os.environ.get("GITHUB_REF_NAME", "")
-          api_url = (os.environ.get("ZEROWATCH_API_URL") or "").strip() or "http://127.0.0.1:8000/api"
+          api_url = (os.environ.get("ZEROWATCH_API_URL") or "").strip() or "http://localhost:3001/api"
           # Strip leading "v" — "v3" → "3", "v1.2.2" → "1.2.2"; fallback to "0.0.0"
           version = re.sub(r"^v", "", ref) if re.match(r"^v\d+", ref) else "0.0.0"
           with open("agent_build_config.py", "w") as f:
