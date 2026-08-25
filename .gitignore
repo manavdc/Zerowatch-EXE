@@ -31,3 +31,11 @@ test_*.py
 scratch_*.py
 verify_pins.py
 
+# Node.js dependencies
+node_modules/
+
+# Local scan output results
+scan-output.json
+
+# Compiled PDF reports
+sbom_generation/main.pdf
