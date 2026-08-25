@@ -1,0 +1,143 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% PROJECT INFORMATION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\chapter[Project Information]{\IconDiagram\ Project Information}
+
+This chapter provides an overview of the software project for which the Software Bill of Materials (SBOM) has been generated. It describes the application, technology stack, software ecosystem, and project metadata required to understand the scope of the generated SBOM.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% PROJECT DETAILS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{5cm}p{8cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Property} & \textbf{\color{white}Value} \\
+\midrule
+Project Name & \ProjectName \\
+Project Type & Endpoint Security and Monitoring Agent \\
+Application Category & Desktop/System-level Security Agent \\
+Primary Languages & Python \\
+Platform & Cross-Platform (Windows, Linux, macOS) \\
+Package Manager & pip \\
+SBOM Standard & \SbomFormat\ \SbomSpecVersion \\
+SBOM Generator & \SbomGenerator \\
+Vulnerability Scanner & \VulScanner \\
+Vulnerability Database & GitHub Advisories, NVD, and other supported vulnerability sources \\
+Assessment Type & Software Composition Analysis (SCA) \\
+Target Environment & Linux / Windows / macOS hosts \\
+Version & \ProjectVersion \\
+\bottomrule
+\end{tabular}
+\caption{Project Information Overview}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% PROJECT DESCRIPTION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Project Description}
+
+\ProjectName\ is an endpoint security and monitoring agent designed to perform system telemetry, process audits, and security configuration analysis on client endpoints. The application continuously monitors host activities, enforces certificate pinning protocols, and updates its rules periodically.
+
+The agent contains a local service module for background telemetry collection and a command-line utility for manual triggers, which communicate with the central administration platform.
+
+To improve software supply chain security, the project generates a CycloneDX Software Bill of Materials (SBOM) using Syft and performs vulnerability assessment using Grype and the ZeroWatch Agent Scan. This enables complete visibility into software dependencies together with identification of known vulnerabilities and available security fixes.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% CORE CAPABILITIES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Core Capabilities}
+
+\begin{itemize}
+\item Endpoint service monitoring daemon
+\item Process audit and telemetry collection
+\item Secure certificate pinning communication
+\item Automated software updates
+\item Host integrity and configuration compliance checks
+\item Software inventory and SBOM management
+\item Dependency vulnerability assessment
+\item Software supply chain visibility
+\item Security risk identification
+\item Vulnerability remediation support
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% TECHNOLOGY STACK
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Technology Stack}
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{5cm}p{8cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Technology} & \textbf{\color{white}Purpose} \\
+\midrule
+Python & Core Programming Language \\
+Nuitka / PyInstaller & Compiler / Bundler for Standalone Binary \\
+pip & Dependency Management \\
+CycloneDX & SBOM Specification \\
+Syft & SBOM Generation Tool \\
+JSON & SBOM Output Format \\
+Grype + ZW Agent Scan & Vulnerability Scanners \\
+\bottomrule
+\end{tabular}
+\caption{Technology Stack}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SOFTWARE CHARACTERISTICS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Software Characteristics}
+
+\begin{itemize}
+\item Cross-platform architecture (Windows, Linux, macOS support)
+\item Compiled standalone executables (via Nuitka/Zig compilation)
+\item Third-party Python open-source package ecosystem
+\item Secure certificate-pinned communications
+\item Continuous vulnerability assessment
+\item Software supply chain security analysis
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% PROJECT OBJECTIVES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Project Objectives}
+
+The primary objectives of the \ProjectName\ include:
+\begin{itemize}
+\item Improve software supply chain visibility across client agent endpoints.
+\item Maintain an accurate Software Bill of Materials (SBOM).
+\item Continuously identify vulnerable software dependencies.
+\item Support Software Composition Analysis (SCA).
+\item Automate vulnerability tracking and remediation planning.
+\item Support security compliance initiatives.
+\item Enable continuous security monitoring.
+\item Reduce software supply chain risks.
+\end{itemize}

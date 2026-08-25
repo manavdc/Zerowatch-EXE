@@ -1,0 +1,14 @@
+{
+  "name": "zerowatch-endpoint-agent-sbom",
+  "version": "1.1.1",
+  "description": "SBOM and vulnerability scanner integration for ZeroWatch Sentinel Agent",
+  "main": "scan_sbom.js",
+  "scripts": {
+    "sbom": "node scan_sbom.js",
+    "update-latex": "node sbom_generation/update_latex.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "mongoose": "^8.24.2"
+  }
+}

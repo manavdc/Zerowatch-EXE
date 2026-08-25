@@ -1,0 +1,242 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% APPENDIX
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\chapter[Supporting Information]{\IconTerminal\ Supporting Information}
+
+This appendix contains supplementary information related to the Software Bill of Materials (SBOM) and the vulnerability assessment performed for the \textbf{\ProjectName}. The information presented here serves as supporting documentation for developers, security teams, auditors, and compliance personnel.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SBOM GENERATION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{SBOM Generation Command}
+
+The Software Bill of Materials (SBOM) was generated using the Syft Software Composition Analysis (SCA) tool, scanning both the frontend and backend project directories:
+
+\begin{verbatim}
+syft dir:./frontend dir:./backend -o cyclonedx-json=zerowatch-sbom.json
+\end{verbatim}
+
+The generated CycloneDX SBOM served as the primary input for the vulnerability assessments performed using Grype and the ZeroWatch Audit Scan.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% VULNERABILITY SCAN
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Vulnerability Assessment Command}
+
+The generated SBOM and project dependencies were analyzed using the Grype Software Composition Analysis (SCA) tool and the proprietary ZeroWatch Audit Scan:
+
+\begin{verbatim}
+# Run Grype Vulnerability Scan
+grype zerowatch-sbom.json -o json > zerowatch-grype-report.json
+
+# Run ZeroWatch Audit Scan
+node scan_sbom.js
+\end{verbatim}
+
+The resulting JSON report was used to generate the vulnerability findings presented in this report.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% TOOL SPECIFICATIONS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Tool Specifications}
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{5cm}p{8cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Attribute} & \textbf{\color{white}Value} \\
+\midrule
+SBOM Standard & \SbomFormat \\
+Specification Version & \SbomSpecVersion \\
+SBOM Generator & \SbomGenerator \\
+Vulnerability Scanner & \VulScanner \\
+Output Format & JSON \\
+Project & \ProjectName \\
+Primary Package Manager & npm \\
+Primary Ecosystem & Node.js \& JavaScript / TypeScript \\
+\bottomrule
+\end{tabular}
+\caption{Tool Specifications}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% VULNERABILITY SUMMARY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Vulnerability Summary}
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{6cm}c}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Severity} & \textbf{\color{white}Count} \\
+\midrule
+Critical & \CriticalVuls \\
+High & \HighVuls \\
+Medium & \MediumVuls \\
+Low & \LowVuls \\
+\midrule
+\textbf{Total Vulnerabilities} & \textbf{\TotalVulnerabilities} \\
+\bottomrule
+\end{tabular}
+\caption{Vulnerability Summary}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% LICENSE SUMMARY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{License Summary}
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{6cm}c}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}License} & \textbf{\color{white}Packages} \\
+\midrule
+MIT & 14 \\
+Unknown & 10 \\
+Apache-2.0 & 4 \\
+BSD-2-Clause & 2 \\
+\bottomrule
+\end{tabular}
+\caption{License Summary}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% COMPONENT STATISTICS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Component Statistics}
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{6cm}c}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Metric} & \textbf{\color{white}Value} \\
+\midrule
+Total Components & \TotalComponents \\
+Libraries & \LibraryComponents \\
+Applications & \AppComponents \\
+Unique Licenses & \UniqueLicenses \\
+Primary Ecosystem & Node.js \& JavaScript / TypeScript \\
+Package Manager & npm \\
+SBOM Format & \SbomFormat\ \SbomSpecVersion \\
+\bottomrule
+\end{tabular}
+\caption{Component Statistics}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SECURITY TOOLS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Security Tools Used}
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{4cm}p{4cm}p{6cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Tool} & \textbf{\color{white}Purpose} & \textbf{\color{white}Output} \\
+\midrule
+Syft & Software Bill of Materials Generation & CycloneDX SBOM \\
+Grype + ZW Audit & Software Composition Analysis & Vulnerability Assessment \\
+CycloneDX & SBOM Specification & Machine-readable Software Inventory \\
+\bottomrule
+\end{tabular}
+\caption{Security Tools Used}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% ABBREVIATIONS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Abbreviations}
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{3cm}p{10cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Term} & \textbf{\color{white}Description} \\
+\midrule
+SBOM & Software Bill of Materials \\
+SCA & Software Composition Analysis \\
+PURL & Package URL \\
+CVE & Common Vulnerabilities and Exposures \\
+CVSS & Common Vulnerability Scoring System \\
+GHSA & GitHub Security Advisory \\
+NVD & National Vulnerability Database \\
+OSV & Open Source Vulnerabilities Database \\
+CI/CD & Continuous Integration / Continuous Deployment \\
+NTIA & National Telecommunications and Information Administration \\
+SSDF & Secure Software Development Framework \\
+\bottomrule
+\end{tabular}
+\caption{Abbreviations}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% REFERENCES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\newpage
+\section{References}
+
+\begin{enumerate}
+\item CycloneDX Specification (\url{https://cyclonedx.org})
+\item Syft Documentation (\url{https://github.com/anchore/syft})
+\item Grype Documentation (\url{https://github.com/anchore/grype})
+\item National Vulnerability Database (NVD) (\url{https://nvd.nist.gov})
+\item GitHub Security Advisories (\url{https://github.com/advisories})
+\item Open Source Vulnerabilities (OSV) (\url{https://osv.dev})
+\item NIST Secure Software Development Framework (SSDF)
+\item NTIA Minimum Elements for Software Bill of Materials
+\item OWASP Software Component Verification Standard
+\end{enumerate}
+
+\vspace{0.8cm}

@@ -1,0 +1,168 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SBOM METADATA
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\chapter[SBOM \& Vul. Scan Metadata]{\IconMetadata\ SBOM \& Vul. Scan Metadata}
+
+This chapter describes the metadata associated with both the generated Software Bill of Materials (SBOM) and the vulnerability assessment performed on the \textbf{\ProjectName}. The metadata records how, when, and by which tools the software inventory and security analysis were produced, enabling traceability, reproducibility, and software supply chain transparency.
+
+The SBOM was generated using Syft in the CycloneDX format, while the generated SBOM and project dependencies were analyzed using Grype and the ZeroWatch Agent Scan to identify known security vulnerabilities and available remediation information.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% METADATA OVERVIEW
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{5cm}p{8cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Metadata Field} & \textbf{\color{white}Value} \\
+\midrule
+SBOM Format & \SbomFormat \\
+Specification Version & \SbomSpecVersion \\
+Document Type & Software Bill of Materials (SBOM) \\
+Generator & \SbomGenerator \\
+Project & \ProjectName \\
+Output Format & JSON \\
+Generation Date & \ScanDate \\
+Scan Tool & \VulScanner \\
+Assessment Type & Software Composition Analysis (SCA) \\
+Vulnerability Database & GitHub Advisories, NVD, and other supported databases \\
+Scan Output Format & JSON \\
+Scan Date & \ScanDate \\
+Document Version & \ProjectVersion \\
+\bottomrule
+\end{tabular}
+\caption{SBOM Metadata Overview}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% METADATA DESCRIPTION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Metadata Description}
+
+The SBOM metadata identifies the origin and generation details of the document. It ensures that every software component listed in the inventory can be traced back to the exact project, generation tool, and SBOM specification version used during creation.
+
+This information enables organizations to verify the authenticity of the SBOM, track changes across software releases, and reproduce the document whenever required.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% GENERATION AND SCAN DETAILS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Generation and Scan Details}
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{5cm}p{8cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Attribute} & \textbf{\color{white}Description} \\
+\midrule
+SBOM Generation Tool & Syft Software Composition Analysis Tool \\
+Vulnerability Scanner & Grype + ZeroWatch Agent Scan Tools \\
+SBOM Generation Method & Automated Dependency Discovery \\
+Vulnerability Detection & Signature and Advisory Database Matching \\
+SBOM Specification & \SbomFormat\ Version \SbomSpecVersion \\
+Serialization Format & JSON \\
+Component Discovery & Filesystem and Package Manifest Analysis \\
+Package Identification & Package URL (PURL) \\
+Dependency Detection & Direct and Transitive Dependencies \\
+Vulnerability Intelligence & GitHub Security Advisories, National Vulnerability Database (NVD), and Other Supported Vulnerability Databases \\
+Output & \SbomFormat\ SBOM Inventory and Vulnerability Assessment Report \\
+\bottomrule
+\end{tabular}
+\caption{SBOM Generation and Vulnerability Scan Details}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% INCLUDED METADATA
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Included Metadata}
+
+The generated SBOM and vulnerability assessment contain metadata describing the following information:
+\begin{itemize}
+\item SBOM specification version
+\item Project identification
+\item SBOM generation timestamp
+\item Generator name and version
+\item Component inventory metadata
+\item Package URL (PURL) identifiers
+\item Software component types
+\item License metadata
+\item Dependency relationships
+\item Vulnerability scan metadata
+\item Vulnerability database information
+\item Vulnerability severity classifications
+\item Available fix versions
+\item Security advisory references
+\item Scan configuration information
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% BENEFITS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Why Metadata Matters}
+
+The metadata included within an SBOM provides several operational and security benefits:
+\begin{itemize}
+\item Enables software traceability.
+\item Improves supply chain transparency.
+\item Supports vulnerability correlation.
+\item Assists software audits.
+\item Simplifies compliance verification.
+\item Facilitates SBOM regeneration and comparison.
+\item Provides provenance information for software components.
+\item Enables vulnerability traceability.
+\item Supports software risk assessment.
+\item Improves remediation planning.
+\item Records security scan provenance.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% COMPLIANCE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Compliance Relevance}
+
+SBOM metadata aligns with widely adopted software supply chain security standards and assists organizations in meeting regulatory and customer requirements, including:
+\begin{itemize}
+\item CycloneDX SBOM Specification
+\item NTIA Minimum Elements for SBOM
+\item NIST Secure Software Development Framework (SSDF)
+\item Software Supply Chain Security Best Practices
+\item Enterprise Security Audit Requirements
+\item Vulnerability Disclosure and Management Best Practices
+\item Software Composition Analysis (SCA) Requirements
+\item Secure Software Supply Chain Frameworks
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Scan Metadata}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+The vulnerability assessment was performed using \textbf{\VulScanner}. Grype and the ZeroWatch Agent Scan analyzed the project dependencies identified during SBOM generation and compared them against multiple vulnerability databases to identify publicly disclosed security issues.
+
+The scan metadata records the scanner version, vulnerability database version, scan timestamp, supported advisory sources, detected vulnerability severities, and available remediation information. This metadata ensures that vulnerability assessment results are reproducible and can be compared across future software releases.

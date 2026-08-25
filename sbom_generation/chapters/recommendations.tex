@@ -1,0 +1,182 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% RECOMMENDATIONS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\chapter[Recommendations]{\IconLightbulb\ Recommendations}
+
+The Software Bill of Materials (SBOM) generated using Syft, together with the Grype and ZeroWatch Agent vulnerability assessments, provides a comprehensive understanding of the \textbf{\ProjectName}'s software supply chain and security posture. Based on the findings of the dependency inventory, license analysis, and vulnerability assessment, the following recommendations are proposed to improve software security, maintain compliance, and strengthen software supply chain resilience.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% OVERVIEW
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{5cm}p{8cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Recommendation Area} & \textbf{\color{white}Priority} \\
+\midrule
+SBOM Management & High \\
+Vulnerability Remediation & High \\
+Dependency Management & High \\
+Software Composition Analysis & High \\
+License Compliance & Medium \\
+Software Supply Chain Security & High \\
+Periodic Security Reviews & Medium \\
+\bottomrule
+\end{tabular}
+\caption{Recommended Security Improvements}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% IMMEDIATE REMEDIATION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Immediate Remediation}
+
+%IMMEDIATE_REMEDIATION_TEXT%
+
+Recommended actions include:
+\begin{itemize}
+%IMMEDIATE_REMEDIATION_ITEMS%
+\item Verify application functionality after dependency changes.
+\item Re-run the SBOM generation and Grype/ZeroWatch Audit vulnerability assessments after updating dependencies.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SBOM MANAGEMENT
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{SBOM Management}
+
+The Software Bill of Materials should become a standard artifact for every software release.
+
+Recommended practices include:
+\begin{itemize}
+\item Generate a fresh SBOM during every release.
+\item Archive previous SBOM versions.
+\item Maintain version history alongside application releases.
+\item Store SBOMs in a centralized repository.
+\item Digitally sign released SBOM documents.
+\item Include the SBOM with software release artifacts.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% DEPENDENCY MANAGEMENT
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Dependency Management}
+
+Maintaining healthy software dependencies significantly reduces long-term security and maintenance risks.
+
+Recommended actions include:
+\begin{itemize}
+\item Remove unused dependencies.
+\item Upgrade outdated packages regularly.
+\item Replace deprecated libraries.
+\item Minimize unnecessary transitive dependencies.
+\item Verify package authenticity before installation.
+\item Periodically review dependency health.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% VULNERABILITY MANAGEMENT
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Vulnerability Management}
+
+Continuous vulnerability management should become an integral part of the software development lifecycle.
+
+Recommended practices include:
+\begin{itemize}
+\item Perform Grype and ZeroWatch Audit vulnerability scans for every software release.
+\item Monitor newly published security advisories.
+\item Prioritize remediation based on vulnerability severity.
+\item Validate fixes after dependency upgrades.
+\item Maintain historical vulnerability reports.
+\item Establish defined remediation timelines for High severity findings.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% LICENSE COMPLIANCE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{License Compliance}
+
+Software license compliance should be reviewed as part of every release cycle.
+
+Recommended actions include:
+\begin{itemize}
+\item Review packages with unknown license metadata.
+\item Maintain complete license documentation.
+\item Verify compatibility between third-party licenses.
+\item Preserve copyright notices where required.
+\item Include license review within release approvals.
+\end{itemize}
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SOFTWARE SUPPLY CHAIN SECURITY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Software Supply Chain Security}
+
+The following practices are recommended to strengthen software supply chain security:
+\begin{itemize}
+\item Verify software provenance.
+\item Validate package integrity.
+\item Use trusted package repositories.
+\item Continuously monitor dependency changes.
+\item Protect build environments.
+\item Maintain complete dependency traceability.
+\item Periodically regenerate the SBOM.
+\item Continuously perform Software Composition Analysis (SCA).
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% FUTURE ENHANCEMENTS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Future Enhancements}
+
+The following improvements can further strengthen the \textbf{\ProjectName}'s software supply chain security:
+\begin{itemize}
+\item Deploy Dependency-Track for continuous SBOM monitoring.
+\item Automate vulnerability correlation using GitHub Security Advisories, NVD, and OSV databases.
+\item Generate digitally signed SBOMs using CycloneDX Attestations.
+\item Maintain historical SBOM and vulnerability comparisons across releases.
+\item Integrate vulnerability trend reporting into security dashboards.
+\item Automate compliance reporting for every software release.
+\item Implement policy-based dependency governance.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SUMMARY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Summary}
+
+%RECOMMENDATIONS_SUMMARY_TEXT%
+
+By continuously maintaining the SBOM, performing regular vulnerability assessments, maintaining integrated security checks in the CI/CD pipeline, and adopting proactive dependency governance, the \textbf{\ProjectName} can further strengthen its security posture, improve regulatory compliance, and maintain a resilient software supply chain throughout its software development lifecycle.

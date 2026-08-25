@@ -1,0 +1,251 @@
+\usepackage{fancyhdr}
+\usepackage{tocloft}
+\usepackage{draftwatermark}
+\usepackage{hyperref}
+\usepackage{tikz}
+
+%------------------------------------------------
+% Watermark Settings
+%------------------------------------------------
+\SetWatermarkText{CONFIDENTIAL}
+\SetWatermarkScale{1.0}
+\SetWatermarkColor{gray!8} % Faint 5% opacity
+\SetWatermarkAngle{45}
+
+%------------------------------------------------
+% Fancy Header / Footer Configuration
+%------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+
+\fancyhead[L]{\small\color{ZWDark}\textbf{ZeroWatch SBOM Report}}
+\fancyhead[R]{\small\color{ZWSecondary}\nouppercase{\leftmark}}
+
+\fancyfoot[L]{\small\color{ZWDark}CONFIDENTIAL}
+\fancyfoot[R]{\small\color{ZWDark}Page \thepage}
+
+% Custom colored rule lines
+\renewcommand{\headrule}{{\color{ZWPrimary}\hrule width\headwidth height 0.6pt}}
+\renewcommand{\footrule}{{\color{ZWPrimary}\hrule width\headwidth height 0.6pt\vskip 3pt}}
+
+% Header heights & layout spacing
+\setlength{\headheight}{18pt}
+\setlength{\footskip}{25pt}
+
+% Correct chapter marks
+\renewcommand{\chaptermark}[1]{%
+    \markboth{\thechapter.\ #1}{}
+}
+
+%------------------------------------------------
+% Table of Contents Dot Leaders
+%------------------------------------------------
+\renewcommand{\cftchapleader}{\cftdotfill{\cftdotsep}}
+\renewcommand{\cftchapfont}{\bfseries\color{ZWPrimary}}
+\renewcommand{\cftchappagefont}{\bfseries\color{ZWPrimary}}
+
+%------------------------------------------------
+% Hyperlink & PDF Metadata Configuration
+%------------------------------------------------
+\hypersetup{
+    colorlinks=true,
+    linkcolor=ZWPrimary,
+    urlcolor=ZWSecondary,
+    citecolor=ZWSecondary,
+    pdftitle={ZeroWatch Sentinel Agent SBOM \& Vulnerability Report},
+    pdfauthor={ZeroWatch Security Team},
+    pdfsubject={Software Bill of Materials (SBOM) and Software Composition Analysis (SCA) Report},
+    pdfkeywords={SBOM, CycloneDX, Syft, Grype, Software Composition Analysis, Vulnerability Assessment, Compliance, Agent}
+}
+
+%------------------------------------------------
+% Custom TikZ Vector Icons (Bypasses Fontconfig/XeTeX issues)
+% All sized relatively using 'em' to match text font sizes automatically.
+% Uses baseline=0 and draws shapes shifted up by 0.35em to align with uppercase center.
+%------------------------------------------------
+
+% 1. Executive Summary: List/Checklist
+\newcommand{\IconSummary}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWPrimary, line width=0.08em, rounded corners=0.1em] (-0.45em,-0.1em) rectangle (0.45em,0.8em);
+    \draw[draw=ZWSecondary, line width=0.06em] 
+      (-0.22em,0.55em) -- (0.22em,0.55em)
+      (-0.22em,0.35em) -- (0.22em,0.35em)
+      (-0.22em,0.15em) -- (0.1em,0.15em);
+  \end{tikzpicture}%
+}
+
+% 2. Introduction: Info Circle
+\newcommand{\IconInfo}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[fill=ZWSecondary, draw=none] (0,0.35em) circle (0.45em);
+    \draw[fill=white, draw=none] (0,0.53em) circle (0.08em);
+    \draw[draw=white, line width=0.08em, line cap=round] (0,0.37em) -- (0,0.17em);
+  \end{tikzpicture}%
+}
+
+% 3. Project Information: Network Nodes / Diagram
+\newcommand{\IconDiagram}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[fill=ZWPrimary, draw=none] (0,0.67em) circle (0.12em);
+    \draw[fill=ZWSecondary, draw=none] (-0.28em,0.15em) circle (0.12em);
+    \draw[fill=ZWSecondary, draw=none] (0.28em,0.15em) circle (0.12em);
+    \draw[draw=ZWDark, line width=0.06em] (0,0.55em) -- (-0.28em,0.27em);
+    \draw[draw=ZWDark, line width=0.06em] (0,0.55em) -- (0.28em,0.27em);
+  \end{tikzpicture}%
+}
+
+% 4. SBOM Metadata: File / Document Signature
+\newcommand{\IconMetadata}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWPrimary, line width=0.08em, rounded corners=0.1em] (-0.36em,-0.1em) rectangle (0.36em,0.8em);
+    \draw[draw=ZWSecondary, line width=0.06em] (-0.18em,0.55em) -- (0.18em,0.55em) (-0.18em,0.35em) -- (0.09em,0.35em);
+    \draw[draw=ZWOrange, line width=0.06em] (-0.09em,0.13em) circle (0.11em);
+  \end{tikzpicture}%
+}
+
+% 5. Statistics: Bar Chart
+\newcommand{\IconChart}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWDark, line width=0.08em] (-0.45em,-0.1em) -- (0.45em,-0.1em);
+    \draw[fill=ZWPrimary, draw=none] (-0.32em,-0.1em) rectangle (-0.14em,0.53em);
+    \draw[fill=ZWSecondary, draw=none] (-0.05em,-0.1em) rectangle (0.14em,0.76em);
+    \draw[fill=ZWOrange, draw=none] (0.22em,-0.1em) rectangle (0.4em,0.21em);
+  \end{tikzpicture}%
+}
+
+% 6. License Analysis: Balance Scale
+\newcommand{\IconLicense}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWDark, line width=0.08em] (0,-0.1em) -- (0,0.71em) (-0.36em,0.57em) -- (0.36em,0.57em);
+    \draw[draw=ZWSecondary, line width=0.06em] (-0.36em,0.57em) -- (-0.36em,0.21em) (0.36em,0.57em) -- (0.36em,0.21em);
+    \draw[fill=ZWSecondary, draw=none] (-0.36em,0.21em) circle (0.11em) (0.36em,0.21em) circle (0.11em);
+    \draw[fill=ZWPrimary, draw=none] (-0.18em,-0.1em) rectangle (0.18em,-0.01em);
+  \end{tikzpicture}%
+}
+
+% 7. Dependency Analysis & Inventory: Box / Cube
+\newcommand{\IconBox}{%
+  \begin{tikzpicture}[baseline=0, scale=1.3]
+    \draw[fill=ZWSecondary, draw=ZWSecondary, line width=0.04em] 
+      (0,0.6em) -- (0.22em,0.47em) -- (0,0.34em) -- (-0.22em,0.47em) -- cycle;
+    \draw[fill=ZWSecondary!80, draw=ZWSecondary, line width=0.04em] 
+      (0,0.34em) -- (0.22em,0.47em) -- (0.22em,0.17em) -- (0,0.04em) -- cycle;
+    \draw[fill=ZWSecondary!60, draw=ZWSecondary, line width=0.04em] 
+      (0,0.34em) -- (-0.22em,0.47em) -- (-0.22em,0.17em) -- (0,0.04em) -- cycle;
+  \end{tikzpicture}%
+}
+
+% 8. Security Analysis: Shield
+\newcommand{\IconShield}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[fill=ZWPrimary, draw=ZWPrimary, line width=0.04em, rounded corners=0.05em] 
+      (0,0.71em) -- (0.27em,0.8em) -- (0.54em,0.71em) -- (0.54em,0.35em) 
+      .. controls (0.54em,0.08em) and (0.27em,-0.1em) .. (0,-0.19em)
+      .. controls (-0.27em,-0.1em) and (-0.54em,0.08em) .. (-0.54em,0.35em)
+      -- (-0.54em,0.71em) -- (-0.27em,0.8em) -- cycle;
+    \draw[color=white, line width=0.06em] (-0.27em,0.53em) -- (-0.27em,0.35em) 
+      .. controls (-0.27em,0.21em) and (-0.14em,0.08em) .. (0,0.03em)
+      .. controls (0.14em,0.08em) and (0.27em,0.21em) .. (0.27em,0.35em)
+      -- (0.27em,0.53em) -- cycle;
+  \end{tikzpicture}%
+}
+
+% 9. Vulnerability Findings: Warning Triangle
+\newcommand{\IconWarning}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[fill=ZWOrange, draw=ZWOrange, line width=0.04em, rounded corners=0.05em] 
+      (0,0.8em) -- (0.5em,-0.05em) -- (-0.5em,-0.05em) -- cycle;
+    \draw[fill=white, draw=none] (0,0.46em) circle (0.05em);
+    \draw[draw=white, line width=0.08em, line cap=round] (0,0.35em) -- (0,0.1em);
+  \end{tikzpicture}%
+}
+
+% 10. Compliance Mapping: Clipboard Checklist
+\newcommand{\IconCompliance}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWPrimary, line width=0.08em, rounded corners=0.05em] 
+      (-0.32em,-0.1em) rectangle (0.32em,0.8em);
+    \draw[fill=ZWSecondary, draw=ZWSecondary, rounded corners=0.02em] 
+      (-0.14em,0.71em) rectangle (0.14em,0.82em);
+    \draw[draw=ZWSecondary, line width=0.06em] 
+      (-0.18em,0.49em) -- (0.18em,0.49em)
+      (-0.18em,0.31em) -- (0.18em,0.31em)
+      (-0.18em,0.13em) -- (0.09em,0.13em);
+  \end{tikzpicture}%
+}
+
+% 11. Recommendations: Lightbulb
+\newcommand{\IconLightbulb}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWOrange, line width=0.08em, fill=ZWOrange!20, rounded corners=0.05em] 
+      (0,0.62em) circle (0.22em);
+    \draw[draw=ZWOrange, fill=ZWOrange] 
+      (-0.08em,0.4em) -- (0.08em,0.4em) -- (0.04em,0.17em) -- (-0.04em,0.17em) -- cycle;
+    \draw[draw=ZWOrange, line width=0.06em] 
+      (-0.04em,0.12em) -- (0.04em,0.12em);
+  \end{tikzpicture}%
+}
+
+% 12. Appendix: Terminal / Code Console
+\newcommand{\IconTerminal}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWDark, fill=ZWDark!10, line width=0.08em, rounded corners=0.1em] 
+      (-0.4em,0.03em) rectangle (0.4em,0.67em);
+    \draw[draw=ZWDark, line width=0.06em, line cap=round, line join=round] 
+      (-0.25em,0.49em) -- (-0.14em,0.35em) -- (-0.25em,0.21em);
+    \draw[draw=ZWDark, line width=0.06em] 
+      (-0.07em,0.21em) -- (0.22em,0.21em);
+  \end{tikzpicture}%
+}
+
+% 13. Scope: Target / Compass (Scaled up to match header dimensions better)
+\newcommand{\IconScope}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWPrimary, line width=0.08em] (0,0.35em) circle (0.42em);
+    \draw[draw=ZWSecondary, line width=0.06em] (0,0.35em) circle (0.18em);
+    \draw[draw=ZWPrimary, line width=0.06em] (0,-0.2em) -- (0,0.9em) (-0.55em,0.35em) -- (0.55em,0.35em);
+  \end{tikzpicture}%
+}
+
+% 14. Dashboard: Grid Layout
+\newcommand{\IconDashboard}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWPrimary, line width=0.1em] (-0.36em,-0.01em) rectangle (0.36em,0.71em);
+    \draw[draw=ZWPrimary, line width=0.06em] (0,-0.01em) -- (0,0.71em) (-0.36em,0.35em) -- (0.36em,0.35em);
+  \end{tikzpicture}%
+}
+
+% 15. Standard Checkmark
+\newcommand{\IconCheck}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[fill=ZWSecondary, draw=none] (0,0.35em) circle (0.39em);
+    \draw[color=white, line width=0.08em, line cap=round, line join=round] 
+      (-0.18em,0.31em) -- (-0.04em,0.17em) -- (0.18em,0.49em);
+  \end{tikzpicture}%
+}
+
+% 16. Libraries: Stack of Books
+\newcommand{\IconLibraries}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWSecondary, fill=ZWSecondary!20, line width=0.06em] (-0.3em,-0.05em) rectangle (-0.1em,0.65em);
+    \draw[draw=ZWSecondary, fill=ZWSecondary!45, line width=0.06em] (-0.05em,-0.05em) rectangle (0.15em,0.7em);
+    \draw[draw=ZWSecondary, fill=ZWSecondary!70, line width=0.06em, rotate around={15:(0.3em,-0.05em)}] (0.2em,-0.05em) rectangle (0.4em,0.65em);
+  \end{tikzpicture}%
+}
+
+% 17. App: Monitor Screen
+\newcommand{\IconApp}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWPrimary, fill=ZWPrimary!10, line width=0.08em, rounded corners=0.05em] (-0.4em,0.15em) rectangle (0.4em,0.7em);
+    \draw[draw=ZWPrimary, fill=ZWPrimary, line width=0.06em] (-0.15em,0.15em) -- (-0.23em,-0.1em) -- (0.23em,-0.1em) -- (0.15em,0.15em) -- cycle;
+  \end{tikzpicture}%
+}
+
+% 18. Scanner / Magnifying Glass
+\newcommand{\IconSearch}{%
+  \begin{tikzpicture}[baseline=0]
+    \draw[draw=ZWSecondary, line width=0.08em] (0.1em,0.45em) circle (0.22em);
+    \draw[draw=ZWSecondary, line width=0.1em, line cap=round] (-0.05em,0.3em) -- (-0.32em,0.03em);
+  \end{tikzpicture}%
+}

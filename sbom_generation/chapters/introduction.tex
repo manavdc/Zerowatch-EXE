@@ -1,0 +1,129 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% INTRODUCTION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\chapter[Introduction]{\IconInfo\ Introduction}
+
+Modern software applications are built upon a vast ecosystem of third-party libraries, frameworks, and open-source components. While these dependencies accelerate software development and improve productivity, they also introduce security, operational, licensing, and software supply chain risks that must be actively managed throughout the software development lifecycle.
+
+A \textbf{Software Bill of Materials (SBOM)} is a structured, machine-readable inventory that documents every software component used within an application, including direct dependencies, transitive dependencies, versions, licensing information, package identifiers, and other metadata. Similar to the bill of materials used in manufacturing, an SBOM provides complete visibility into the software supply chain, enabling organizations to understand exactly what software is included within their products.
+
+However, visibility alone is insufficient for ensuring software security. An SBOM identifies the components present in an application but does not determine whether those components contain known security vulnerabilities. Therefore, the SBOM generated for the \textbf{\ProjectName} has been further analyzed using \textbf{\VulScanner}, a Software Composition Analysis (SCA) vulnerability scanner that correlates software components against multiple vulnerability databases, including GitHub Security Advisories, the National Vulnerability Database (NVD), and other trusted security sources.
+
+Together, the Syft-generated SBOM, Grype, and the ZeroWatch Agent Scan vulnerability assessments provide a comprehensive view of the \ProjectName's software supply chain by combining complete dependency visibility with security risk analysis. This approach enables developers, security teams, auditors, and customers to assess software composition, identify vulnerable components, prioritize remediation, and support regulatory compliance throughout the application's lifecycle.
+
+\vspace{0.4cm}
+\begin{tcolorbox}[colback=ZWLightGray,colframe=ZWTeal,arc=6pt,title=\textbf{\IconInfo\ SBOM Scope \& Context}]
+The current report is designed to represent the \textbf{\ProjectName} codebase. The technical dependency data, package inventory, and vulnerability scans reflect the python dependencies and Nuitka compiler requirements needed for agent distribution.
+\end{tcolorbox}
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Purpose of this Report}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+The purpose of this report is to transform the machine-readable CycloneDX Software Bill of Materials and the corresponding Grype/ZeroWatch Audit vulnerability assessments into a structured, human-readable document suitable for technical review, security assessments, software supply chain governance, and compliance activities.
+
+Specifically, this report aims to:
+\begin{itemize}
+\item Provide complete visibility into all software components used by the \ProjectName.
+\item Document both first-party and third-party software dependencies across system-level platforms.
+\item Summarize software licensing information for compliance purposes.
+\item Identify known security vulnerabilities affecting project dependencies.
+\item Present vulnerability severity, affected packages, and available remediation information.
+\item Support vulnerability management and software supply chain security.
+\item Facilitate internal security reviews and external customer audits.
+\item Establish a continuously maintainable software inventory and security baseline for future software releases.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{About ZeroWatch Sentinel Agent}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+The \ProjectName\ is an endpoint security and monitoring agent designed to perform system telemetry, process audits, and security configuration analysis on client endpoints. The agent consists of the following components:
+\begin{enumerate}
+    \item \textbf{Sentinel Agent Service}: A background daemon running on client hosts (Windows, Linux, macOS) that communicates securely with the central management platform.
+    \item \textbf{Telemetry and Scanner Engine}: Sub-modules that monitor running processes, active connections, and system integrity.
+\end{enumerate}
+
+Both sub-systems integrate numerous open-source libraries to implement secure communications, cryptography, event logging, and telemetry reporting. Because these dependencies continuously evolve and new vulnerabilities are regularly disclosed, maintaining an accurate inventory of software components together with continuous vulnerability assessment is critical for ensuring the integrity, security, and maintainability of the agent.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Why Software Bill of Materials (SBOM)?}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+As modern software increasingly depends on external packages and open-source libraries, organizations require greater visibility into their software supply chains. An SBOM addresses this requirement by providing a standardized inventory of software components and their relationships.
+
+The benefits of maintaining an SBOM include:
+\begin{itemize}
+\item Improved software supply chain transparency.
+\item Complete visibility into direct and transitive dependencies.
+\item Faster identification of affected components during newly disclosed vulnerabilities.
+\item Simplified software license compliance.
+\item Better third-party risk assessment.
+\item Support for customer security questionnaires and procurement reviews.
+\item Improved software governance and release management.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Vulnerability Assessment}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+While an SBOM provides complete visibility into software components, it does not indicate whether those components contain known security vulnerabilities. To address this limitation, the generated SBOM was analyzed using \textbf{\VulScanner}, an open-source vulnerability scanner developed to perform Software Composition Analysis (SCA).
+
+Grype and the ZeroWatch Audit Scan compare identified software packages against multiple vulnerability databases to detect publicly disclosed security issues. For each affected component, they report vulnerability identifiers, severity ratings, affected versions, available fixes, and supporting advisory information.
+
+The integration of SBOM generation and vulnerability scanning enables organizations to rapidly identify vulnerable dependencies, prioritize security updates, reduce software supply chain risk, and improve overall security readiness.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{CycloneDX Standard}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+This report is based on the CycloneDX Software Bill of Materials specification. CycloneDX is an open standard specifically designed for software supply chain security, software composition analysis, and vulnerability management.
+
+CycloneDX provides a structured representation of software components, dependencies, metadata, licenses, cryptographic information, external references, and other supply chain artifacts in a machine-readable format. The standard is widely adopted across the cybersecurity industry and integrates effectively with modern vulnerability scanners and Software Composition Analysis tools.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{SBOM and Vulnerability Generation Process}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+The Software Bill of Materials for the \ProjectName\ was generated using \textbf{Syft}, an open-source Software Composition Analysis tool. Syft scans the project source code directories, package manifests, and lockfiles to produce a CycloneDX-compliant SBOM containing detailed information about software components used within the application.
+
+The generated SBOM was subsequently analyzed using \textbf{\VulScanner}, which correlates identified software components against multiple vulnerability databases to detect known security vulnerabilities, determine severity levels, identify available fixes, and generate a comprehensive vulnerability assessment.
+
+Together, Syft, Grype, and the ZeroWatch Agent Scan provide complementary capabilities. Syft inventories software components, while Grype and the ZeroWatch Agent Scan evaluate their security posture by identifying known vulnerabilities affecting those components.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Report Organization}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+This report is organized into the following sections:
+\begin{enumerate}
+\item Executive Summary
+\item Introduction
+\item Project Information
+\item SBOM Metadata
+\item Software Component Statistics
+\item License Analysis
+\item Dependency Analysis
+\item Dependency Inventory
+\item Security Analysis
+\item Vulnerability Findings
+\item Compliance Mapping
+\item Recommendations
+\item Appendix
+\end{enumerate}
+
+Together, these sections provide a comprehensive overview of the software composition and security posture of the \ProjectName. By combining SBOM generation with vulnerability assessment, the report supports software supply chain security, governance, compliance, and continuous security improvement throughout the application's lifecycle.
