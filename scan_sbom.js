@@ -78,12 +78,13 @@ async function run() {
   // 1. Generate SBOM using Syft
   console.log("📦 Generating SBOM for Agent codebase...");
   try {
-    // Exclude build, dist, git, pycache, and sbom_generation directories to prevent scanning output binaries or config templates
+    // Exclude build, dist, git, github, pycache, and sbom_generation directories to prevent scanning CI configs, output binaries or config templates
     const excludeFlags = [
       '**/build/**',
       '**/dist/**',
       '**/__pycache__/**',
       '**/.git/**',
+      '**/.github/**',
       '**/sbom_generation/**',
       '**/temp-*.json'
     ].map(pattern => `--exclude "${pattern}"`).join(" ");

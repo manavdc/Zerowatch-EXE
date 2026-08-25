@@ -179,6 +179,11 @@ function run() {
   }).join("\n");
   replacePlaceholder(vulFindingsPath, /%\s*%VULNERABILITY_TABLE_ROWS%/g, vulTableRows || "% No vulnerabilities found");
 
+  // Fix TikZ / PGFPlots coordinates macro expansion bug by replacing coordinate macros with actual numbers
+  const coordRegex = /\\addplot\[fill=ZWRed,\s*draw=none\]\s*coordinates\s*\{.*?\}\;/g;
+  const targetCoords = `\\addplot[fill=ZWRed, draw=none] coordinates {(Critical,${criticalCount}) (High,${highCount}) (Medium,${mediumCount}) (Low,${lowCount}) (Negligible,${negligibleCount})};`;
+  replacePlaceholder(vulFindingsPath, coordRegex, targetCoords);
+
   // Vulnerability analysis sections
   const vulAnalysisSections = vulnerabilities.map(v => {
     const badge = severityBadgeMap[v.severity.toUpperCase()] || "\\NegligibleBadge";
