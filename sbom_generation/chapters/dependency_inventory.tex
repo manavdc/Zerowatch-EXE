@@ -1,0 +1,167 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% DEPENDENCY INVENTORY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\chapter[Dependency Inventory]{\IconBox\ Dependency Inventory}
+\chaptermark{Dependency Inventory}
+
+This chapter presents an inventory of software components identified in the generated Software Bill of Materials (SBOM). Each component is uniquely identified by its package name, version, component type, software license, and Package URL (PURL).
+
+The dependency inventory serves as the authoritative record of third-party software incorporated into the \textbf{\ProjectName} application. It provides the foundation for vulnerability assessment, license compliance, software supply chain analysis, and continuous Software Composition Analysis (SCA).
+
+The generated inventory was subsequently analyzed using Grype and the ZeroWatch Agent Scan to correlate software components with publicly disclosed security vulnerabilities and available remediation information.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% INVENTORY SUMMARY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{5cm}p{8cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Metric} & \textbf{\color{white}Value} \\
+\midrule
+Total Components & \TotalComponents \\
+Libraries & \LibraryComponents \\
+Applications & \AppComponents \\
+Unique Licenses & \UniqueLicenses \\
+SBOM Standard & \SbomFormat\ \SbomSpecVersion \\
+Generator & \SbomGenerator \\
+Vulnerability Scanner & \VulScanner \\
+Vulnerability Assessment & Completed \\
+\bottomrule
+\end{tabular}
+\caption{Dependency Inventory Summary}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% INVENTORY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Representative Component Inventory}
+
+The following table contains a representative sample of software components identified in the generated SBOM.
+
+\small
+\renewcommand{\arraystretch}{1.2}
+
+\begin{longtable}{p{4.5cm}p{2.3cm}p{2cm}p{3.5cm}}
+\caption{Representative Software Components} \\
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Package} & \textbf{\color{white}Version} & \textbf{\color{white}Type} & \textbf{\color{white}License} \\
+\midrule
+\endfirsthead
+
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Package} & \textbf{\color{white}Version} & \textbf{\color{white}Type} & \textbf{\color{white}License} \\
+\midrule
+\endhead
+@mongodb-js/saslprep & 1.5.0 & Library & MIT \\
+@types/webidl-conversions & 7.0.3 & Library & MIT \\
+@types/whatwg-url & 11.0.5 & Library & MIT \\
+actions/checkout & v4 & Library & Unknown \\
+actions/checkout & v4 & Library & Unknown \\
+actions/download-artifact & v4 & Library & Unknown \\
+actions/setup-node & v4 & Library & Unknown \\
+actions/setup-python & v5 & Library & Unknown \\
+actions/upload-artifact & v4 & Library & Unknown \\
+actions/upload-artifact & v4 & Library & Unknown \\
+bson & 6.10.4 & Library & Apache-2.0 \\
+debug & 4.4.3 & Library & MIT \\
+dotenv & 16.6.1 & Library & BSD-2-Clause \\
+kareem & 2.6.3 & Library & Apache-2.0 \\
+memory-pager & 1.5.0 & Library & MIT \\
+mongodb & 6.20.0 & Library & Apache-2.0 \\
+mongodb-connection-string-url & 3.0.2 & Library & Apache-2.0 \\
+mongoose & 8.24.4 & Library & MIT \\
+mpath & 0.9.0 & Library & MIT \\
+mquery & 5.0.0 & Library & MIT \\
+ms & 2.1.3 & Library & MIT \\
+punycode & 2.3.1 & Library & MIT \\
+sift & 17.1.3 & Library & MIT \\
+softprops/action-gh-release & v2 & Library & Unknown \\
+sparse-bitfield & 3.0.3 & Library & MIT \\
+tr46 & 5.1.1 & Library & MIT \\
+webidl-conversions & 7.0.0 & Library & BSD-2-Clause \\
+whatwg-url & 14.2.0 & Library & MIT \\
+wtfjoke/setup-tectonic & v3 & Library & Unknown \\
+zerowatch-endpoint-agent-sbom & 1.1.1 & Library & Unknown \\
+\bottomrule
+\end{longtable}
+
+\chaptermark{Dependency Inventory}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% PACKAGE IDENTIFICATION
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Component Identification}
+
+Each component in the SBOM is uniquely identified using the following attributes:
+\begin{itemize}
+\item Package Name
+\item Version
+\item Component Type
+\item Software License
+\item Package URL (PURL)
+\item Supplier Information (where available)
+\item Dependency Relationships
+\item Vulnerability Correlation (through Grype and ZeroWatch Audit Scan analysis)
+\item Security Advisory References (where applicable)
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% INVENTORY PURPOSE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Purpose of the Inventory}
+
+Maintaining an accurate dependency inventory enables organizations to:
+\begin{itemize}
+\item Track every third-party software component.
+\item Perform Software Composition Analysis (SCA).
+\item Correlate software components with known vulnerabilities.
+\item Detect outdated or unsupported packages.
+\item Monitor dependency changes across software releases.
+\item Simplify software license compliance.
+\item Improve software supply chain transparency.
+\item Support vulnerability management and remediation.
+\item Assist incident response and forensic investigations.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% COMPLETE INVENTORY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Complete Inventory}
+
+The complete dependency inventory consists of all \TotalComponents\ software components identified during SBOM generation using Syft. The inventory is maintained in the original CycloneDX SBOM and may also be exported in CSV or spreadsheet format for automated processing, reporting, and audit purposes.
+
+The generated inventory serves as the primary input for the Grype and ZeroWatch Agent Software Composition Analysis (SCA) scans, which evaluate each identified component against multiple vulnerability databases to detect known security issues and available software updates.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SUMMARY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Summary}
+
+The dependency inventory provides a comprehensive record of all software components used by the \textbf{\ProjectName}. Combined with the metadata, license analysis, dependency analysis, and Grype/ZeroWatch Agent vulnerability assessments, this inventory establishes a complete view of the application's software supply chain.
+
+Maintaining an accurate and continuously updated dependency inventory enables effective Software Composition Analysis (SCA), strengthens software supply chain security, simplifies compliance activities, and supports proactive vulnerability management throughout the software development lifecycle.

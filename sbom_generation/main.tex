@@ -1,0 +1,147 @@
+\PassOptionsToPackage{table}{xcolor}
+\documentclass[12pt,a4paper]{report}
+
+%------------------------------------------------
+% Encoding
+%------------------------------------------------
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+%------------------------------------------------
+% Page Layout & Margins
+%------------------------------------------------
+\usepackage[
+a4paper,
+left=1in,
+right=1in,
+top=1.0in,
+bottom=1.1in,
+headheight=18pt
+]{geometry}
+
+%------------------------------------------------
+% Graphics & Visuals
+%------------------------------------------------
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+%------------------------------------------------
+% Typography & Formatting
+%------------------------------------------------
+\usepackage[scaled]{helvet}
+\renewcommand\familydefault{\sfdefault} % Modern sans-serif Helvetica
+\usepackage{microtype}
+\usepackage{setspace}
+\setstretch{1.15} % Slight line spacing increase
+
+%------------------------------------------------
+% Document Packages
+%------------------------------------------------
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+% \usepackage{fontawesome5} % Disabled to avoid Fontconfig/XeTeX crash on Windows
+\usepackage[most]{tcolorbox} % Cards and callout boxes
+\usepackage{eso-pic} % Absolute background page placement
+
+%------------------------------------------------
+% Load Custom Colors & Page Styles
+%------------------------------------------------
+\input{styles/colors.tex}
+\input{styles/pagestyle.tex}
+
+%------------------------------------------------
+% Better Headings (titlesec)
+%------------------------------------------------
+\usepackage{titlesec}
+
+% Chapter formatting: Huge title with a left vertical accent bar
+\titleformat{\chapter}[block]
+{\Huge\bfseries\color{ZWPrimary}}
+{\color{ZWSecondary}\rule[-6pt]{5pt}{32pt}\hspace{10pt}\ifnum\value{chapter}>0 \thechapter.\ \fi}
+{0pt}
+{}
+
+\titlespacing{\chapter}
+{0pt}
+{-10pt}
+{25pt}
+
+% Section formatting: Large title with a thin teal underline
+\titleformat{\section}
+{\Large\bfseries\color{ZWPrimary}}
+{}
+{0pt}
+{}
+[\vspace{-2pt}{\color{ZWSecondary}\hrule height 0.8pt}]
+
+\titlespacing{\section}
+{0pt}
+{18pt}
+{8pt}
+
+%------------------------------------------------
+% Table Row Height
+%------------------------------------------------
+\renewcommand{\arraystretch}{1.25} % Increased row spacing for better readability
+
+%------------------------------------------------
+% Paragraph Formatting
+%------------------------------------------------
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.8em} % Increased whitespace between paragraphs
+
+%------------------------------------------------
+% Load Stats Macros
+%------------------------------------------------
+\input{chapters/stats.tex}
+
+%------------------------------------------------
+% Document Start
+%------------------------------------------------
+\begin{document}
+
+\input{chapters/cover}
+\clearpage
+
+\input{chapters/dashboard}
+\clearpage
+
+\tableofcontents
+\clearpage
+
+\input{chapters/scope}
+\clearpage
+
+\input{chapters/executive_summary}
+
+\input{chapters/introduction}
+
+\input{chapters/project_information}
+
+\input{chapters/sbom_metadata}
+
+\input{chapters/statistics}
+
+\input{chapters/license_analysis}
+
+\input{chapters/dependency_analysis}
+
+\input{chapters/dependency_inventory}
+
+\input{chapters/security_analysis}
+
+\input{chapters/vulnerability_findings}
+
+\input{chapters/compliance_mapping}
+
+\input{chapters/recommendations}
+
+\appendix
+
+\input{chapters/appendix}
+
+\end{document}

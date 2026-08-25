@@ -1,0 +1,180 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% STATISTICS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\chapter[SBOM Statistics]{\IconChart\ SBOM Statistics}
+
+This chapter presents a statistical overview of the generated Software Bill of Materials (SBOM) together with a high-level summary of the vulnerability assessment. The statistics provide insights into the software supply chain, including component counts, package classifications, license diversity, and overall security posture.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% OVERVIEW
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{5cm}p{8cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Metric} & \textbf{\color{white}Value} \\
+\midrule
+Total Components & \TotalComponents \\
+Library Components & \LibraryComponents \\
+Application Components & \AppComponents \\
+Unique Licenses & \UniqueLicenses \\
+SBOM Format & \SbomFormat \\
+Specification Version & \SbomSpecVersion \\
+Generation Tool & \SbomGenerator \\
+Vulnerability Scanner & \VulScanner \\
+Total Vulnerabilities & \TotalVulnerabilities \\
+Critical & \CriticalVuls \\
+High & \HighVuls \\
+Medium & \MediumVuls \\
+Low & \LowVuls \\
+Negligible & \NegligibleVuls \\
+\bottomrule
+\end{tabular}
+\caption{Overall SBOM Statistics}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% COMPONENT SUMMARY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Component Summary}
+
+The generated SBOM contains a total of \textbf{\TotalComponents\ software components}. Most of these components are third-party libraries required by the application, while a small number represent application artifacts generated during the build process.
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{6cm}c}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Component Type} & \textbf{\color{white}Count} \\
+\midrule
+Libraries & \LibraryComponents \\
+Applications & \AppComponents \\
+\bottomrule
+\end{tabular}
+\caption{Component Type Distribution}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% LICENSE STATISTICS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{License Statistics}
+
+The project depends on packages distributed under multiple open-source licenses. License diversity is important for legal compliance and software redistribution.
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{6cm}c}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}License} & \textbf{\color{white}Packages} \\
+\midrule
+MIT & 14 \\
+Unknown & 10 \\
+Apache-2.0 & 4 \\
+BSD-2-Clause & 2 \\
+\bottomrule
+\end{tabular}
+\caption{License Distribution}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% OBSERVATIONS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Statistical Observations}
+
+The analysis of the generated SBOM reveals the following key observations:
+\begin{itemize}
+\item The software supply chain consists primarily of third-party libraries.
+\item MIT License is the most commonly used license within the project.
+\item Apache-2.0 is the second most frequently used license.
+\item Only four application components are present in the SBOM.
+\item Multiple license types indicate a diverse open-source dependency ecosystem.
+\item A small number of components have unknown license information and should be reviewed during compliance audits.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SECURITY INSIGHTS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Security Insights}
+
+Statistical analysis of the SBOM assists security teams by providing:
+\begin{itemize}
+\item Visibility into dependency growth.
+\item Identification of heavily reused packages.
+\item Detection of components without license metadata.
+\item Better prioritization for vulnerability assessment.
+\item Support for software supply chain risk analysis.
+\item Baseline metrics for future software releases.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% VULNERABILITY STATISTICS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Vulnerability Statistics}
+
+The generated SBOM was analyzed using the \textbf{\VulScanner} Software Composition Analysis (SCA) tool to identify known security vulnerabilities within project dependencies.
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{6cm}c}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Severity} & \textbf{\color{white}Count} \\
+\midrule
+Critical & \CriticalVuls \\
+High & \HighVuls \\
+Medium & \MediumVuls \\
+Low & \LowVuls \\
+Negligible & \NegligibleVuls \\
+\midrule
+\textbf{Total Vulnerabilities} & \textbf{\TotalVulnerabilities} \\
+\bottomrule
+\end{tabular}
+\caption{Vulnerability Severity Distribution}
+\end{table}
+
+%STATISTICS_VULNERABILITY_SUMMARY_TEXT%
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SUMMARY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Summary}
+
+The generated SBOM demonstrates that the \textbf{\ProjectName} relies on a mature open-source ecosystem consisting of hundreds of reusable software libraries. The statistical analysis provides valuable insight into component composition, license diversity, and dependency characteristics.
+
+In addition, the vulnerability assessment complements the SBOM by identifying known security issues within project dependencies. Together, these statistics establish a quantitative baseline for software composition, software supply chain security, and future security assessments across subsequent releases.

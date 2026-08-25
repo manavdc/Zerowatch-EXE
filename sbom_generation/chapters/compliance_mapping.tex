@@ -1,0 +1,162 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% COMPLIANCE MAPPING
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\chapter[Compliance Mapping]{\IconCompliance\ Compliance Mapping}
+
+This chapter maps the generated SBOM and vulnerability assessment against widely adopted security frameworks and explains how they contribute to software governance, software supply chain security, and compliance.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% COMPLIANCE OVERVIEW
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{5cm}p{8cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Compliance Area} & \textbf{\color{white}Status} \\
+\midrule
+CycloneDX SBOM & Supported \\
+NTIA Minimum Elements & Supported \\
+NIST SSDF & Partially Supported \\
+Software Supply Chain Visibility & Supported \\
+License Compliance & Supported \\
+Component Inventory & Supported \\
+Vulnerability Assessment & Supported (\SbomFormat) \\
+Vulnerability Correlation & Supported \\
+SCA & Supported \\
+\bottomrule
+\end{tabular}
+\caption{Compliance Overview}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% FRAMEWORK MAPPING
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Framework Mapping}
+
+\begin{table}[H]
+\centering
+\small
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{5cm}p{3cm}p{5cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Framework} & \textbf{\color{white}Status} & \textbf{\color{white}SBOM Contribution} \\
+\midrule
+CycloneDX & Supported & Standardized SBOM specification \\
+NTIA Minimum Elements & Supported & Component inventory, supplier information, dependency relationships \\
+NIST Secure Software Development Framework (SSDF) & Partial & Supports software inventory and dependency management \\
+ISO 27001 Asset Management & Partial & Maintains software asset inventory \\
+Software Supply Chain Security & Supported & SBOM inventory with vulnerability assessment \\
+Customer Security Assessments & Supported & Provides software transparency \\
+Software Composition Analysis (SCA) & Supported & Continuous dependency vulnerability analysis \\
+\bottomrule
+\end{tabular}
+\caption{Compliance Framework Mapping}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% HOW THE SBOM SUPPORTS COMPLIANCE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{How the SBOM and Vulnerability Assessment Support Compliance}
+The generated SBOM together with the Grype and ZeroWatch Audit vulnerability assessments contributes to software governance by providing:
+\begin{itemize}
+\item Complete software component inventory.
+\item Identification of third-party dependencies.
+\item Standardized Package URL (PURL) identifiers.
+\item Software license metadata.
+\item Traceability of software components.
+\item Machine-readable software inventory.
+\item Identification of known security vulnerabilities.
+\item Available remediation information.
+\item Improved software supply chain transparency.
+\item Continuous Software Composition Analysis (SCA).
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% COMPLIANCE BENEFITS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Compliance Benefits}
+
+Maintaining an accurate SBOM enables organizations to:
+\begin{itemize}
+\item Demonstrate software supply chain transparency.
+\item Simplify customer security questionnaires.
+\item Accelerate internal and external security audits.
+\item Improve software governance.
+\item Track third-party software usage.
+\item Support procurement security reviews.
+\item Maintain software inventory throughout the application lifecycle.
+\item Demonstrate proactive vulnerability management.
+\item Support software security audits.
+\item Improve Software Composition Analysis (SCA) maturity.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% CURRENT LIMITATIONS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Current Limitations}
+
+The generated SBOM and vulnerability assessment provide a comprehensive view of the current software supply chain; however, compliance requires continuous maintenance throughout the software development lifecycle.
+
+Future software releases should continue to include:
+\begin{itemize}
+\item Regeneration of the SBOM after dependency changes.
+\item Periodic vulnerability assessments using Grype and the ZeroWatch Audit Scan.
+\item Continuous dependency updates.
+\item Secure software development practices.
+\item Digital signature verification.
+\item Continuous security monitoring.
+\item Periodic compliance reviews.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% RECOMMENDED COMPLIANCE WORKFLOW
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Recommended Compliance Workflow}
+
+\begin{enumerate}
+\item Generate a new SBOM for every software release.
+\item Archive SBOMs alongside released artifacts.
+\item Scan dependencies using Grype and the ZeroWatch Audit Scan.
+\item Review vulnerability findings and available fixes.
+\item Review software license compliance.
+\item Address newly discovered vulnerabilities.
+\item Regenerate the SBOM after dependency updates.
+\item Maintain historical SBOMs for audit purposes.
+\end{enumerate}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SUMMARY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Summary}
+
+The Software Bill of Materials generated using Syft, together with the Grype and ZeroWatch Audit vulnerability assessments, provides a comprehensive foundation for software supply chain governance, dependency management, software license compliance, and security assurance.
+
+By combining software inventory, vulnerability analysis, and continuous Software Composition Analysis (SCA), the \textbf{\ProjectName} is better positioned to support modern cybersecurity practices, regulatory compliance, customer security assessments, and secure software development throughout the application lifecycle.

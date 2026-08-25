@@ -1,0 +1,144 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% EXECUTIVE SUMMARY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\chapter[Executive Summary]{\IconSummary\ Executive Summary}
+
+The \textbf{Software Bill of Materials (SBOM)} provides a comprehensive inventory of all software components used within the \textbf{\ProjectName}. By documenting third-party libraries, application components, software licenses, and dependency relationships, the SBOM enhances software supply chain transparency while enabling effective vulnerability management, license compliance, and software governance.
+
+This report has been generated from the project's \textbf{\SbomFormat\ Software Bill of Materials (SBOM)} using the \textbf{\SbomGenerator} tool. The generated SBOM is subsequently analyzed using \textbf{\VulScanner}, which correlates the identified software components with publicly disclosed Common Vulnerabilities and Exposures (CVEs). This approach enables the identification of vulnerable dependencies, severity levels, affected package versions, and available fixed versions.
+
+The resulting machine-readable SBOM has been transformed into a structured and human-readable report that summarizes project metadata, software dependency statistics, license distribution, dependency inventory, security analysis, compliance mapping, and recommendations for improving software supply chain security.
+
+The primary objective of this report is to provide developers, security engineers, auditors, and compliance teams with complete visibility into the software composition and security posture of the \textbf{\ProjectName}. By combining SBOM generation with automated vulnerability analysis, the report supports continuous monitoring of third-party software components throughout the software development lifecycle.
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% OVERVIEW TABLE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{table}[H]
+\small
+\centering
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{5cm}p{8cm}}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Item} & \textbf{\color{white}Value}\\
+\midrule
+Project & \ProjectName \\
+Document & Software Bill of Materials (SBOM) Report \\
+SBOM Format & \SbomFormat \\
+Specification Version & \SbomSpecVersion \\
+SBOM Generator & \SbomGenerator \\
+Vulnerability Scanner & \VulScanner \\
+Generated On & \ReportDate \\
+Target Audience & Developers, Security Engineers, Compliance Auditors \\
+\bottomrule
+\end{tabular}
+\caption{Executive Summary Overview}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% REPORT OBJECTIVES
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Objectives}
+
+This report has been prepared with the following objectives:
+\begin{itemize}
+\item Provide complete visibility into all software components used across the \ProjectName\ codebase.
+\item Generate a standards-compliant Software Bill of Materials (SBOM).
+\item Identify known software vulnerabilities using \VulScanner.
+\item Support software supply chain transparency.
+\item Assist software license compliance.
+\item Enable security audits and compliance assessments.
+\item Maintain an inventory of direct and transitive dependencies.
+\item Improve vulnerability management through continuous Software Composition Analysis (SCA).
+\item Strengthen software supply chain security throughout the development lifecycle.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% KEY STATISTICS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Key Statistics}
+
+\begin{table}[H]
+\small
+\centering
+\renewcommand{\arraystretch}{1.3}
+
+\begin{tabular}{p{6cm}c}
+\toprule
+\rowcolor{ZWPrimary}
+\textbf{\color{white}Metric} & \textbf{\color{white}Value}\\
+\midrule
+Total Software Components & \TotalComponents \\
+Library Components & \LibraryComponents \\
+Application Components & \AppComponents \\
+Unique Licenses & \UniqueLicenses \\
+Package Manager & pip \\
+Primary Languages & Python \\
+SBOM Standard & \SbomFormat\ \SbomSpecVersion \\
+Vulnerability Scanner & \VulScanner \\
+\bottomrule
+\end{tabular}
+\caption{High-Level SBOM Metrics}
+\end{table}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% REPORT SCOPE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Report Scope}
+
+The scope of this report includes:
+\begin{itemize}
+\item Software Bill of Materials (SBOM) generation.
+\item Direct and transitive dependency inventory.
+\item Software license analysis.
+\item Dependency statistics.
+\item Package URL (PURL) identification.
+\item Software supply chain analysis.
+\item Vulnerability analysis using \VulScanner.
+\item Security and compliance assessment.
+\item Recommendations for dependency and vulnerability management.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% COMPLIANCE HIGHLIGHTS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Compliance Highlights}
+
+The generated SBOM and vulnerability analysis support modern software supply chain security initiatives, including:
+\begin{itemize}
+\item CycloneDX Software Bill of Materials Specification.
+\item NTIA Minimum Elements for SBOM.
+\item NIST Secure Software Development Framework (SSDF).
+\item Software Supply Chain Security Best Practices.
+\item ISO/IEC 27001 Asset Inventory Requirements.
+\item Enterprise Software Governance.
+\item Customer Security and Procurement Assessments.
+\end{itemize}
+
+\vspace{0.4cm}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% SUMMARY
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Summary}
+
+The \ProjectName\ integrates Syft for SBOM generation, and Grype and the ZeroWatch Agent Scan for automated vulnerability analysis, providing a comprehensive Software Composition Analysis (SCA) workflow. Together, these tools enable complete software inventory management, vulnerability detection, license compliance, and software supply chain transparency, allowing organizations to identify and mitigate security risks associated with third-party dependencies more effectively.

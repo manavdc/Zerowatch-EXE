@@ -1,0 +1,36 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% REPORT SCOPE
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\chapter[Report Scope]{\IconScope\ Report Scope}
+\chaptermark{Report Scope}
+
+\noindent This chapter outlines the boundaries, objectives, standards, and scope of the Software Bill of Materials (SBOM) and vulnerability assessment conducted for the \ProjectName. Defining these parameters is essential for audit transparency and security review.
+
+\section{Objectives}
+\begin{itemize}
+    \item \textbf{Visibility}: Establish a complete, transparent, and queryable inventory of all third-party software components.
+    \item \textbf{Vulnerability Management}: Identify and catalog known security vulnerabilities affecting any deployed dependencies.
+    \item \textbf{License Compliance}: Discover and report the licenses of all components to mitigate legal and intellectual property risks.
+    \item \textbf{Regulatory Preparedness}: Provide standard-compliant documentation suitable for security audits, executive reviews, and customer inquiries.
+\end{itemize}
+
+\section{Included Components}
+The assessment covers the architecture of the \ProjectName, scanning system-level service components and background scanning utilities:
+\begin{enumerate}
+    \item \textbf{Sentinel Agent Service}: Core agent loop, certificate pinning validators, secure communications, and update handlers.
+    \item \textbf{Background Scanning Engines}: Local vulnerability detection, configuration audits, and system metric reporters.
+\end{enumerate}
+
+\section{SBOM Standard}
+This report conforms to the \textbf{\SbomFormat\ \SbomSpecVersion} specification. CycloneDX is a lightweight software bill of materials standard designed for use in application security contexts and supply chain component analysis. The SBOM is serialized in JSON format for automated validation and integration.
+
+\section{Vulnerability Scanner}
+Vulnerabilities are identified using \textbf{\VulScanner}, an open-source, database-agnostic Software Composition Analysis (SCA) vulnerability scanner. The scanner correlates package metadata (PURLs) against curated feeds, including the National Vulnerability Database (NVD) and GitHub Security Advisories (GHSA).
+
+\section{Intended Audience}
+This document is prepared for:
+\begin{itemize}
+    \item \textbf{Security Auditors}: To verify compliance with software security guidelines and supply chain requirements.
+    \item \textbf{Technical Teams \& Architects}: To plan remediation activities and package upgrades.
+    \item \textbf{Executive Leadership}: To assess the platform's third-party risk profile and security posture.
+\end{itemize}

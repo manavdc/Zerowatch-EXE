@@ -1,0 +1,72 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% EXECUTIVE DASHBOARD
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\chapter[Executive Dashboard]{\IconDashboard\ Executive Dashboard}
+\chaptermark{Executive Dashboard}
+
+\noindent This dashboard provides a high-level visual summary of the software composition and vulnerability posture of the \textbf{\ProjectName}. These key metrics represent a security assessment of the Python codebase and its packages.
+
+\vspace{0.8cm}
+
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{cc}
+
+\begin{tcolorbox}[colback=ZWLightGray,colframe=ZWPrimary,arc=6pt,halign=center,width=6.5cm,height=3.2cm,valign=center]
+    {\color{ZWPrimary}\large\textbf{\IconDiagram\ PROJECT}} \\
+    \vspace{0.25cm}
+    {\Large\bfseries\color{ZWDark} \ProjectName}
+\end{tcolorbox}
+&
+\begin{tcolorbox}[colback=ZWLightGray,colframe=ZWPrimary,arc=6pt,halign=center,width=6.5cm,height=3.2cm,valign=center]
+    {\color{ZWPrimary}\large\textbf{\IconMetadata\ SBOM FORMAT}} \\
+    \vspace{0.25cm}
+    {\Large\bfseries\color{ZWDark} \SbomFormat\ \SbomSpecVersion}
+\end{tcolorbox}
+\\
+
+\begin{tcolorbox}[colback=ZWLightGray,colframe=ZWPrimary,arc=6pt,halign=center,width=6.5cm,height=3.2cm,valign=center]
+    {\color{ZWPrimary}\large\textbf{\IconBox\ TOTAL COMPONENTS}} \\
+    \vspace{0.25cm}
+    {\Huge\bfseries\color{ZWDark} \TotalComponents}
+\end{tcolorbox}
+&
+\begin{tcolorbox}[colback=ZWLightGray,colframe=ZWPrimary,arc=6pt,halign=center,width=6.5cm,height=3.2cm,valign=center]
+    {\color{ZWPrimary}\large\textbf{\IconLibraries\ LIBRARIES}} \\
+    \vspace{0.25cm}
+    {\Huge\bfseries\color{ZWDark} \LibraryComponents}
+\end{tcolorbox}
+\\
+
+\begin{tcolorbox}[colback=ZWLightGray,colframe=ZWPrimary,arc=6pt,halign=center,width=6.5cm,height=3.2cm,valign=center]
+    {\color{ZWPrimary}\large\textbf{\IconApp\ APPLICATIONS}} \\
+    \vspace{0.25cm}
+    {\Huge\bfseries\color{ZWDark} \AppComponents}
+\end{tcolorbox}
+&
+\begin{tcolorbox}[colback=ZWLightGray,colframe=ZWPrimary,arc=6pt,halign=center,width=6.5cm,height=3.2cm,valign=center]
+    {\color{ZWPrimary}\large\textbf{\IconLicense\ LICENSES}} \\
+    \vspace{0.25cm}
+    {\Huge\bfseries\color{ZWDark} \UniqueLicenses}
+\end{tcolorbox}
+\\
+
+\begin{tcolorbox}[colback=ZWLightGray,colframe=ZWRed,arc=6pt,halign=center,width=6.5cm,height=3.2cm,valign=center]
+    {\color{ZWRed}\large\textbf{\IconWarning\ VULNERABILITIES}} \\
+    \vspace{0.25cm}
+    {\Huge\bfseries\color{ZWRed} \TotalVulnerabilities\ High}
+\end{tcolorbox}
+&
+\begin{tcolorbox}[colback=ZWLightGray,colframe=ZWPrimary,arc=6pt,halign=center,width=6.5cm,height=3.2cm,valign=center]
+    {\color{ZWPrimary}\large\textbf{\IconSearch\ SCAN TOOL}} \\
+    \vspace{0.25cm}
+    {\large\bfseries\color{ZWDark} Syft + Grype + ZW Audit}
+\end{tcolorbox}
+
+\end{tabular}
+\end{center}
+
+\vspace{0.8cm}
+\begin{tcolorbox}[colback=ZWLightGray,colframe=ZWTeal,arc=6pt,left=12pt,right=12pt,top=10pt,bottom=10pt]
+\textbf{\color{ZWTeal}\IconInfo\ Dashboard Overview:} %DASHBOARD_OVERVIEW_TEXT%
+\end{tcolorbox}

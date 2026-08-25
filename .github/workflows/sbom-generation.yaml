@@ -1,0 +1,64 @@
+name: Generate SBOM PDF Report
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-sbom-pdf:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+          cache-dependency-path: 'package-lock.json'
+
+      - name: Install dependencies
+        run: |
+          npm install
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Install Grype
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Setup Tectonic
+        uses: wtfjoke/setup-tectonic@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run SBOM & Vulnerability Scan
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+        run: |
+          node scan_sbom.js
+
+      - name: Update LaTeX templates with scan data
+        run: |
+          node sbom_generation/update_latex.js
+
+      - name: Compile SBOM Report to PDF (Tectonic)
+        run: |
+          tectonic main.tex
+        working-directory: sbom_generation
+
+      - name: Upload PDF Report Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-report
+          path: sbom_generation/main.pdf
+          retention-days: 1
