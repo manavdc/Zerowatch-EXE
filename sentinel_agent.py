@@ -7667,7 +7667,11 @@ class DashboardFrame(tk.Frame):
                     return
 
                 # 2. Ensure initial inventory scan & sync runs if server has no software
-                if not getattr(self, "inventory_synced", False):
+                # Inventory belongs to the background daemon.  When the GUI
+                # also starts a scan here, it can race the daemon and upload
+                # a registry-only fallback repeatedly, masking the deep-scan
+                # result in the backend.
+                if not getattr(self, "inventory_synced", False) and not _is_daemon_running():
                     product_count = (info.get("stats", {}) or {}).get("productCount") if isinstance(info, dict) else None
                     if product_count is None or product_count == 0:
                         logging.info("GUI: No server inventory detected. Triggering full scan (60s deadline)...")
