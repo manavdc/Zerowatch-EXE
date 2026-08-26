@@ -5676,8 +5676,6 @@ def main_agent():
                 logging.warning(
                     "Initial Windows deep scan exceeded 55 seconds; sending fast installed-software inventory."
                 )
-                scan_stop.set()
-                scan_thread.join(timeout=5)
                 software = get_installed_software_registry()
                 inventory_scope = "partial"
         else:
@@ -5690,6 +5688,36 @@ def main_agent():
 
         logging.info("Syncing full inventory to backend via JSON...")
         zw_client.sync_full(software, hardware_data, inventory_scope=inventory_scope)
+
+        if _orchestrator is not None and inventory_scope == "partial" and not scan_error:
+            # Keep the deep scan alive past the startup deadline, then replace
+            # the fallback inventory when the complete result is available.
+            def _sync_completed_initial_scan():
+                scan_done.wait()
+                if scan_error:
+                    logging.warning(
+                        "Background Windows deep scan failed after fallback sync: %s",
+                        scan_error[0],
+                    )
+                    return
+                try:
+                    zw_client.sync_full(
+                        scan_result, hardware_data, inventory_scope="complete"
+                    )
+                    logging.info(
+                        "Background Windows deep scan sync completed (%d items).",
+                        len(scan_result),
+                    )
+                except Exception as _bg_sync_err:
+                    logging.warning(
+                        "Background Windows deep scan sync failed: %s", _bg_sync_err
+                    )
+
+            threading.Thread(
+                target=_sync_completed_initial_scan,
+                name="windows-initial-scan-followup",
+                daemon=True,
+            ).start()
         show_windows_notification("Zerowatch", "Sentinel Agent stopped scanning")
 
         if _orchestrator is not None:
