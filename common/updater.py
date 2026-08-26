@@ -30,7 +30,7 @@ GitHub Releases distribution:
   Uses plain requests (no cert pinning) against GitHub CDN — the Ed25519
   signature is the trust anchor, not TLS.
 
-Background check: every UPDATE_CHECK_INTERVAL_SECS (5 minutes) via a daemon thread.
+Background check: every UPDATE_CHECK_INTERVAL_SECS (4 hours) via a daemon thread.
 Manual check:     UpdateChecker.check_for_update(force=True)
 ─────────────────────────────────────────────────────────────────────────────
 """
@@ -77,8 +77,8 @@ MANIFEST_SIG_URL = f"{_RELEASES_BASE}/release-manifest.json.sig"
 # TUF-inspired Timestamp: refuse to trust manifests older than this
 MANIFEST_MAX_AGE_DAYS: int = 3
 
-# Background poll: 5 minutes (300 seconds) for local OTA verification
-UPDATE_CHECK_INTERVAL_SECS: int = 5 * 60
+# Background poll: 4 hours (14400 seconds) for local OTA verification
+UPDATE_CHECK_INTERVAL_SECS: int = 4 * 60 * 60
 
 # Download streaming chunk size
 _CHUNK_SIZE: int = 8 * 1024  # 8 KiB
@@ -542,7 +542,7 @@ class UpdateChecker:
         with self._lock:
             now = time.monotonic()
             if not force and (now - self._last_check_time) < UPDATE_CHECK_INTERVAL_SECS:
-                logger.debug("OTA check skipped (within 5-minute cooldown window).")
+                logger.debug("OTA check skipped (within 4-hour cooldown window).")
                 return self._cached_result
 
             try:
@@ -796,12 +796,12 @@ class BinaryDownloader:
 
 
 # ---------------------------------------------------------------------------
-# Background 5-minute update monitor
+# Background 4-hour update monitor
 # ---------------------------------------------------------------------------
 
 class BackgroundUpdateMonitor:
     """
-    Daemon thread that polls GitHub Releases every 5 minutes.
+    Daemon thread that polls GitHub Releases every 4 hours.
 
     When a verified update is detected, calls `on_update_available(info: UpdateInfo)`.
     Thread is a daemon so it does not prevent interpreter shutdown.
@@ -844,7 +844,7 @@ class BackgroundUpdateMonitor:
 
     def check_now(self) -> Optional[UpdateInfo]:
         """
-        Trigger an immediate (forced) check, bypassing the 5-minute cooldown.
+        Trigger an immediate (forced) check, bypassing the 4-hour cooldown.
         Used by the 'Check for Updates' button.
         """
         return self._checker.check_for_update(force=True)
@@ -862,7 +862,7 @@ class BackgroundUpdateMonitor:
             return
         self._do_check()
 
-        # Periodic 5-minute check
+        # Periodic 4-hour check
         elapsed = 0
         while not self._stop.is_set():
             self._stop.wait(timeout=60)

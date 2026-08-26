@@ -7088,7 +7088,7 @@ class DashboardFrame(tk.Frame):
         """OTA Software Update card for the Settings page.
 
         Implements Section 5.1 of the OTA spec:
-          - Background 5-minute check (driven by BackgroundUpdateMonitor)
+          - Background 4-hour check (driven by BackgroundUpdateMonitor)
           - Manual 'Check for Updates' button
           - Cyan banner: '⚡ New version vX.Y.Z available!'
           - 'Update Now' button with determinate progress bar
