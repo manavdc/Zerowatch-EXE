@@ -4789,7 +4789,14 @@ def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
                 if orchestrator is not None:
                     orchestrator.stop_periodic_scans()
                     orchestrator.reset_for_reenrollment()
-                    software = orchestrator.run_full_scan(include_filesystem=True)
+                    software = orchestrator.run_full_scan(
+                        include_filesystem=True,
+                        on_delta=lambda added_items, removed_items: (
+                            zw_client.sync_delta(added_items, removed_items)
+                            if (added_items or removed_items) and zw_client.jwt
+                            else None
+                        ),
+                    )
                 else:
                     # Re-enrollment can follow a deliberate cache close.  In
                     # that case build a fresh scanner instead of treating the
@@ -5807,7 +5814,10 @@ def main_agent():
                 # replace the partial enrollment inventory with its result.
                 def _run_deep_scan_after_baseline():
                     try:
-                        deep_items = _orchestrator.run_full_scan(include_filesystem=True)
+                        deep_items = _orchestrator.run_full_scan(
+                            include_filesystem=True,
+                            on_delta=_on_fs_delta,
+                        )
                         if zw_client.jwt:
                             zw_client.sync_full(
                                 deep_items, hardware_data, inventory_scope="complete"
