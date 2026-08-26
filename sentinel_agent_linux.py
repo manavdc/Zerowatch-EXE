@@ -766,6 +766,28 @@ class LinuxAgent:
             logger.info("Fallback L0 scan: %d items — syncing now.", len(items))
             self._sync_full_with_retry(items, hardware, "partial")
 
+            # Do not leave the backend with the partial fallback forever.
+            # The full scan is still running after the 60-second deadline;
+            # publish its completed L1/L2 result as a complete replacement as
+            # soon as it finishes instead of waiting for a later periodic
+            # scan/delta cycle.
+            def _sync_completed_full_scan():
+                full_scan_done.wait()
+                if full_scan_error or self._shutdown_event.is_set():
+                    return
+                if self._session._jwt and full_items:
+                    if self._sync_full_with_retry(full_items, hardware, "complete"):
+                        logger.info(
+                            "Background deep scan sync complete: %d items.",
+                            len(full_items),
+                        )
+
+            threading.Thread(
+                target=_sync_completed_full_scan,
+                daemon=True,
+                name="linux-initial-scan-followup",
+            ).start()
+
             # Seed orchestrator snapshot so subsequent deltas are accurate
             try:
                 with self._orchestrator._snapshot_lock:

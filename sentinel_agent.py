@@ -4700,7 +4700,11 @@ def _wait_for_enrollment(zw_client, base_dir):
                 elif refresh.get("status") == "pending":
                     join_state_needs_verification = False
 
-            time.sleep(60)
+            # Approval can happen from the web UI after the local GUI has
+            # been closed.  Keep the daemon responsive in that case; a
+            # minute-long polling interval made enrollment appear stuck and
+            # delayed the first inventory upload unnecessarily.
+            time.sleep(5)
             zw_client.jwt = zw_client._load_jwt()
 
         return True
@@ -4744,45 +4748,78 @@ def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
     Called after every re-enrollment event (unlink, auth failure, license renewal).
     """
     try:
-        # Step 1: Full inventory sync (Layer 0 + Layer 1 + Layer 2)
-        if orchestrator is not None:
-            software = orchestrator.run_full_scan(include_filesystem=True)
-        else:
-            software = get_full_software_inventory(base_dir, include_filesystem=True)
+        # Publish a useful baseline first.  The previous implementation made
+        # the daemon wait for a full-drive walk before doing any sync, so an
+        # approval made from the frontend while the GUI was closed could take
+        # several minutes and leave the UI showing only a partial inventory.
         hardware_data = get_detailed_hardware_profile()
-        zw_client.sync_full(software, hardware_data, inventory_scope="complete")
-        logging.info("[RE-ENROLL] Full inventory sync complete.")
+        fast_software = get_installed_software_registry()
+        if zw_client.sync_full(fast_software, hardware_data, inventory_scope="partial"):
+            logging.info(
+                "[RE-ENROLL] Immediate installed-software sync complete (%d items).",
+                len(fast_software),
+            )
 
-        if orchestrator is not None:
-            # Step 2: Flush cached filesystem items as delta
+        # A daemon re-enrollment closes the old cache before loading the new
+        # token.  Recreate the scanner here so the deep scan and its cache are
+        # valid even when the caller supplied no live orchestrator.
+        if orchestrator is None:
             try:
-                cached_items = orchestrator._cache.all_cached_items()
-                if cached_items:
-                    with orchestrator._snapshot_lock:
-                        existing_keys = set(orchestrator._last_snapshot.keys())
-                    new_additions = []
-                    for item in cached_items:
-                        if item.is_valid() and item.dedup_key() not in existing_keys:
-                            d = item.to_api_dict()
-                            d["change_type"] = "added"
-                            new_additions.append(d)
-                    if new_additions:
-                        zw_client.sync_delta(new_additions, [])
-                        logging.info("[RE-ENROLL] Flushed %d cached items.", len(new_additions))
-            except Exception as flush_err:
-                logging.warning("[RE-ENROLL] Cache flush failed (non-fatal): %s", flush_err)
+                from scanner import ScanOrchestrator
+                from platforms import PlatformFactory
 
-            # Step 3 & 4: Stop existing scan thread, reset cold-start, restart scans
-            orchestrator.stop_periodic_scans()
-            orchestrator.reset_for_reenrollment()
+                platform = PlatformFactory.create(get_installed_software_registry)
+                orchestrator = ScanOrchestrator(
+                    base_dir=base_dir,
+                    existing_registry_fn=get_installed_software_registry,
+                    agent_version=AGENT_VERSION,
+                    software_collector=platform.software_collector,
+                    binary_inspector=platform.binary_inspector,
+                    filesystem_walker=platform.filesystem_walker,
+                )
+                orchestrator.load_snapshot_from_cache()
+            except Exception as orch_exc:
+                logging.warning("[RE-ENROLL] Fresh scanner setup failed: %s", orch_exc)
 
-            def _on_fs_delta(added_items, removed_items):
-                if (added_items or removed_items) and zw_client.jwt:
-                    zw_client.sync_delta(added_items, removed_items)
+        # The expensive walk must not block enrollment or the daemon's main
+        # loop.  It runs once in the background and replaces the partial
+        # server snapshot with the complete Layer 0/1/2 inventory.
+        def _deep_scan_worker():
+            try:
+                if orchestrator is not None:
+                    orchestrator.stop_periodic_scans()
+                    orchestrator.reset_for_reenrollment()
+                    software = orchestrator.run_full_scan(include_filesystem=True)
+                else:
+                    # Re-enrollment can follow a deliberate cache close.  In
+                    # that case build a fresh scanner instead of treating the
+                    # closed instance as usable.
+                    software = get_full_software_inventory(
+                        base_dir, include_filesystem=True
+                    )
+                if zw_client.jwt:
+                    zw_client.sync_full(software, hardware_data, inventory_scope="complete")
+                    logging.info(
+                        "[RE-ENROLL] Background deep inventory sync complete (%d items).",
+                        len(software),
+                    )
 
-            orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
-            logging.info("[RE-ENROLL] Periodic scans restarted — deep scan will run immediately.")
+                def _on_fs_delta(added_items, removed_items):
+                    if (added_items or removed_items) and zw_client.jwt:
+                        zw_client.sync_delta(added_items, removed_items)
 
+                if orchestrator is not None:
+                    orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
+                    logging.info("[RE-ENROLL] Periodic scans restarted after deep scan.")
+            except Exception as exc:
+                logging.error("[RE-ENROLL] Background deep scan failed: %s", exc)
+
+        threading.Thread(
+            target=_deep_scan_worker,
+            name="post-enrollment-deep-scan",
+            daemon=True,
+        ).start()
+        logging.info("[RE-ENROLL] Deep scan started in background.")
     except Exception as e:
         logging.error("[RE-ENROLL] Post-enrollment scan failed: %s", e)
 
@@ -5875,6 +5912,10 @@ def main_agent():
                         logging.info("[MAIN] Agent unlinked: stopping scans and closing cache connection.")
                         _orchestrator.stop_periodic_scans()
                         _orchestrator.close()
+                        # The closed instance must not be reused after the new
+                        # JWT is loaded; the post-enrollment path will create
+                        # a fresh scanner when this is None.
+                        _orchestrator = None
                     except Exception as _close_err:
                         logging.warning("[MAIN] Error closing orchestrator (non-fatal): %s", _close_err)
 
