@@ -340,6 +340,11 @@ def _systemctl_restart() -> bool:
                 "[LINUX SWAP] systemctl %s restart failed (rc=%d): %s",
                 " ".join(scope_flag), result.returncode, result.stderr.strip()
             )
+            logger.warning(
+                "[LINUX SWAP] systemctl %s restart rejected (rc=%d): %s",
+                " ".join(scope_flag), result.returncode,
+                result.stderr.strip() or "no error output",
+            )
         except Exception as exc:
             logger.debug("[LINUX SWAP] systemctl invocation error: %s", exc)
 
@@ -543,17 +548,32 @@ def startup_bak_cleanup(current_exe: str) -> None:
         current_exe: Absolute path to the running executable (from get_exe_path()).
     """
     bak_path = current_exe + ".bak"
-    if not os.path.exists(bak_path):
+    backup_paths = [bak_path]
+    if sys.platform == "win32":
+        current_name = os.path.basename(current_exe)
+        parent_dir = os.path.dirname(current_exe) or "."
+        try:
+            backup_paths.extend(
+                os.path.join(parent_dir, name)
+                for name in os.listdir(parent_dir)
+                if name.startswith(current_name + ".") and name.endswith(".bak")
+            )
+        except OSError:
+            pass
+
+    backup_paths = list(dict.fromkeys(path for path in backup_paths if os.path.exists(path)))
+    if not backup_paths:
         return  # Normal startup — nothing to clean up
 
     logger.info(
-        "[OTA] Post-update .bak detected: %s — scheduling cleanup after 30s stability window.",
-        bak_path,
+        "[OTA] Post-update backup(s) detected: %s — cleaning up after successful startup.",
+        ", ".join(backup_paths),
     )
 
     # Reaching this function means the replacement process has started. Remove
     # the backup now so successful updates never leave a .bak artifact behind.
-    _commit_update(bak_path)
+    for backup_path in backup_paths:
+        _commit_update(backup_path)
     logger.info("[OTA] Post-update cleanup complete.")
 
 

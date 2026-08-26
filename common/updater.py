@@ -542,7 +542,7 @@ class UpdateChecker:
         with self._lock:
             now = time.monotonic()
             if not force and (now - self._last_check_time) < UPDATE_CHECK_INTERVAL_SECS:
-                logger.debug("OTA check skipped (within 4-hour cooldown window).")
+                logger.debug("OTA check skipped (within 5-minute cooldown window).")
                 return self._cached_result
 
             try:
@@ -834,7 +834,7 @@ class BackgroundUpdateMonitor:
         """Start the background monitoring thread."""
         logger.info(
             "[OTA] Background update monitor started (interval: %dmin).",
-            UPDATE_CHECK_INTERVAL_SECS // 3600,
+            UPDATE_CHECK_INTERVAL_SECS // 60,
         )
         self._thread.start()
 
