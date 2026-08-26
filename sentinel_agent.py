@@ -5650,6 +5650,22 @@ def main_agent():
         logging.info("Skipping file ACL protection in standard profile.")
 
 
+    # Publish the approval baseline before initializing the scanner/cache.
+    # Cache setup and filesystem enumeration can be slow or blocked by a
+    # stale process; neither should delay the first inventory upload.
+    if is_inventory_scan_enabled():
+        baseline_software = get_installed_software_registry()
+        baseline_hardware = get_detailed_hardware_profile()
+        zw_client.sync_full(
+            baseline_software,
+            baseline_hardware,
+            inventory_scope="partial",
+        )
+        logging.info(
+            "Initial Windows baseline synced (%d installed-software items).",
+            len(baseline_software),
+        )
+
     # --- Initialize Scan Orchestrator ---
     # Wraps the existing registry scanner + adds Store apps, drivers,
     # OS version, portable PE binaries, and manifest parsing.
@@ -5737,7 +5753,7 @@ def main_agent():
             inventory_scope = "partial"
 
         # Get high-fidelity hardware profile (unchanged)
-        hardware_data = get_detailed_hardware_profile()
+        hardware_data = baseline_hardware
 
         logging.info("Syncing full inventory to backend via JSON...")
         zw_client.sync_full(software, hardware_data, inventory_scope=inventory_scope)

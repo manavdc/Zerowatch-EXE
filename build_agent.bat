@@ -209,7 +209,10 @@ echo       This will utilize all available CPU cores (%NUMBER_OF_PROCESSORS% thr
 echo.
 set "PACKAGE_FLAGS=--include-package=common --include-package=scanner --include-package=platforms --include-package=windows --nofollow-import-to=linux --nofollow-import-to=macos"
 set "DATA_FLAGS=--include-data-dir=resources=resources"
-set "SPEED_FLAGS=--lto=no --jobs=%NUMBER_OF_PROCESSORS%"
+rem Keep local builds reliable on developer machines with limited RAM.
+rem Onefile Zstandard packing can require several additional GB at the end
+rem of a large build, even after C compilation has succeeded.
+set "SPEED_FLAGS=--low-memory --lto=no --jobs=1"
 set "BASE_FLAGS=--assume-yes-for-downloads --zig --windows-console-mode=disable --output-dir=build --output-filename=%OUTPUT_NAME% %ICON_FLAG% --include-data-file=%ICON_PATH%=favicon.ico %PACKAGE_FLAGS% %DATA_FLAGS% %SPEED_FLAGS%"
 
 if /I "%BUILD_STYLE%"=="onefile" (
@@ -221,7 +224,7 @@ if /I "%BUILD_STYLE%"=="onefile" (
     rem Compress the outer onefile launcher so it does not retain a second
     rem full, uncompressed runtime on disk. The shared cache still lets the
     rem GUI, daemon, and watchdog reuse one extracted runtime.
-    set "STYLE_FLAGS=--onefile --enable-plugin=tk-inter --onefile-tempdir-spec={CACHE_DIR}/ZeroWatch/extracted"
+    set "STYLE_FLAGS=--onefile --onefile-no-compression --enable-plugin=tk-inter --onefile-tempdir-spec={CACHE_DIR}/ZeroWatch/extracted"
 ) else (
     set "STYLE_FLAGS=--standalone --enable-plugin=tk-inter"
 )
