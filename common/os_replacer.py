@@ -203,10 +203,16 @@ def _relaunch_detached(current_exe: str) -> bool:
         # user's file association and can open an editor instead of the agent.
         if current_exe.lower().endswith(".py"):
             target = sys.executable
-            launch_args = [current_exe, *sys.argv[1:]]
+            launch_args = [current_exe]
         else:
             target = current_exe
-            launch_args = list(sys.argv[1:])
+            launch_args = []
+
+        # A GUI restart must not inherit stale internal or installer flags.
+        # Preserve daemon mode because headless service restarts must remain
+        # headless; interactive restarts intentionally use normal routing.
+        if "--daemon" in sys.argv[1:]:
+            launch_args.append("--daemon")
 
         # Start the replacement directly instead of through PowerShell/cmd.
         # Its entry point waits on this PID before doing any agent work, so it
