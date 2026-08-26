@@ -5692,6 +5692,7 @@ def main_agent():
             scan_error = []
             scan_stop = threading.Event()
             scan_done = threading.Event()
+            deep_scan_pending = False
 
             def _run_initial_scan():
                 try:
@@ -5707,12 +5708,27 @@ def main_agent():
                 target=_run_initial_scan, name="windows-initial-scan", daemon=True
             )
             scan_thread.start()
-            if scan_done.wait(timeout=55) and not scan_error:
+            scan_completed = scan_done.wait(timeout=55)
+            if scan_completed and not scan_error:
                 software = scan_result
             else:
-                logging.warning(
-                    "Initial Windows deep scan exceeded 55 seconds; sending fast installed-software inventory."
-                )
+                if not scan_completed:
+                    logging.warning(
+                        "Initial Windows deep scan exceeded 55 seconds; sending fast installed-software inventory."
+                    )
+                    # Hand the scanner over cleanly to the periodic deep
+                    # scan.  Leaving this worker alive while starting a
+                    # second scan causes concurrent SQLite/cache access and
+                    # can prevent deep results from being uploaded.
+                    scan_stop.set()
+                    scan_thread.join(timeout=5)
+                    scan_error.append(TimeoutError("initial deep scan timed out"))
+                    deep_scan_pending = True
+                else:
+                    logging.warning(
+                        "Initial Windows deep scan failed (%s); sending fast installed-software inventory.",
+                        scan_error[0] if scan_error else "unknown error",
+                    )
                 software = get_installed_software_registry()
                 inventory_scope = "partial"
         else:
@@ -5726,35 +5742,6 @@ def main_agent():
         logging.info("Syncing full inventory to backend via JSON...")
         zw_client.sync_full(software, hardware_data, inventory_scope=inventory_scope)
 
-        if _orchestrator is not None and inventory_scope == "partial" and not scan_error:
-            # Keep the deep scan alive past the startup deadline, then replace
-            # the fallback inventory when the complete result is available.
-            def _sync_completed_initial_scan():
-                scan_done.wait()
-                if scan_error:
-                    logging.warning(
-                        "Background Windows deep scan failed after fallback sync: %s",
-                        scan_error[0],
-                    )
-                    return
-                try:
-                    zw_client.sync_full(
-                        scan_result, hardware_data, inventory_scope="complete"
-                    )
-                    logging.info(
-                        "Background Windows deep scan sync completed (%d items).",
-                        len(scan_result),
-                    )
-                except Exception as _bg_sync_err:
-                    logging.warning(
-                        "Background Windows deep scan sync failed: %s", _bg_sync_err
-                    )
-
-            threading.Thread(
-                target=_sync_completed_initial_scan,
-                name="windows-initial-scan-followup",
-                daemon=True,
-            ).start()
         show_windows_notification("Zerowatch", "Sentinel Agent stopped scanning")
 
         if _orchestrator is not None:
@@ -5798,8 +5785,43 @@ def main_agent():
                 if (added_items or removed_items) and zw_client.jwt:
                     zw_client.sync_delta(added_items, removed_items)
 
-            _orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
-            logging.info("Periodic filesystem scan started (4h priority / 24h deep).")
+            if deep_scan_pending:
+                # The timed-out startup scan has already been stopped. Run one
+                # clean, complete deep scan before enabling periodic scans and
+                # replace the partial enrollment inventory with its result.
+                def _run_deep_scan_after_baseline():
+                    try:
+                        deep_items = _orchestrator.run_full_scan(include_filesystem=True)
+                        if zw_client.jwt:
+                            zw_client.sync_full(
+                                deep_items, hardware_data, inventory_scope="complete"
+                            )
+                            logging.info(
+                                "Background Windows deep scan sync completed (%d items).",
+                                len(deep_items),
+                            )
+                    except Exception as _deep_err:
+                        logging.error(
+                            "Background Windows deep scan failed after baseline: %s",
+                            _deep_err,
+                            exc_info=True,
+                        )
+                    finally:
+                        if zw_client.jwt:
+                            _orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
+                            logging.info(
+                                "Periodic filesystem scan started after initial deep scan."
+                            )
+
+                threading.Thread(
+                    target=_run_deep_scan_after_baseline,
+                    name="windows-initial-deep-scan",
+                    daemon=True,
+                ).start()
+                logging.info("Background Windows deep scan started after baseline sync.")
+            else:
+                _orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
+                logging.info("Periodic filesystem scan started (4h priority / 24h deep).")
 
     else:
         logging.info("Inventory scan is disabled in settings. Skipping initial full scan.")
