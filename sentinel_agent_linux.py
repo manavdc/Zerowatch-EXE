@@ -903,17 +903,55 @@ class LinuxAgent:
             "hardware":  hardware,
             "inventoryScope": inventory_scope,
             "inventoryRevision": time.time_ns(),
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         try:
             resp = self._session.post("/agent/sync/full", payload, timeout=60)
             if resp.status_code in (200, 201, 204):
                 logger.info("Full sync: %d items and hardware profile synced", len(software))
-                return True
+                return resp.status_code
             logger.warning("Full sync failed: HTTP %d", resp.status_code)
+            return resp.status_code
         except Exception as exc:
             logger.warning("Full sync error: %s", exc)
-        return False
+            return 0
+
+    def _sync_complete_inventory(self, software_list: list, hardware: dict | None = None) -> bool:
+        """Sync complete inventory, falling back to chunked delta batches on HTTP 413 (Payload Too Large)."""
+        status_code = self._sync_full(software_list, hardware, inventory_scope="complete")
+        if status_code in (200, 201, 204):
+            return True
+        if status_code != 413:
+            return False
+
+        items = list(software_list or [])
+        if not items:
+            return False
+
+        batches = []
+        current = []
+        current_size = 0
+        for item in items:
+            item_size = len(json.dumps(item, default=str, separators=(",", ":")))
+            if current and (current_size + item_size > 256 * 1024 or len(current) >= 400):
+                batches.append(current)
+                current, current_size = [], 0
+            current.append(item)
+            current_size += item_size
+        if current:
+            batches.append(current)
+
+        logger.info("[SYNC] Chunking oversized inventory (%d items) into %d requests (HTTP 413 fallback).", len(items), len(batches))
+        first_status = self._sync_full(batches[0], hardware, inventory_scope="complete")
+        if first_status not in (200, 201, 204):
+            return False
+
+        for index, batch in enumerate(batches[1:], start=2):
+            if not self._sync_delta(batch, []):
+                logger.warning("[SYNC] Inventory chunk %d/%d failed.", index, len(batches))
+                return False
+        logger.info("[SYNC] Chunked inventory sync finished: %d items delivered.", len(items))
+        return True
 
     def _sync_delta(self, added: list, removed: list) -> bool:
         """Push incremental delta to backend."""
@@ -923,7 +961,7 @@ class LinuxAgent:
             "deviceId": self._device_id,
             "added":    added,
             "removed":  removed,
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         try:
             resp = self._session.post("/agent/sync/delta", payload, timeout=60)
@@ -931,15 +969,16 @@ class LinuxAgent:
                 logger.info("Delta sync: +%d -%d items", len(added), len(removed))
                 return True
             logger.warning("Delta sync failed: HTTP %d", resp.status_code)
+            return resp.status_code in (200, 201, 204)
         except Exception as exc:
             logger.warning("Delta sync error: %s", exc)
-        return False
+            return False
 
     def _heartbeat(self) -> bool:
         """Send periodic heartbeat."""
         payload = {
             "deviceId":   self._device_id,
-            "timestamp":  datetime.datetime.utcnow().isoformat() + "Z",
+            "timestamp":  datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "agentVersion": AGENT_VERSION,
             "platform":   "linux",
         }
@@ -952,11 +991,11 @@ class LinuxAgent:
 
     def _sync_full_with_retry(self, software: list, hardware: dict | None = None,
                               inventory_scope: str = "complete") -> bool:
-        """Push full software inventory and hardware profile to backend, retrying up to 3 times on failure."""
+        """Push full software inventory and hardware profile to backend with 413 chunking fallback, retrying up to 3 times on failure."""
         for attempt in range(3):
             if self._shutdown_event.is_set():
                 return False
-            if self._sync_full(software, hardware, inventory_scope):
+            if self._sync_complete_inventory(software, hardware):
                 return True
             logger.warning("Full sync attempt %d/3 failed. Retrying in 15s...", attempt + 1)
             self._shutdown_event.wait(timeout=15)
