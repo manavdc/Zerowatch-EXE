@@ -4407,6 +4407,7 @@ def _is_daemon_running():
         # Keep daemon.lock as a legacy fallback for older builds.
         lock_candidates = [
             os.path.join(_secure_state_dir(base_dir), ".zerowatch.lock"),
+            "/Library/Application Support/ZeroWatch/state/.zerowatch.lock",
             "/var/lib/zerowatch/state/.zerowatch.lock",
             _daemon_lock_path(base_dir),
         ]
@@ -4423,7 +4424,7 @@ def _is_daemon_running():
 
         # Final safety net: detect any already-running daemon process regardless
         # of owning user so sudo and non-sudo launches do not fork duplicates.
-        if sys.platform.startswith("linux"):
+        if sys.platform.startswith("linux") or sys.platform == "darwin":
             try:
                 exe_base = os.path.basename(get_exe_path()).lower()
                 proc = subprocess.run(
@@ -4449,7 +4450,7 @@ def _is_daemon_running():
                         if pid == self_pid:
                             continue
                         cmd_l = cmd.lower()
-                        if "--daemon" in cmd_l and exe_base and exe_base in cmd_l:
+                        if "--daemon" in cmd_l and ("sentinel_agent" in cmd_l or (exe_base and exe_base in cmd_l)):
                             return True
             except Exception:
                 pass
