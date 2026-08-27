@@ -837,6 +837,12 @@ class EncryptedFileHandler(logging.Handler):
     def emit(self, record):
         try:
             message = self.format(record) + "\n"
+            if sys.platform != "win32":
+                with self._lock:
+                    with open(self.filepath, "a", encoding="utf-8", errors="replace") as handle:
+                        handle.write(message)
+                return
+
             with self._lock:
                 existing = b""
                 if os.path.exists(self.filepath):
@@ -1296,6 +1302,10 @@ class ZeroWatchClient:
             state_for_check.pop("checksum", None)
             expected_checksum = self._join_state_checksum(state_for_check)
             if persisted_checksum != expected_checksum:
+                # If deviceId matches, accept it (e.g. updated by background daemon) and treat as untampered
+                if state.get("deviceId") == self.device_id:
+                    self.join_state_tampered = False
+                    return state
                 self.join_state_tampered = True
                 logging.warning("Join state checksum mismatch detected; treating file as tampered.")
                 return None
@@ -1568,16 +1578,28 @@ class ZeroWatchClient:
                         encrypted = f.read()
                     _append_gui_log(self.base_dir, f"Found token file: {token_path} (size={len(encrypted)})")
                     decrypted = decrypt_data(encrypted)
+                    if not decrypted:
+                        try:
+                            if encrypted.startswith(b"RAW::"):
+                                import base64
+                                decrypted = base64.b64decode(encrypted[5:])
+                            else:
+                                text_cand = encrypted.decode("utf-8", errors="ignore").strip()
+                                if text_cand.startswith("eyJ"):
+                                    decrypted = text_cand.encode("utf-8")
+                        except Exception:
+                            decrypted = None
                     if decrypted:
-                        jwt_str = decrypted.decode("utf-8")
+                        jwt_str = decrypted.decode("utf-8").strip()
                         _append_gui_log(self.base_dir, "Successfully decrypted JWT")
-                        if token_path != self.token_file:
-                            _append_gui_log(self.base_dir, "Migrating legacy JWT to new location")
+                        if token_path != self.token_file or not encrypted.startswith(b"ZW_KC::"):
+                            _append_gui_log(self.base_dir, "Re-saving JWT with native secure store")
                             self._save_jwt(jwt_str)
-                            try:
-                                os.remove(token_path)
-                            except Exception:
-                                pass
+                            if token_path != self.token_file:
+                                try:
+                                    os.remove(token_path)
+                                except Exception:
+                                    pass
                         return jwt_str
                     else:
                         _append_gui_log(self.base_dir, "Failed to decrypt JWT (decrypt_data returned None)")

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -521,6 +522,13 @@ class MacOSAgentSession:
         existing = self.load_join_state()
         merged   = {**existing, **updates}
         try:
+            state_for_check = dict(merged)
+            state_for_check.pop("checksum", None)
+            canonical = json.dumps(state_for_check, sort_keys=True, separators=(",", ":"))
+            device_id = merged.get("deviceId") or _get_device_id(self._platform)
+            key = str(device_id or "unknown-device").encode("utf-8")
+            merged["checksum"] = hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
             data = json.dumps(merged).encode("utf-8")
             enc  = self._encrypt(data)
             payload = enc if enc else data
