@@ -87,7 +87,7 @@ if os.path.exists(_BUILD_CFG_PATH):
     BASE_API_URL: str = _cfg_ns.get("FORCED_BASE_API_URL", "")
     AGENT_VERSION: str = _cfg_ns.get("FORCED_AGENT_VERSION", AGENT_VERSION)
 else:
-    BASE_API_URL = os.environ.get("ZEROWATCH_API_URL", "http://localhost:3001/api")
+    BASE_API_URL = os.environ.get("ZEROWATCH_API_URL", "https://zerowatch.deepcytes.io/api")
 
 # ── SPKI pins (identical to Windows and Linux agents) ─────────────────────────
 SPKI_PINS = {
@@ -498,6 +498,41 @@ class MacOSAgentSession:
             except OSError:
                 pass
 
+
+    def load_join_state(self) -> dict:
+        """Load enrollment state written by the GUI in the shared state dir."""
+        for path in (self._join_path, os.path.join(self._state_dir, "zw_team_join_state.dat")):
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+                decoded = self._decrypt(raw) or raw
+                state = json.loads(decoded.decode("utf-8"))
+                if isinstance(state, dict):
+                    return state
+            except Exception as exc:
+                logger.debug("Join state load failed from %s: %s", path, exc)
+        return {}
+
+    def save_join_state(self, updates: dict) -> None:
+        """Merge *updates* into the persisted join_state.json without overwriting
+        fields that are not being changed."""
+        existing = self.load_join_state()
+        merged   = {**existing, **updates}
+        try:
+            data = json.dumps(merged).encode("utf-8")
+            enc  = self._encrypt(data)
+            payload = enc if enc else data
+            for path in (self._join_path, os.path.join(self._state_dir, "zw_team_join_state.dat")):
+                try:
+                    with open(path, "wb") as fh:
+                        fh.write(payload)
+                    os.chmod(path, _SHARED_STATE_FILE_MODE)
+                except OSError as exc:
+                    logger.warning("Join state save failed for %s: %s", path, exc)
+        except Exception as exc:
+            logger.warning("Join state serialization failed: %s", exc)
     # ── HTTP verbs ────────────────────────────────────────────────────────────
 
     def post(self, path: str, payload: dict, timeout: int = 30) -> requests.Response:
@@ -608,6 +643,11 @@ class MacOSAgent:
             filesystem_walker=self._platform.filesystem_walker,
         )
 
+        # Approval-sync idempotency lock (in-process single-flight guard)
+        # The persisted approvalSyncStatus in join_state.json is the cross-restart
+        # guard; this threading.Lock() prevents duplicate callbacks within one run.
+        self._approval_sync_lock: threading.Lock = threading.Lock()
+
         # Warm the scan cache from previous session so first delta is minimal
         try:
             self._orchestrator.load_snapshot_from_cache()
@@ -647,6 +687,47 @@ class MacOSAgent:
 
     # ── Authentication ─────────────────────────────────────────────────────────
 
+    # -- Approval-sync idempotency helpers ------------------------------------
+
+    def _claim_approval_sync(self) -> bool:
+        """Atomically claim the approval-sync slot. Returns True if this daemon
+        should run the full sync; False if already complete or in-progress."""
+        with self._approval_sync_lock:
+            state = self._session.load_join_state()
+            if not isinstance(state, dict) or str(state.get("status") or "").lower() != "approved":
+                return False
+            sync_status = str(state.get("approvalSyncStatus") or "").lower()
+            request_id  = state.get("requestId") or state.get("approvalSyncRequestId") or "approved"
+            if sync_status == "complete" and state.get("approvalSyncRequestId") == request_id:
+                return False
+            if sync_status == "in_progress":
+                return False
+            self._session.save_join_state({
+                "approvalSyncStatus":    "in_progress",
+                "approvalSyncRequestId": request_id,
+            })
+            return True
+
+    def _approval_sync_complete(self) -> bool:
+        """Return True if the approval sync already completed for this device."""
+        state = self._session.load_join_state()
+        return (
+            isinstance(state, dict)
+            and str(state.get("status") or "").lower() == "approved"
+            and state.get("approvalSyncStatus") == "complete"
+            and bool(state.get("approvalSyncRequestId"))
+        )
+
+    def _finish_approval_sync(self, success: bool) -> None:
+        """Persist completion or failure without invalidating enrollment."""
+        with self._approval_sync_lock:
+            state = self._session.load_join_state()
+            if not isinstance(state, dict) or str(state.get("status") or "").lower() != "approved":
+                return
+            self._session.save_join_state({
+                "approvalSyncStatus": "complete" if success else "failed",
+            })
+
     def _register_or_authenticate(self) -> bool:
         """Join the device or authenticate with saved JWT."""
         # Keep authentication independent from the expensive hardware profile.
@@ -678,6 +759,57 @@ class MacOSAgent:
             except Exception as exc:
                 logger.warning("Auth check failed: %s", exc)
                 self._session.clear_jwt()
+
+        # Persisted-enrollment check (FIXED: no hard deadline)
+        # If join_state.json shows pending/approved status, poll indefinitely.
+        state = self._session.load_join_state()
+        if str(state.get("status") or "").lower() in {"pending", "approved"}:
+            logger.info(
+                "[PENDING_APPROVAL] Resuming persisted enrollment; "
+                "polling indefinitely for administrator approval (device_id=%s).",
+                self._device_id,
+            )
+            consecutive_errors = 0
+            while not self._shutdown_event.is_set():
+                try:
+                    response = self._session.get(
+                        f"/agent/join-status?deviceId={self._device_id}"
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        status = str(data.get("status") or "").lower()
+                        if status == "approved" and data.get("jwt"):
+                            self._session.save_jwt(data["jwt"])
+                            logger.info(
+                                "[APPROVAL_DETECTED] Persisted enrollment approved; "
+                                "daemon authenticated (device_id=%s).",
+                                self._device_id,
+                            )
+                            return True
+                        if status == "denied":
+                            logger.error(
+                                "[ENROLLMENT] Persisted enrollment denied by administrator "
+                                "(device_id=%s).",
+                                self._device_id,
+                            )
+                            return False
+                        consecutive_errors = 0
+                    elif response.status_code in (401, 403, 404):
+                        logger.warning(
+                            "[ENROLLMENT] Join-status returned HTTP %d; clearing pending state.",
+                            response.status_code,
+                        )
+                        return False
+                    else:
+                        consecutive_errors += 1
+                except Exception as exc:
+                    consecutive_errors += 1
+                    logger.debug(
+                        "Persisted enrollment status check failed (attempt %d): %s",
+                        consecutive_errors, exc,
+                    )
+                wait = min(8 * (1 + consecutive_errors // 5), 60)
+                self._shutdown_event.wait(timeout=wait)
 
         # Read enrollment codes from environment
         team_code       = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
@@ -726,25 +858,53 @@ class MacOSAgent:
                         logger.info("Agent joined and approved immediately.")
                         return True
 
-                    logger.info("Join request status: %s. Awaiting admin approval...", status)
-                    # Poll for admin approval (same pattern as Windows / Linux agents)
-                    poll_start = time.time()
-                    while time.time() - poll_start < 600:
-                        if self._shutdown_event.is_set():
-                            return False
-                        time.sleep(8)
-                        status_resp = self._session.get(f"/agent/join-status?deviceId={self._device_id}")
-                        if status_resp.status_code == 200:
-                            status_data = status_resp.json()
-                            if status_data.get("status") == "approved":
-                                token = status_data.get("jwt")
-                                if token:
-                                    self._session.save_jwt(token)
-                                    logger.info("Device approved! Enrollment complete.")
-                                    return True
-                            elif status_data.get("status") == "denied":
-                                logger.error("Device join denied by admin.")
+                    logger.info(
+                        "[PENDING_APPROVAL] Join request status: %s. "
+                        "Awaiting admin approval indefinitely (device_id=%s)...",
+                        status, self._device_id,
+                    )
+                    # Infinite retry poll -- no hard deadline (fixes the 600s bug)
+                    consecutive_errors = 0
+                    while not self._shutdown_event.is_set():
+                        try:
+                            status_resp = self._session.get(
+                                f"/agent/join-status?deviceId={self._device_id}"
+                            )
+                            if status_resp.status_code == 200:
+                                status_data = status_resp.json()
+                                if status_data.get("status") == "approved":
+                                    token = status_data.get("jwt")
+                                    if token:
+                                        self._session.save_jwt(token)
+                                        logger.info(
+                                            "[APPROVAL_DETECTED] Device approved! "
+                                            "Enrollment complete (device_id=%s).",
+                                            self._device_id,
+                                        )
+                                        return True
+                                elif status_data.get("status") == "denied":
+                                    logger.error(
+                                        "[ENROLLMENT] Device join denied by admin (device_id=%s).",
+                                        self._device_id,
+                                    )
+                                    return False
+                                consecutive_errors = 0
+                            elif status_resp.status_code in (401, 403, 404):
+                                logger.warning(
+                                    "[ENROLLMENT] Join-status HTTP %d; enrollment not found.",
+                                    status_resp.status_code,
+                                )
                                 return False
+                            else:
+                                consecutive_errors += 1
+                        except Exception as poll_exc:
+                            consecutive_errors += 1
+                            logger.debug(
+                                "Join status poll error (attempt %d): %s",
+                                consecutive_errors, poll_exc,
+                            )
+                        wait = min(8 * (1 + consecutive_errors // 5), 60)
+                        self._shutdown_event.wait(timeout=wait)
                 else:
                     logger.error(
                         "Join request failed: HTTP %d — %s",
@@ -874,7 +1034,7 @@ class MacOSAgent:
 
     # ── Scan phases ────────────────────────────────────────────────
 
-    def _initial_scan_and_sync(self) -> None:
+    def _initial_scan_and_sync(self, approval_sync_claimed: bool = False) -> None:
         """
         Complete L0/L1/L2 inventory, including the initial deep filesystem scan,
         before publishing enrollment inventory. The deadline keeps linking
@@ -914,6 +1074,11 @@ class MacOSAgent:
         ).start()
 
         logger.info("Running complete initial inventory and deep scan (timeout=%ds)...", timeout)
+        logger.info(
+            "[FULL_SYNC_STARTED] macOS initial scan started "
+            "(timeout=%ds, device_id=%s, approval_claimed=%s).",
+            timeout, self._device_id, approval_sync_claimed,
+        )
         threading.Thread(target=_scan, daemon=True, name="initial-full-scan").start()
         try:
             completed = done.wait(timeout=timeout)
@@ -922,16 +1087,66 @@ class MacOSAgent:
             hw = hardware
             if completed and not errors:
                 items = _items_to_dicts(self._orchestrator._deduplicate(full_items))
-                logger.info("Complete initial scan finished: %d software items", len(items))
-                self._sync_full_with_retry(items, hw, "complete")
+                logger.info(
+                    "[LAYER2_COMPLETED] Complete initial scan finished: "
+                    "%d software items (device_id=%s).",
+                    len(items), self._device_id,
+                )
+                logger.info("[INVENTORY_UPLOAD_STARTED] device_id=%s items=%d", self._device_id, len(items))
+                ok = self._sync_full_with_retry(items, hw, "complete")
+                logger.info("[INVENTORY_UPLOAD_COMPLETED] device_id=%s success=%s", self._device_id, ok)
+                if approval_sync_claimed:
+                    self._finish_approval_sync(ok)
+                    logger.info("[FULL_SYNC_COMPLETED] device_id=%s", self._device_id)
             else:
-                logger.warning("Initial deep scan exceeded %ds or failed; syncing installed software and hardware now.", timeout)
+                logger.warning(
+                    "Initial deep scan exceeded %ds or failed; "
+                    "syncing installed software and hardware now (device_id=%s).",
+                    timeout, self._device_id,
+                )
                 layer0 = self._orchestrator._run_layer0()
-                self._sync_full_with_retry(
-                    _items_to_dicts(self._orchestrator._deduplicate(layer0)),
+                layer0_dicts = _items_to_dicts(self._orchestrator._deduplicate(layer0))
+                logger.info(
+                    "[INVENTORY_UPLOAD_STARTED] L0 fallback device_id=%s items=%d",
+                    self._device_id, len(layer0_dicts),
+                )
+                ok_partial = self._sync_full_with_retry(
+                    layer0_dicts,
                     hw,
                     "partial",
                 )
+                # macOS FIX: upload the completed deep scan via follow-up thread.
+                # Previously results were computed but silently discarded.
+                def _upload_completed_deep_scan():
+                    done.wait()
+                    if self._shutdown_event.is_set() or not full_items:
+                        if approval_sync_claimed:
+                            self._finish_approval_sync(False)
+                        return
+                    if self._session._jwt:
+                        full_dicts = _items_to_dicts(self._orchestrator._deduplicate(full_items))
+                        logger.info(
+                            "[INVENTORY_UPLOAD_STARTED] Background deep scan upload "
+                            "(device_id=%s items=%d).",
+                            self._device_id, len(full_dicts),
+                        )
+                        ok = self._sync_full_with_retry(full_dicts, hw, "complete")
+                        if ok:
+                            logger.info(
+                                "[FULL_SYNC_COMPLETED] Background deep scan uploaded: "
+                                "%d items (device_id=%s).",
+                                len(full_dicts), self._device_id,
+                            )
+                        if approval_sync_claimed:
+                            self._finish_approval_sync(ok)
+                    elif approval_sync_claimed:
+                        self._finish_approval_sync(False)
+
+                threading.Thread(
+                    target=_upload_completed_deep_scan,
+                    daemon=True,
+                    name="macos-initial-scan-followup",
+                ).start()
         except Exception as exc:
             logger.error("Initial scan failed: %s", exc, exc_info=True)
 
@@ -1011,8 +1226,32 @@ class MacOSAgent:
         )
         monitor.start()
 
+        # Approval-sync idempotency check
+        approval_sync_claimed  = self._claim_approval_sync()
+        approval_sync_complete = self._approval_sync_complete()
+        if approval_sync_claimed:
+            logger.info(
+                "[ENROLLMENT] Approval claimed by macOS daemon; "
+                "starting one complete inventory sync (device_id=%s).",
+                self._device_id,
+            )
+        elif approval_sync_complete:
+            logger.info(
+                "[ENROLLMENT] Approval sync already complete; "
+                "skipping duplicate startup sync (device_id=%s).",
+                self._device_id,
+            )
+
         # Initial scan (L0 + L1 + L2)
-        self._initial_scan_and_sync()
+        if not approval_sync_complete:
+            self._initial_scan_and_sync(approval_sync_claimed=approval_sync_claimed)
+        else:
+            self._initial_scan_done = threading.Event()
+            self._initial_scan_done.set()
+
+        # Keep the periodic scanner off the shared cache until the initial
+        # deep scan and its follow-up upload have completed.
+        self._initial_scan_done.wait()
 
         # Start periodic filesystem scans (priority + deep) so macOS does a
         # true folder/file deep scan instead of only hardware/software inventory.

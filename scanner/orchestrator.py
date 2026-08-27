@@ -994,6 +994,11 @@ class ScanOrchestrator:
                     break
                 _collect_completed()
                 seen_paths.add(path)
+                if len(seen_paths) % 1000 == 0:
+                    logger.info(
+                        "Deep scan progress: %d filesystem paths visited, %d items discovered",
+                        len(seen_paths), len(new_items),
+                    )
                 cached = cached_stats.get(path)
                 if cached is not None:
                     try:

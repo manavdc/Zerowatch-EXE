@@ -34,6 +34,9 @@ except ImportError:
 
 # Module-level background monitor instance (started in main_agent / run_interactive)
 _ota_background_monitor = None
+_daemon_spawn_lock = threading.Lock()
+_last_daemon_spawn_at = 0.0
+_DAEMON_SPAWN_COOLDOWN = 120.0
 
 IS_COMPILED = False
 try:
@@ -610,7 +613,7 @@ def _resolve_base_api_url():
     if FORCED_BASE_API_URL:
         return str(FORCED_BASE_API_URL).rstrip("/")
 
-    return "http://localhost:3001/api"
+    return "https://localhost:3001/api"
 
 
 BASE_API_URL = _resolve_base_api_url()
@@ -991,6 +994,7 @@ class ZeroWatchClient:
         self.notification_queue = []
         self._last_approval_sync_at = 0.0
         self._approval_sync_in_flight = False
+        self._approval_sync_lock = threading.Lock()
         self._setup_socket_handlers()
         self.socket_connected = False
         
@@ -1179,7 +1183,19 @@ class ZeroWatchClient:
         return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def _build_join_state(self, status, team_code=None, request_id=None, team_id=None, team_name=None,
-                          organization_name=None, region_name=None, branch_name=None, plan_type=None):
+                          organization_name=None, region_name=None, branch_name=None, plan_type=None,
+                          approval_sync_status=None, approval_sync_request_id=None):
+        existing = self.join_state if isinstance(self.join_state, dict) else {}
+        if str(status or "").strip().lower() == "approved":
+            if approval_sync_status is None:
+                approval_sync_status = existing.get("approvalSyncStatus")
+            if approval_sync_request_id is None:
+                approval_sync_request_id = existing.get("approvalSyncRequestId")
+        else:
+            # A new pending request is a new approval event. Never carry a
+            # completion marker from an earlier enrollment into it.
+            approval_sync_status = None
+            approval_sync_request_id = None
         state = {
             "version": 1,
             "deviceId": self.device_id,
@@ -1193,12 +1209,15 @@ class ZeroWatchClient:
             "requestId": str(request_id or "").strip() or None,
             "status": str(status or "none").strip().lower(),
             "updatedAt": self._utc_now_iso(),
+            "approvalSyncStatus": approval_sync_status,
+            "approvalSyncRequestId": approval_sync_request_id,
         }
         state["checksum"] = self._join_state_checksum(state)
         return state
 
     def _save_join_state(self, status, team_code=None, request_id=None, team_id=None, team_name=None,
-                         organization_name=None, region_name=None, branch_name=None, plan_type=None):
+                         organization_name=None, region_name=None, branch_name=None, plan_type=None,
+                         approval_sync_status=None, approval_sync_request_id=None):
         temp_path = f"{self.join_state_file}.{uuid.uuid4().hex}.tmp"
         try:
             os.makedirs(self.state_dir, exist_ok=True)
@@ -1212,6 +1231,8 @@ class ZeroWatchClient:
                 region_name=region_name,
                 branch_name=branch_name,
                 plan_type=plan_type,
+                approval_sync_status=approval_sync_status,
+                approval_sync_request_id=approval_sync_request_id,
             )
             payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
             encrypted = encrypt_data(payload)
@@ -1336,7 +1357,11 @@ class ZeroWatchClient:
                 return {"status": "unknown", "message": data.get("message")}
 
             status = str(data.get("status") or "").strip().lower()
-            current_state = self.join_state if isinstance(self.join_state, dict) else {}
+            # Read the latest encrypted state on every refresh. The GUI and
+            # daemon can observe approval at nearly the same time; using a
+            # stale in-memory pending state here could overwrite the daemon's
+            # in-progress idempotency marker.
+            current_state = self._load_join_state() or {}
             request_id = data.get("requestId") or current_state.get("requestId")
 
             if status == "approved":
@@ -1997,6 +2022,12 @@ class ZeroWatchClient:
             logging.info(f"Full sync response: {resp.status_code}")
             if self._is_acknowledged_response(resp):
                 return True
+            # A deep inventory can exceed a reverse proxy/body-parser limit.
+            # Do not enqueue a permanently oversized request; the caller can
+            # fall back to one bounded full snapshot followed by deltas.
+            if resp.status_code == 413:
+                logging.warning("Full sync rejected as too large (HTTP 413); caller should use chunked sync.")
+                return False
             if not self.license_active:
                 return False
             self._enqueue_offline("POST", f"{AGENT_API_URL}/sync/full", payload)
@@ -2008,6 +2039,106 @@ class ZeroWatchClient:
         except Exception as e:
             logging.error(f"Full sync error: {e}")
             return False
+
+    def claim_approval_sync(self):
+        """Claim the persisted approval transition for one daemon worker.
+
+        The join-state file is the cross-process idempotency record. The
+        in-memory lock handles duplicate socket/poll callbacks in one process;
+        the daemon mutex handles competing daemon processes.
+        """
+        with self._approval_sync_lock:
+            state = self._load_join_state()
+            if not isinstance(state, dict) or str(state.get("status")).lower() != "approved":
+                return False
+            request_id = state.get("requestId") or state.get("approvalSyncRequestId") or "approved"
+            sync_status = state.get("approvalSyncStatus")
+            if sync_status == "complete" and state.get("approvalSyncRequestId") == request_id:
+                return False
+            self._save_join_state(
+                status="approved",
+                team_name=state.get("teamName"), team_code=state.get("teamCode"),
+                request_id=state.get("requestId"), team_id=state.get("teamId"),
+                organization_name=state.get("organizationName"),
+                region_name=state.get("regionName"), branch_name=state.get("branchName"),
+                plan_type=state.get("planType"),
+                approval_sync_status="in_progress",
+                approval_sync_request_id=request_id,
+            )
+            return True
+
+    def approval_sync_complete(self):
+        state = self._load_join_state()
+        return (
+            isinstance(state, dict)
+            and str(state.get("status")).lower() == "approved"
+            and state.get("approvalSyncStatus") == "complete"
+            and state.get("approvalSyncRequestId")
+        )
+
+    def finish_approval_sync(self, success):
+        """Persist completion/failure without changing enrollment validity."""
+        with self._approval_sync_lock:
+            state = self._load_join_state()
+            if not isinstance(state, dict) or str(state.get("status")).lower() != "approved":
+                return
+            request_id = state.get("requestId") or state.get("approvalSyncRequestId") or "approved"
+            self._save_join_state(
+                status="approved",
+                team_name=state.get("teamName"), team_code=state.get("teamCode"),
+                request_id=state.get("requestId"), team_id=state.get("teamId"),
+                organization_name=state.get("organizationName"),
+                region_name=state.get("regionName"), branch_name=state.get("branchName"),
+                plan_type=state.get("planType"),
+                approval_sync_status="complete" if success else "failed",
+                approval_sync_request_id=request_id,
+            )
+
+    def sync_complete_inventory(self, software_list, hardware_info=None):
+        """Sync a complete inventory, falling back to bounded requests on 413.
+
+        The full endpoint replaces the snapshot, so send a bounded initial
+        snapshot first and append the remaining deep-scan items as deltas.
+        This keeps large filesystem inventories deliverable through proxies
+        with smaller request limits.
+        """
+        if self.sync_full(software_list, hardware_info, inventory_scope="complete"):
+            return True
+        if self.last_server_status != 413:
+            return False
+
+        items = list(software_list or [])
+        if not items:
+            return False
+
+        batches = []
+        current = []
+        current_size = 0
+        for item in items:
+            if hasattr(item, "to_api_dict"):
+                item = item.to_api_dict()
+            elif hasattr(item, "to_dict"):
+                item = item.to_dict()
+            item_size = len(json.dumps(item, default=str, separators=(",", ":")))
+            # Stay well below common reverse-proxy request limits. The
+            # backend may allow 25 MB while an intermediary still allows 1 MB.
+            if current and current_size + item_size > 512 * 1024:
+                batches.append(current)
+                current, current_size = [], 0
+            current.append(item)
+            current_size += item_size
+        if current:
+            batches.append(current)
+
+        logging.info("[SYNC] Chunking oversized complete inventory into %d requests.", len(batches))
+        if not self.sync_full(batches[0], hardware_info, inventory_scope="partial"):
+            return False
+        for index, batch in enumerate(batches[1:], start=2):
+            if not self.sync_delta(batch, []):
+                logging.warning("[SYNC] Inventory chunk %d/%d failed.", index, len(batches))
+                return False
+        logging.info("[SYNC] Chunked complete inventory sync finished: %d items.", len(items))
+        return True
 
     def sync_delta(self, added, removed, added_hw=None, removed_hw=None, hardware_snapshot=None):
         if not self.jwt: return False
@@ -2073,7 +2204,7 @@ class ZeroWatchClient:
             try:
                 software = get_full_software_inventory(self.base_dir, include_filesystem=True)
                 hardware_data = get_detailed_hardware_profile()
-                sync_ok = self.sync_full(software, hardware_data)
+                sync_ok = self.sync_complete_inventory(software, hardware_data)
                 if sync_ok:
                     logging.info("[AGENT] Approval-triggered full sync completed (reason=%s).", reason)
                 else:
@@ -4370,6 +4501,7 @@ def _spawn_daemon_process():
 
 def _auto_bootstrap_background_agent() -> None:
     """Ensure startup persistence and background daemon are active for GUI sessions."""
+    global _last_daemon_spawn_at
     # Make startup persistence idempotent so a single GUI launch is enough.
     try:
         register_startup_registry()
@@ -4378,12 +4510,22 @@ def _auto_bootstrap_background_agent() -> None:
 
     # Start daemon if not already running.
     try:
-        if not _is_daemon_running():
+        # This function is called from GUI notification/approval callbacks.
+        # Serialize calls and rate-limit failed visibility probes so repeated
+        # dashboard refreshes cannot create a daemon process storm.
+        with _daemon_spawn_lock:
+            if _is_daemon_running():
+                return
+            now = time.monotonic()
+            if now - _last_daemon_spawn_at < _DAEMON_SPAWN_COOLDOWN:
+                logging.debug("Daemon spawn suppressed by cooldown.")
+                return
+            _last_daemon_spawn_at = now
             started, pid = _spawn_daemon_process()
             if started:
                 logging.info("Auto-started background daemon (pid=%s).", pid)
             else:
-                logging.warning("Daemon auto-start command executed but process did not stay alive.")
+                logging.error("Daemon auto-start failed to stay alive (pid=%s).", pid)
     except Exception as exc:
         logging.warning("Background daemon auto-start failed: %s", exc)
 
@@ -4794,9 +4936,9 @@ def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
                     orchestrator.stop_periodic_scans()
                     orchestrator.reset_for_reenrollment()
                     orchestrator.run_priority_scan(on_delta=_on_fs_delta)
-                    software = orchestrator.run_full_scan(
-                        include_filesystem=True, on_delta=_on_fs_delta
-                    )
+                    # The completed replacement snapshot is uploaded once
+                    # below; per-batch deltas here create request storms.
+                    software = orchestrator.run_full_scan(include_filesystem=True)
                 else:
                     # Re-enrollment can follow a deliberate cache close.  In
                     # that case build a fresh scanner instead of treating the
@@ -4805,7 +4947,7 @@ def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
                         base_dir, include_filesystem=True
                     )
                 if zw_client.jwt:
-                    zw_client.sync_full(software, hardware_data, inventory_scope="complete")
+                    zw_client.sync_complete_inventory(software, hardware_data)
                     logging.info(
                         "[RE-ENROLL] Background deep inventory sync complete (%d items).",
                         len(software),
@@ -5625,6 +5767,13 @@ def main_agent():
     if not zw_client.jwt:
         return
 
+    approval_sync_claimed = zw_client.claim_approval_sync()
+    approval_sync_already_complete = zw_client.approval_sync_complete()
+    if approval_sync_claimed:
+        logging.info("[ENROLLMENT] Approval claimed by daemon; starting one complete inventory sync.")
+    elif approval_sync_already_complete:
+        logging.info("[ENROLLMENT] Approval sync already complete; skipping duplicate startup sync.")
+
     # Keep the endpoint alive while the initial inventory is running. Windows
     # inventory can take longer than one heartbeat interval, so the heartbeat
     # service must not wait for the scan to finish.
@@ -5656,18 +5805,16 @@ def main_agent():
     # Publish the approval baseline before initializing the scanner/cache.
     # Cache setup and filesystem enumeration can be slow or blocked by a
     # stale process; neither should delay the first inventory upload.
-    if is_inventory_scan_enabled():
+    if is_inventory_scan_enabled() and not approval_sync_already_complete:
         baseline_software = get_installed_software_registry()
         baseline_hardware = get_detailed_hardware_profile()
-        zw_client.sync_full(
-            baseline_software,
-            baseline_hardware,
-            inventory_scope="partial",
-        )
         logging.info(
-            "Initial Windows baseline synced (%d installed-software items).",
+            "Initial Windows Layer 0 baseline collected (%d installed-software items).",
             len(baseline_software),
         )
+    else:
+        baseline_software = []
+        baseline_hardware = get_detailed_hardware_profile() if is_inventory_scan_enabled() else {}
 
     # --- Initialize Scan Orchestrator ---
     # Wraps the existing registry scanner + adds Store apps, drivers,
@@ -5696,8 +5843,75 @@ def main_agent():
         logging.error(f"ScanOrchestrator init failed, falling back to registry only: {_orch_err}")
         _orchestrator = None
 
+    # --- Daemon-owned post-enrollment synchronization ---
+    # Publish the fast baseline above, then run one complete deep scan in a
+    # long-lived worker.  No GUI callback owns this lifecycle and no timeout
+    # starts a second scanner against the same SQLite cache.
+    deep_scan_done = threading.Event()
+    if is_inventory_scan_enabled() and _orchestrator is not None and not approval_sync_already_complete:
+        def _on_fs_delta(added_items, removed_items):
+            if (added_items or removed_items) and zw_client.jwt:
+                try:
+                    zw_client.sync_delta(added_items, removed_items)
+                except Exception:
+                    logging.exception("[SCAN] Background filesystem delta sync failed.")
+
+        def _run_initial_deep_scan():
+            started = time.perf_counter()
+            logging.info("[SCAN] Initial deep file scan started (daemon-owned).")
+            sync_ok = False
+            try:
+                # Do not upload each filesystem worker batch as a delta. That
+                # creates hundreds of requests and races the final snapshot.
+                deep_items = _orchestrator.run_full_scan(include_filesystem=True)
+                if zw_client.jwt:
+                    synced = zw_client.sync_complete_inventory(deep_items, baseline_hardware)
+                    sync_ok = synced
+                    if synced:
+                        logging.info(
+                            "[SCAN] Initial deep file scan completed and synced: %d items in %.1fs.",
+                            len(deep_items), time.perf_counter() - started,
+                        )
+                    else:
+                        logging.warning("[SCAN] Deep scan completed but full sync was not accepted.")
+            except Exception:
+                logging.exception("[SCAN] Initial deep file scan failed.")
+            finally:
+                if approval_sync_claimed:
+                    zw_client.finish_approval_sync(sync_ok)
+                deep_scan_done.set()
+                if zw_client.jwt:
+                    try:
+                        _orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
+                        logging.info("[SCAN] Periodic filesystem scans enabled.")
+                    except Exception:
+                        logging.exception("[SCAN] Could not enable periodic filesystem scans.")
+
+        threading.Thread(
+            target=_run_initial_deep_scan,
+            name="windows-initial-deep-scan",
+            daemon=True,
+        ).start()
+        logging.info("[SCAN] Initial deep file scan queued immediately after approval baseline.")
+    else:
+        if approval_sync_claimed:
+            # No scanner means the claimed approval cannot be completed yet;
+            # leave enrollment valid and allow the next daemon cycle to retry.
+            zw_client.finish_approval_sync(False)
+        deep_scan_done.set()
+        if approval_sync_already_complete and _orchestrator is not None:
+            try:
+                _orchestrator.start_periodic_scans()
+            except Exception:
+                logging.exception("[SCAN] Could not resume periodic scans after completed approval sync.")
+        if is_inventory_scan_enabled():
+            logging.warning("[SCAN] Orchestrator unavailable; baseline-only sync used.")
+
     # --- Full Inventory ---
-    if is_inventory_scan_enabled():
+    # The legacy timeout/restart implementation is retained below for
+    # reference, but is disabled.  It could overlap SQLite workers and make
+    # the deep scan appear to be skipped.
+    if False and is_inventory_scan_enabled():
         show_windows_notification("Zerowatch", "Sentinel Agent running in Background")
         logging.info("Running full software + hardware inventory...")
         inventory_scope = "complete"
@@ -5857,13 +6071,25 @@ def main_agent():
     zw_client.log_event("STARTUP", {"version": AGENT_VERSION, "status": "active"})
 
     # --- Background Monitor ---
-    logging.info("Starting background change monitor...")
-    monitor = threading.Thread(
-        target=monitor_system_changes,
-        args=(base_dir, fingerprint, zw_client, _orchestrator),
-        daemon=True
-    )
-    monitor.start()
+    # The monitor shares the orchestrator cache.  Do not let it race the
+    # daemon-owned initial deep scan; it starts as soon as that scan has
+    # finished (or immediately when inventory scanning is disabled).
+    def _start_change_monitor():
+        deep_scan_done.wait()
+        logging.info("Starting background change monitor...")
+        monitor = threading.Thread(
+            target=monitor_system_changes,
+            args=(base_dir, fingerprint, zw_client, _orchestrator),
+            daemon=True,
+            name="windows-change-monitor",
+        )
+        monitor.start()
+
+    threading.Thread(
+        target=_start_change_monitor,
+        name="windows-monitor-bootstrap",
+        daemon=True,
+    ).start()
 
     ota_shutdown = threading.Event()
     ota_monitor = None
@@ -6570,14 +6796,11 @@ class EnrollmentFrame(tk.Frame):
             except Exception as exc:
                 logging.warning("Post-enrollment persistence registration failed: %s", exc)
 
-            # Spawn the background daemon process (detached, survives window close)
+            # Ensure the detached daemon process exists. The daemon owns
+            # approval detection and synchronization; this callback must not
+            # start a competing process during the approval race.
             try:
-                if not _is_daemon_running():
-                    started, pid = _spawn_daemon_process()
-                    if started:
-                        logging.info("Post-enrollment daemon spawned (pid=%s).", pid)
-                    else:
-                        logging.warning("Post-enrollment daemon spawn returned no PID.")
+                _auto_bootstrap_background_agent()
             except Exception as exc:
                 logging.warning("Post-enrollment daemon spawn failed: %s", exc)
                 
@@ -7718,7 +7941,9 @@ class DashboardFrame(tk.Frame):
                 # also starts a scan here, it can race the daemon and upload
                 # a registry-only fallback repeatedly, masking the deep-scan
                 # result in the backend.
-                if not getattr(self, "inventory_synced", False) and not _is_daemon_running():
+                # Inventory is owned by the daemon. Dashboard refreshes only
+                # display state and must never start scans or daemon retries.
+                if False and not getattr(self, "inventory_synced", False) and not _is_daemon_running():
                     product_count = (info.get("stats", {}) or {}).get("productCount") if isinstance(info, dict) else None
                     if product_count is None or product_count == 0:
                         logging.info("GUI: No server inventory detected. Triggering full scan (60s deadline)...")
@@ -8357,14 +8582,9 @@ class UnifiedSentinelGUI(tk.Tk):
                         payload_status = str(data.get("status") or "").strip().lower()
 
                     if payload_status == "approved":
-                        # Ensure first inventory reaches backend immediately after admin approval.
-                        if not _is_daemon_running():
-                            self.zw_client.trigger_approval_sync(
-                                reason="feed_ready_approved",
-                                min_interval=90,
-                            )
-                        else:
-                            logging.info("[GUI] Daemon is running; skipping trigger_approval_sync.")
+                        # Approval is a daemon concern. The GUI only repairs
+                        # the daemon if necessary and never starts a scan.
+                        _auto_bootstrap_background_agent()
                     
                     if now - last_refresh > 5:
                         self._last_notif_refresh = now
@@ -8372,13 +8592,7 @@ class UnifiedSentinelGUI(tk.Tk):
                         if isinstance(self.current_frame, EnrollmentFrame):
                             status = self.zw_client.refresh_join_status_once()
                             if status.get("status") == "approved" and self.zw_client.jwt:
-                                if not _is_daemon_running():
-                                    self.zw_client.trigger_approval_sync(
-                                        reason="enrollment_approved",
-                                        min_interval=90,
-                                    )
-                                else:
-                                    logging.info("[GUI] Daemon is running; skipping trigger_approval_sync.")
+                                _auto_bootstrap_background_agent()
                                 self.show_dashboard()
                         elif isinstance(self.current_frame, DashboardFrame):
                             # Just refresh the dashboard data
@@ -8598,10 +8812,6 @@ def run_interactive():
         else:
             prompt_consent(base_dir, force_show=False)
 
-        # Single-command UX: launching GUI also ensures background daemon and
-        # startup persistence are active for both sudo and non-sudo launches.
-        _auto_bootstrap_background_agent()
-
         # Default routing logic with a 2-second "Server Veto"
         is_enrolled_locally = zw_client.is_enrolled()
         
@@ -8617,6 +8827,10 @@ def run_interactive():
                 is_enrolled_locally = False
             else:
                 logging.info(f"Startup: Server verification result: {verify_res.get('status')}")
+                # FIX: Daemon spawned only after server confirms enrollment valid.
+                # Previously called before this check — caused a race where the daemon
+                # spawned then state was wiped before it could load the JWT.
+                _auto_bootstrap_background_agent()
 
         if is_enrolled_locally:
             logging.info("Startup: Proceeding to Dashboard.")
@@ -8743,6 +8957,8 @@ def main():
         fp = collect_fingerprint()
         hn = resolve_hostname(base_dir)
         client = ZeroWatchClient(base_dir, fp['device_id'], hn)
+        # Keep approval polling alive if this enrollment window is closed.
+        _auto_bootstrap_background_agent()
         app = UnifiedSentinelGUI(client, force_frame="enroll")
         app.mainloop()
         return
