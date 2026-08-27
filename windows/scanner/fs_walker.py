@@ -249,10 +249,8 @@ def walk_dir_for_manifests(
 
 _USER_PRIORITY_DIRS: List[str] = [
     r"%LOCALAPPDATA%\Programs",
-    r"%APPDATA%",
-    r"%USERPROFILE%\Downloads",
-    r"%USERPROFILE%\Desktop",
-    r"%USERPROFILE%\Documents",
+    r"%APPDATA%\npm",
+    r"%LOCALAPPDATA%\npm",
 ]
 
 _DATA_ROOT_NAMES: FrozenSet[str] = frozenset({
@@ -269,25 +267,6 @@ def get_priority_scan_dirs() -> List[str]:
             p = os.path.join(drive, std)
             if os.path.isdir(p):
                 dirs.append(p)
-
-        try:
-            for entry in os.scandir(drive):
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                name_lower = entry.name.lower()
-
-                if name_lower in SKIP_DIR_NAMES:
-                    continue
-                if name_lower in ("windows", "users", "user",
-                                  "program files", "program files (x86)"):
-                    continue
-
-                if name_lower in _DATA_ROOT_NAMES:
-                    continue
-
-                dirs.append(entry.path)
-        except (PermissionError, OSError):
-            pass
 
     for tmpl in _USER_PRIORITY_DIRS:
         p = os.path.expandvars(tmpl)

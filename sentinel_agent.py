@@ -4781,21 +4781,21 @@ def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
             except Exception as orch_exc:
                 logging.warning("[RE-ENROLL] Fresh scanner setup failed: %s", orch_exc)
 
+        def _on_fs_delta(added_items, removed_items):
+            if (added_items or removed_items) and zw_client.jwt:
+                zw_client.sync_delta(added_items, removed_items)
+
         # The expensive walk must not block enrollment or the daemon's main
-        # loop.  It runs once in the background and replaces the partial
-        # server snapshot with the complete Layer 0/1/2 inventory.
+        # loop.  First publish a bounded deep scan of software locations,
+        # then continue with the exhaustive all-drive scan in this worker.
         def _deep_scan_worker():
             try:
                 if orchestrator is not None:
                     orchestrator.stop_periodic_scans()
                     orchestrator.reset_for_reenrollment()
+                    orchestrator.run_priority_scan(on_delta=_on_fs_delta)
                     software = orchestrator.run_full_scan(
-                        include_filesystem=True,
-                        on_delta=lambda added_items, removed_items: (
-                            zw_client.sync_delta(added_items, removed_items)
-                            if (added_items or removed_items) and zw_client.jwt
-                            else None
-                        ),
+                        include_filesystem=True, on_delta=_on_fs_delta
                     )
                 else:
                     # Re-enrollment can follow a deliberate cache close.  In
@@ -4810,10 +4810,6 @@ def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
                         "[RE-ENROLL] Background deep inventory sync complete (%d items).",
                         len(software),
                     )
-
-                def _on_fs_delta(added_items, removed_items):
-                    if (added_items or removed_items) and zw_client.jwt:
-                        zw_client.sync_delta(added_items, removed_items)
 
                 if orchestrator is not None:
                     orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
@@ -5814,6 +5810,9 @@ def main_agent():
                 # replace the partial enrollment inventory with its result.
                 def _run_deep_scan_after_baseline():
                     try:
+                        # Publish the bounded deep/software-location pass
+                        # first; the all-drive scan continues afterward.
+                        _orchestrator.run_priority_scan(on_delta=_on_fs_delta)
                         deep_items = _orchestrator.run_full_scan(
                             include_filesystem=True,
                             on_delta=_on_fs_delta,

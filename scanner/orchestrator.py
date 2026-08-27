@@ -764,6 +764,20 @@ class ScanOrchestrator:
         if (added_dicts or removed_dicts) and on_delta:
             on_delta(added_dicts, removed_dicts)
 
+    def run_priority_scan(
+        self,
+        on_delta: Optional[Callable[[List[dict], List[dict]], None]] = None,
+    ) -> Tuple[List[dict], List[dict]]:
+        """Scan only high-value software locations and publish the result."""
+        new_items, removed_items = self._run_incremental_scan(
+            get_priority_scan_dirs(), label="initial-priority"
+        )
+        self._emit_fs_delta(new_items, removed_items, on_delta)
+        return (
+            [item.to_api_dict() for item in new_items],
+            [item.to_api_dict() for item in removed_items],
+        )
+
     def start_periodic_scans(
         self,
         on_delta: Optional[Callable[[List[dict], List[dict]], None]] = None,
