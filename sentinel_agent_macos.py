@@ -1210,27 +1210,16 @@ class MacOSAgent:
         monitor.start()
 
         # Approval-sync idempotency check
-        approval_sync_claimed  = self._claim_approval_sync()
-        approval_sync_complete = self._approval_sync_complete()
+        approval_sync_claimed = self._claim_approval_sync()
         if approval_sync_claimed:
             logger.info(
                 "[ENROLLMENT] Approval claimed by macOS daemon; "
-                "starting one complete inventory sync (device_id=%s).",
-                self._device_id,
-            )
-        elif approval_sync_complete:
-            logger.info(
-                "[ENROLLMENT] Approval sync already complete; "
-                "skipping duplicate startup sync (device_id=%s).",
+                "starting complete inventory sync (device_id=%s).",
                 self._device_id,
             )
 
-        # Initial scan (L0 + L1 + L2)
-        if not approval_sync_complete:
-            self._initial_scan_and_sync(approval_sync_claimed=approval_sync_claimed)
-        else:
-            self._initial_scan_done = threading.Event()
-            self._initial_scan_done.set()
+        # Initial startup scan (L0 + priority L1/L2 within 60s)
+        self._initial_scan_and_sync(approval_sync_claimed=approval_sync_claimed)
 
         # Keep the periodic scanner off the shared cache until the initial
         # deep scan and its follow-up upload have completed.
