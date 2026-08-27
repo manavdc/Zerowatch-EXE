@@ -71,8 +71,9 @@ Target: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
   - Survives reboot (item persists while device is locked after first unlock)
 
 For a root LaunchDaemon:
-  - The System keychain is the target
-  - kSecUseKeychain must specify the System keychain explicitly
+  - The System keychain is the default target when running as root
+  - No kSecUseKeychain needed — SecItemAdd defaults to the correct keychain
+    based on the execution context (login for interactive, System for root)
   - kSecAttrAccessGroup may be needed for signed binaries
 
 ALL of the above requires native validation on real macOS hardware.
@@ -320,7 +321,8 @@ class _NativeSecurityBindings:
             "kSecAttrService":              load(sec, "kSecAttrService"),
             "kSecAttrAccount":              load(sec, "kSecAttrAccount"),
             "kSecAttrAccessible":           load(sec, "kSecAttrAccessible"),
-            "kSecUseKeychain":              load(sec, "kSecUseKeychain"),
+            # Keychain target — omitted; SecItemAdd auto-selects
+            # login keychain (interactive) or System keychain (root daemon)
             "kSecAttrSynchronizable":       load(sec, "kSecAttrSynchronizable"),
             "kSecAttrSynchronizableAny":    load(sec, "kSecAttrSynchronizableAny"),
             # kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
@@ -428,22 +430,19 @@ class _NativeSecurityBindings:
 
         svc_ref  = self._cf_string(service)
         acct_ref = self._cf_string(account)
-        keychain_ref = self._cf_string("/Library/Keychains/System.keychain")
 
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecClass"]),
                                    ctypes.c_void_p(c["kSecClassGenericPassword"]))
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecAttrService"]),  ctypes.c_void_p(svc_ref))
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecAttrAccount"]),  ctypes.c_void_p(acct_ref))
-        cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecUseKeychain"]), ctypes.c_void_p(keychain_ref))
         # Disable iCloud sync — agent credentials are device-specific
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecAttrSynchronizable"]),
                                    ctypes.c_void_p(c["kCFBooleanFalse"]))
 
-        # Note: svc_ref, acct_ref, and keychain_ref are retained by the dict
+        # Note: svc_ref and acct_ref are retained by the dict
         # (CF retain semantics). Release our temporary references now.
         cf.CFRelease(svc_ref)
         cf.CFRelease(acct_ref)
-        cf.CFRelease(keychain_ref)
 
         return d
 

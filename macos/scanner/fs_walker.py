@@ -13,7 +13,7 @@ Strategy:
 
   2. Volume discovery uses /Volumes for secondary volumes.
      The boot volume is accessed via its standard mount points (/Applications, etc.)
-     rather than walking /Volumes/Macintosh\ HD which may not always be accessible.
+     rather than walking /Volumes/Macintosh HD which may not always be accessible.
 
   3. Binary detection:
        - Mach-O: Header magic (32-bit, first 4 bytes read only) — no subprocess
