@@ -55,7 +55,7 @@ https://github.com/user-attachments/assets/77a62549-01ed-4cab-a0dd-2f37109f0a86
 
 ---
 
-## 🐧 Linux Setup & Execution
+## Linux Setup & Execution
 
 ### 1. Make the Binary Executable
 ```bash
@@ -81,7 +81,7 @@ Linux persistence behavior:
 
 ---
 
-## 🍎 macOS Setup & Execution
+## macOS Setup & Execution
 
 
 ### 1. Make the Binary Executable
