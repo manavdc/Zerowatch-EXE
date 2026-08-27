@@ -561,20 +561,8 @@ class MacOSAgentSession:
 def _build_hardware_profile(plat) -> dict:
     """Build a backend-compatible hardware profile dict from macOS collectors."""
     try:
-        hc      = plat.hardware_collector
-        profile = hc.get_detailed_hardware_profile()
-        inv     = hc.get_hardware_inventory()
-        return {
-            "hardware": {
-                "cpu":   next((x for x in inv if x.get("category") == "cpu"), {}),
-                "ram":   next((x for x in inv if x.get("category") == "ram"), {}),
-                "gpu":   profile.get("gpus", []),
-                "disks": [],
-            },
-            "os_info":     profile.get("os_info", {}),
-            "fingerprint": hc.collect_fingerprint(),
-            "profile":     profile,      # Full profile for dashboard display
-        }
+        hc = plat.hardware_collector
+        return hc.get_detailed_hardware_profile()
     except Exception as exc:
         logger.warning("Hardware profile failed: %s", exc)
         return {}

@@ -312,6 +312,23 @@ def _get_mac_addresses() -> List[str]:
     return macs if macs else ["ANONYMIZED"]
 
 
+def _get_disks() -> List[Dict[str, Any]]:
+    """Collect mounted disk information."""
+    try:
+        import shutil as _shutil
+        total, used, free = _shutil.disk_usage("/")
+        return [
+            {
+                "model": "Macintosh HD",
+                "size_gb": round(total / (1024 ** 3), 2),
+                "free_gb": round(free / (1024 ** 3), 2),
+                "media_type": "SSD",
+            }
+        ]
+    except Exception:
+        return []
+
+
 # ── MacOSHardwareCollector ────────────────────────────────────────────────────
 
 class MacOSHardwareCollector(HardwareCollector):
@@ -451,6 +468,7 @@ class MacOSHardwareCollector(HardwareCollector):
             },
             "gpu": gpus[0] if gpus else "Unknown",
             "gpus": [{"name": g} for g in gpus],
+            "disks": _get_disks(),
             "motherboard": {
                 "manufacturer": "Apple Inc.",
                 "product": model,
