@@ -35,10 +35,10 @@ CONCURRENCY MODEL
   immediately for the initial sync.
 
 • Layer 1 (PE binaries) and Layer 2 (manifests) run in a
-  ThreadPoolExecutor with max_workers=4.
+  ThreadPoolExecutor with max_workers=6 (configurable).
   - Filesystem I/O releases the GIL, so Python threads are genuinely
     parallel for these workloads.
-  - 4 workers saturates a typical SSD without over-committing CPU.
+  - 6 workers saturates a typical SSD without over-committing CPU.
 
 • The orchestrator yields a batch of API-ready dicts as each layer
   completes rather than waiting for the entire scan.  This means the
@@ -177,10 +177,15 @@ class ScanOrchestrator:
         Used to invalidate the cache when the agent is updated.
 
     max_workers
-        Thread pool size for Layer 1/2 I/O workers. Default 4.
+        Thread pool size for Layer 1/2 I/O workers. Default 6.
 
     extra_scan_dirs
         Optional additional directories to include in every filesystem scan.
+
+    priority_scan_dirs
+        Optional override list for priority scan directories.
+        If provided, these paths replace the platform defaults from
+        get_priority_scan_dirs() during startup and priority scans.
 
     fs_scan_interval_hours
         How often the priority-path incremental scan runs. Default 4 hours.
@@ -203,8 +208,9 @@ class ScanOrchestrator:
         base_dir: str,
         existing_registry_fn: Optional[Callable[[], List[dict]]] = None,  # TODO: Remove after Windows migration completes.
         agent_version: str = "unknown",
-        max_workers: int = 4,
+        max_workers: int = 6,
         extra_scan_dirs: Optional[List[str]] = None,
+        priority_scan_dirs: Optional[List[str]] = None,
         fs_scan_interval_hours: float = 4.0,
         deep_scan_interval_hours: float = 24.0,
         software_collector: Optional[SoftwareCollector] = None,
@@ -216,6 +222,7 @@ class ScanOrchestrator:
         self._agent_version = agent_version
         self._max_workers = max_workers
         self._extra_dirs = extra_scan_dirs or []
+        self._priority_scan_dirs = priority_scan_dirs  # None = use platform defaults
 
         # Fallback adapter resolution for legacy constructor invocations
         if software_collector is None or binary_inspector is None or filesystem_walker is None:
@@ -764,19 +771,93 @@ class ScanOrchestrator:
         if (added_dicts or removed_dicts) and on_delta:
             on_delta(added_dicts, removed_dicts)
 
+    def _get_priority_dirs(self) -> List[str]:
+        """Return the priority scan directory list, respecting config overrides."""
+        if self._priority_scan_dirs is not None:
+            return list(self._priority_scan_dirs)
+        return get_priority_scan_dirs()
+
     def run_priority_scan(
         self,
         on_delta: Optional[Callable[[List[dict], List[dict]], None]] = None,
     ) -> Tuple[List[dict], List[dict]]:
         """Scan only high-value software locations and publish the result."""
         new_items, removed_items = self._run_incremental_scan(
-            get_priority_scan_dirs(), label="initial-priority"
+            self._get_priority_dirs(), label="initial-priority"
         )
         self._emit_fs_delta(new_items, removed_items, on_delta)
         return (
             [item.to_api_dict() for item in new_items],
             [item.to_api_dict() for item in removed_items],
         )
+
+    def run_startup_scan(
+        self,
+        stop_event: Optional[threading.Event] = None,
+    ) -> List[dict]:
+        """
+        Startup-optimized scan: L0 (registry/package managers) + L1/L2
+        (filesystem) restricted to priority paths only.
+
+        Designed to produce a complete-enough inventory within 60 seconds
+        of agent startup. The full-disk exhaustive walk is left to the
+        periodic deep scan (24h cadence).
+
+        Returns
+        ───────
+        List of dicts ready for sync_full(), combining L0 + priority L1/L2.
+        """
+        t0 = time.perf_counter()
+
+        # ── Layer 0 (always synchronous, <1s) ──────────────────────────────
+        l0_items = self._run_layer0()
+
+        # ── Priority L1/L2 (parallelized, priority paths only) ─────────────
+        priority_dirs = self._get_priority_dirs()
+        logger.info(
+            "[STARTUP_SCAN] Starting priority L1/L2 scan (%d dirs, %d workers).",
+            len(priority_dirs), self._max_workers,
+        )
+        fs_new, fs_removed = self._run_incremental_scan(
+            priority_dirs,
+            stop_event=stop_event,
+            label="startup-priority",
+        )
+
+        # ── Combine and deduplicate ────────────────────────────────────────
+        all_items = l0_items + fs_new
+
+        # On warm start, merge cached filesystem items from paths OUTSIDE
+        # the priority set so the full sync payload doesn't wipe them.
+        cached_items = self._cache.all_cached_items()
+        all_items.extend(cached_items)
+
+        unique = self._deduplicate(all_items)
+
+        elapsed = time.perf_counter() - t0
+        within_budget = elapsed < 60.0
+        logger.info(
+            "[STARTUP_SCAN] Complete: %d unique items in %.1f s "
+            "(%s 60s budget). L0=%d, L1/L2=%d, cached=%d.",
+            len(unique), elapsed,
+            "WITHIN" if within_budget else "EXCEEDED",
+            len(l0_items), len(fs_new), len(cached_items),
+        )
+        if not within_budget:
+            logger.warning(
+                "[STARTUP_SCAN] Priority scan exceeded 60s budget (%.1fs). "
+                "Consider reducing priority_scan_dirs or increasing max_workers.",
+                elapsed,
+            )
+
+        # ── Update snapshot for delta computation ──────────────────────────
+        with self._snapshot_lock:
+            self._last_snapshot = {item.dedup_key(): item for item in unique}
+
+        # ── Update cache meta ──────────────────────────────────────────────
+        self._cache.set_meta("last_full_scan_at", self._utc_now_iso())
+
+        return [item.to_api_dict() for item in unique]
 
     def start_periodic_scans(
         self,

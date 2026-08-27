@@ -251,6 +251,8 @@ _USER_PRIORITY_DIRS: List[str] = [
     r"%LOCALAPPDATA%\Programs",
     r"%APPDATA%\npm",
     r"%LOCALAPPDATA%\npm",
+    r"%USERPROFILE%\Desktop",
+    r"%USERPROFILE%\Downloads",
 ]
 
 _DATA_ROOT_NAMES: FrozenSet[str] = frozenset({

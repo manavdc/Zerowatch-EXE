@@ -613,7 +613,7 @@ def _resolve_base_api_url():
     if FORCED_BASE_API_URL:
         return str(FORCED_BASE_API_URL).rstrip("/")
 
-    return "https://localhost:3001/api"
+    return "https://zerowatch.deepcytes.io/api"
 
 
 BASE_API_URL = _resolve_base_api_url()
@@ -5858,24 +5858,24 @@ def main_agent():
 
         def _run_initial_deep_scan():
             started = time.perf_counter()
-            logging.info("[SCAN] Initial deep file scan started (daemon-owned).")
+            logging.info("[STARTUP_SCAN] Initial priority scan started (daemon-owned).")
             sync_ok = False
             try:
-                # Do not upload each filesystem worker batch as a delta. That
-                # creates hundreds of requests and races the final snapshot.
-                deep_items = _orchestrator.run_full_scan(include_filesystem=True)
+                # Use startup scan: L0 + priority-path L1/L2 (parallelized).
+                # Full disk walk is left to the periodic deep scan (24h cadence).
+                deep_items = _orchestrator.run_startup_scan()
                 if zw_client.jwt:
                     synced = zw_client.sync_complete_inventory(deep_items, baseline_hardware)
                     sync_ok = synced
                     if synced:
                         logging.info(
-                            "[SCAN] Initial deep file scan completed and synced: %d items in %.1fs.",
+                            "[STARTUP_SCAN] Initial priority scan completed and synced: %d items in %.1fs.",
                             len(deep_items), time.perf_counter() - started,
                         )
                     else:
-                        logging.warning("[SCAN] Deep scan completed but full sync was not accepted.")
+                        logging.warning("[STARTUP_SCAN] Priority scan completed but full sync was not accepted.")
             except Exception:
-                logging.exception("[SCAN] Initial deep file scan failed.")
+                logging.exception("[STARTUP_SCAN] Initial priority scan failed.")
             finally:
                 if approval_sync_claimed:
                     zw_client.finish_approval_sync(sync_ok)
@@ -5889,10 +5889,10 @@ def main_agent():
 
         threading.Thread(
             target=_run_initial_deep_scan,
-            name="windows-initial-deep-scan",
+            name="windows-initial-startup-scan",
             daemon=True,
         ).start()
-        logging.info("[SCAN] Initial deep file scan queued immediately after approval baseline.")
+        logging.info("[STARTUP_SCAN] Initial priority scan queued immediately after approval baseline.")
     else:
         if approval_sync_claimed:
             # No scanner means the claimed approval cannot be completed yet;

@@ -1036,24 +1036,32 @@ class MacOSAgent:
 
     def _initial_scan_and_sync(self, approval_sync_claimed: bool = False) -> None:
         """
-        Complete L0/L1/L2 inventory, including the initial deep filesystem scan,
-        before publishing enrollment inventory. The deadline keeps linking
-        responsive while the periodic scanner remains available for retries.
-        """
-        timeout = 60
-        full_items = []
-        done = threading.Event()
-        errors = []
+        Startup-optimized L0 + priority-path L1/L2 scan.
 
-        def _scan():
+        Strategy:
+          1. run_startup_scan(): L0 synchronous (<1s) + priority L1/L2
+             parallelized with 6 workers.
+          2. 90-second safety timeout as a defensive backstop.
+          3. If exceeded or errored, fall back to L0-only sync.
+
+        The full-disk exhaustive walk is NOT run at startup.
+        It runs on the existing 24h cadence via start_periodic_scans().
+        """
+        _SAFETY_TIMEOUT = 90
+        startup_items = []
+        scan_done = threading.Event()
+        scan_error = []
+
+        def _run_startup():
             try:
-                full_items.extend(self._orchestrator.run_full_scan(
-                    include_filesystem=True, stop_event=self._shutdown_event
-                ))
+                result = self._orchestrator.run_startup_scan(
+                    stop_event=self._shutdown_event,
+                )
+                startup_items.extend(result)
             except Exception as exc:
-                errors.append(exc)
+                scan_error.append(exc)
             finally:
-                done.set()
+                scan_done.set()
 
         hardware = {}
         hardware_done = threading.Event()
@@ -1073,36 +1081,36 @@ class MacOSAgent:
             name="macos-hardware-profile",
         ).start()
 
-        logger.info("Running complete initial inventory and deep scan (timeout=%ds)...", timeout)
         logger.info(
-            "[FULL_SYNC_STARTED] macOS initial scan started "
+            "[STARTUP_SCAN_STARTED] macOS initial scan started "
             "(timeout=%ds, device_id=%s, approval_claimed=%s).",
-            timeout, self._device_id, approval_sync_claimed,
+            _SAFETY_TIMEOUT, self._device_id, approval_sync_claimed,
         )
-        threading.Thread(target=_scan, daemon=True, name="initial-full-scan").start()
+        threading.Thread(
+            target=_run_startup, daemon=True, name="initial-startup-scan",
+        ).start()
         try:
-            completed = done.wait(timeout=timeout)
+            completed = scan_done.wait(timeout=_SAFETY_TIMEOUT)
             if not hardware_done.wait(timeout=30):
                 logger.warning("Hardware profile timed out; syncing inventory without hardware details.")
             hw = hardware
-            if completed and not errors:
-                items = _items_to_dicts(self._orchestrator._deduplicate(full_items))
+            if completed and not scan_error:
                 logger.info(
-                    "[LAYER2_COMPLETED] Complete initial scan finished: "
+                    "[STARTUP_SCAN] Completed within %ds: "
                     "%d software items (device_id=%s).",
-                    len(items), self._device_id,
+                    _SAFETY_TIMEOUT, len(startup_items), self._device_id,
                 )
-                logger.info("[INVENTORY_UPLOAD_STARTED] device_id=%s items=%d", self._device_id, len(items))
-                ok = self._sync_full_with_retry(items, hw, "complete")
+                logger.info("[INVENTORY_UPLOAD_STARTED] device_id=%s items=%d", self._device_id, len(startup_items))
+                ok = self._sync_full_with_retry(startup_items, hw, "complete")
                 logger.info("[INVENTORY_UPLOAD_COMPLETED] device_id=%s success=%s", self._device_id, ok)
                 if approval_sync_claimed:
                     self._finish_approval_sync(ok)
                     logger.info("[FULL_SYNC_COMPLETED] device_id=%s", self._device_id)
             else:
                 logger.warning(
-                    "Initial deep scan exceeded %ds or failed; "
-                    "syncing installed software and hardware now (device_id=%s).",
-                    timeout, self._device_id,
+                    "[STARTUP_SCAN] Priority scan exceeded %ds or failed; "
+                    "syncing L0-only now (device_id=%s).",
+                    _SAFETY_TIMEOUT, self._device_id,
                 )
                 layer0 = self._orchestrator._run_layer0()
                 layer0_dicts = _items_to_dicts(self._orchestrator._deduplicate(layer0))
@@ -1110,43 +1118,9 @@ class MacOSAgent:
                     "[INVENTORY_UPLOAD_STARTED] L0 fallback device_id=%s items=%d",
                     self._device_id, len(layer0_dicts),
                 )
-                ok_partial = self._sync_full_with_retry(
-                    layer0_dicts,
-                    hw,
-                    "partial",
-                )
-                # macOS FIX: upload the completed deep scan via follow-up thread.
-                # Previously results were computed but silently discarded.
-                def _upload_completed_deep_scan():
-                    done.wait()
-                    if self._shutdown_event.is_set() or not full_items:
-                        if approval_sync_claimed:
-                            self._finish_approval_sync(False)
-                        return
-                    if self._session._jwt:
-                        full_dicts = _items_to_dicts(self._orchestrator._deduplicate(full_items))
-                        logger.info(
-                            "[INVENTORY_UPLOAD_STARTED] Background deep scan upload "
-                            "(device_id=%s items=%d).",
-                            self._device_id, len(full_dicts),
-                        )
-                        ok = self._sync_full_with_retry(full_dicts, hw, "complete")
-                        if ok:
-                            logger.info(
-                                "[FULL_SYNC_COMPLETED] Background deep scan uploaded: "
-                                "%d items (device_id=%s).",
-                                len(full_dicts), self._device_id,
-                            )
-                        if approval_sync_claimed:
-                            self._finish_approval_sync(ok)
-                    elif approval_sync_claimed:
-                        self._finish_approval_sync(False)
-
-                threading.Thread(
-                    target=_upload_completed_deep_scan,
-                    daemon=True,
-                    name="macos-initial-scan-followup",
-                ).start()
+                self._sync_full_with_retry(layer0_dicts, hw, "partial")
+                if approval_sync_claimed:
+                    self._finish_approval_sync(False)
         except Exception as exc:
             logger.error("Initial scan failed: %s", exc, exc_info=True)
 
@@ -1180,9 +1154,10 @@ class MacOSAgent:
                 self._heartbeat()
                 last_heartbeat = now
 
-            if now - last_l0_delta >= MONITOR_INTERVAL:
+            # ── Fast L0 delta (app bundles, pkgutil, Homebrew, etc.) ───────
+            if now - last_l0_delta >= L0_INTERVAL:
                 try:
-                    added, removed = self._orchestrator.run_delta_scan()
+                    added, removed = self._orchestrator.run_registry_delta()
                     if added or removed:
                         self._sync_delta(
                             _items_to_dicts(added),
@@ -1190,7 +1165,7 @@ class MacOSAgent:
                         )
                     last_l0_delta = now
                 except Exception as exc:
-                    logger.warning("Delta scan error: %s", exc)
+                    logger.warning("L0 delta scan error: %s", exc)
 
             self._shutdown_event.wait(timeout=5)
 

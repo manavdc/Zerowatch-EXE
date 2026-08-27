@@ -558,3 +558,38 @@ def walk_specified_dirs(
             yield from _walk_dir(dirpath, stats)
         except Exception as exc:
             logger.warning("walk_specified_dirs error in %s: %s", dirpath, exc)
+
+
+def get_priority_scan_dirs(extra_user_dirs: Optional[List[str]] = None) -> List[str]:
+    """Return ordered list of priority scan directories for fast startup.
+
+    These are the high-probability locations where user-installed software
+    lives on macOS. This is a curated subset of the full scan roots —
+    secondary /Volumes are excluded (left to the periodic deep scan).
+
+    The list is identical to SYSTEM_SCAN_ROOTS + per-user dirs, which on
+    macOS already represents a narrow, curated set (unlike Windows/Linux
+    where the deep scan walks all drive roots).
+    """
+    dirs: List[str] = []
+
+    for r in SYSTEM_SCAN_ROOTS:
+        if os.path.isdir(r):
+            dirs.append(r)
+
+    dirs.extend(_get_user_scan_dirs())
+
+    if extra_user_dirs:
+        dirs.extend(d for d in extra_user_dirs if os.path.isdir(d))
+
+    # De-duplicate preserving order
+    seen: Set[str] = set()
+    deduped: List[str] = []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            deduped.append(d)
+
+    logger.debug("macOS priority scan dirs (%d): %s", len(deduped), deduped)
+    return deduped
+

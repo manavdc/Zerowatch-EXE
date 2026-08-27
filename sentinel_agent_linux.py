@@ -964,53 +964,65 @@ class LinuxAgent:
         return False
 
     def _initial_scan_and_sync(self, approval_sync_claimed: bool = False) -> None:
-        """Run a combined L0 + L1/L2 scan and push complete inventory immediately.
+        """Run a startup-optimized L0 + priority-path L1/L2 scan.
 
         Strategy:
-          1. Attempt a full scan (all layers) with a 60-second deadline.
-          2. If it finishes in time -> sync everything in one payload.
-          3. If the deadline is exceeded -> immediately sync L0-only results so the
-             device goes Active right away; the still-running background thread
-             uploads the completed deep scan when it finishes.
+          1. Run run_startup_scan() which does:
+             - L0 (package managers) synchronously (<1s)
+             - L1/L2 on priority paths only, parallelized with 6 workers
+          2. 90-second safety timeout as a defensive backstop.
+          3. If the priority scan exceeds the timeout or errors out,
+             fall back to L0-only sync so the device goes Active immediately.
+             The periodic deep scan will fill in the rest.
+
+        The full-disk exhaustive walk is NOT run at startup. It runs on the
+        existing 24h cadence via start_periodic_scans().
 
         approval_sync_claimed: if True this invocation owns the approval-sync slot
             and must call _finish_approval_sync() when the upload completes.
         """
-        _FULL_SCAN_TIMEOUT = 60  # seconds
+        _SAFETY_TIMEOUT = 90  # seconds — backstop for pathological disks
 
-        full_items: list = []
-        full_scan_done = threading.Event()
-        self._initial_scan_done = full_scan_done
-        full_scan_error: list = []  # mutable container to capture exception from thread
+        startup_items: list = []
+        scan_done = threading.Event()
+        self._initial_scan_done = scan_done
+        scan_error: list = []
 
         logger.info(
-            "[FULL_SYNC_STARTED] Linux initial scan started "
+            "[STARTUP_SCAN_STARTED] Linux initial scan started "
             "(timeout=%ds, device_id=%s, approval_claimed=%s).",
-            _FULL_SCAN_TIMEOUT, self._device_id, approval_sync_claimed,
+            _SAFETY_TIMEOUT, self._device_id, approval_sync_claimed,
         )
 
-        def _run_full():
+        def _run_startup():
             try:
-                logger.info("[LAYER0_STARTED] Full L0+L1+L2 scan started (device_id=%s).", self._device_id)
-                result = self._orchestrator.run_full_scan(
-                    include_filesystem=True,  # L0 + L1 + L2
+                logger.info(
+                    "[STARTUP_SCAN] L0 + priority-path L1/L2 scan started "
+                    "(device_id=%s).", self._device_id,
+                )
+                result = self._orchestrator.run_startup_scan(
                     stop_event=self._shutdown_event,
                 )
-                full_items.extend(result)
+                startup_items.extend(result)
                 logger.info(
-                    "[LAYER2_COMPLETED] Deep scan finished: %d items (device_id=%s).",
-                    len(full_items), self._device_id,
+                    "[STARTUP_SCAN] Priority scan finished: %d items (device_id=%s).",
+                    len(startup_items), self._device_id,
                 )
             except Exception as exc:
-                full_scan_error.append(exc)
-                logger.error("[LAYER2_FAILED] Deep scan error (device_id=%s): %s", self._device_id, exc)
+                scan_error.append(exc)
+                logger.error(
+                    "[STARTUP_SCAN] Scan error (device_id=%s): %s",
+                    self._device_id, exc, exc_info=True,
+                )
             finally:
-                full_scan_done.set()
+                scan_done.set()
 
-        scan_thread = threading.Thread(target=_run_full, daemon=True, name="initial-full-scan")
+        scan_thread = threading.Thread(
+            target=_run_startup, daemon=True, name="initial-startup-scan",
+        )
         scan_thread.start()
 
-        completed_in_time = full_scan_done.wait(timeout=_FULL_SCAN_TIMEOUT)
+        completed_in_time = scan_done.wait(timeout=_SAFETY_TIMEOUT)
 
         # Collect full hardware profile
         try:
@@ -1019,31 +1031,33 @@ class LinuxAgent:
             logger.warning("Hardware collection failed: %s", hw_exc)
             hardware = {}
 
-        if completed_in_time and not full_scan_error:
+        if completed_in_time and not scan_error:
             logger.info(
-                "[LAYER2_COMPLETED] Full scan completed within %ds -- "
+                "[STARTUP_SCAN] Completed within %ds — "
                 "syncing %d items in one shot (device_id=%s).",
-                _FULL_SCAN_TIMEOUT, len(full_items), self._device_id,
+                _SAFETY_TIMEOUT, len(startup_items), self._device_id,
             )
-            logger.info("[INVENTORY_UPLOAD_STARTED] device_id=%s items=%d", self._device_id, len(full_items))
-            ok = self._sync_full_with_retry(full_items, hardware, "complete")
+            logger.info("[INVENTORY_UPLOAD_STARTED] device_id=%s items=%d", self._device_id, len(startup_items))
+            ok = self._sync_full_with_retry(startup_items, hardware, "complete")
             logger.info("[INVENTORY_UPLOAD_COMPLETED] device_id=%s success=%s", self._device_id, ok)
             if approval_sync_claimed:
                 self._finish_approval_sync(ok)
                 logger.info("[FULL_SYNC_COMPLETED] device_id=%s", self._device_id)
             return
 
-        # ── Timeout (or error) path: fall back to fast L0-only sync ──────────
+        # ── Safety timeout path: fall back to L0-only sync ───────────────────
         if not completed_in_time:
             logger.warning(
-                "Full scan exceeded %ds timeout — falling back to L0-only immediate sync. "
-                "L1/L2 results will arrive via background delta.",
-                _FULL_SCAN_TIMEOUT,
+                "[STARTUP_SCAN] Priority scan exceeded %ds safety timeout — "
+                "falling back to L0-only immediate sync. "
+                "L1/L2 results will arrive via periodic deep scan.",
+                _SAFETY_TIMEOUT,
             )
         else:
             logger.warning(
-                "Full scan encountered an error (%s) — falling back to L0-only sync.",
-                full_scan_error[0],
+                "[STARTUP_SCAN] Scan encountered an error (%s) — "
+                "falling back to L0-only sync.",
+                scan_error[0],
             )
 
         try:
@@ -1069,39 +1083,6 @@ class LinuxAgent:
             logger.info("Fallback L0 scan: %d items — syncing now.", len(items))
             self._sync_full_with_retry(items, hardware, "partial")
 
-            # Do not leave the backend with the partial fallback forever.
-            # The full scan is still running after the 60-second deadline;
-            # publish its completed L1/L2 result as a complete replacement as
-            # soon as it finishes instead of waiting for a later periodic
-            # scan/delta cycle.
-            def _sync_completed_full_scan():
-                full_scan_done.wait()
-                if full_scan_error or self._shutdown_event.is_set():
-                    if approval_sync_claimed:
-                        self._finish_approval_sync(False)
-                    return
-                if self._session._jwt and full_items:
-                    logger.info(
-                        "[INVENTORY_UPLOAD_STARTED] Background deep scan upload "
-                        "(device_id=%s items=%d).",
-                        self._device_id, len(full_items),
-                    )
-                    ok = self._sync_full_with_retry(full_items, hardware, "complete")
-                    if ok:
-                        logger.info(
-                            "[FULL_SYNC_COMPLETED] Background deep scan sync complete: "
-                            "%d items (device_id=%s).",
-                            len(full_items), self._device_id,
-                        )
-                    if approval_sync_claimed:
-                        self._finish_approval_sync(ok)
-
-            threading.Thread(
-                target=_sync_completed_full_scan,
-                daemon=True,
-                name="linux-initial-scan-followup",
-            ).start()
-
             # Seed orchestrator snapshot so subsequent deltas are accurate
             try:
                 with self._orchestrator._snapshot_lock:
@@ -1110,6 +1091,9 @@ class LinuxAgent:
                             self._orchestrator._last_snapshot[item.dedup_key()] = item
             except Exception as seed_exc:
                 logger.debug("Snapshot seed skipped (non-fatal): %s", seed_exc)
+
+            if approval_sync_claimed:
+                self._finish_approval_sync(False)
 
         except Exception as exc:
             logger.error("Fallback L0 scan failed: %s", exc, exc_info=True)

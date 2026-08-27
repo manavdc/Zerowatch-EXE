@@ -63,13 +63,9 @@ MANIFEST_FILENAMES: FrozenSet[str] = frozenset({
 _ConditionalSkipGroup = Tuple[FrozenSet[str], FrozenSet[str]]
 
 CONDITIONAL_SKIP_GROUPS: Tuple[_ConditionalSkipGroup, ...] = (
-    (
-        frozenset({
-            "package.json", "package-lock.json",
-            "yarn.lock", "pnpm-lock.yaml",
-        }),
-        frozenset({"node_modules"}),
-    ),
+    # NOTE: node_modules moved to unconditional SKIP_DIR_NAMES_COMMON.
+    # Orphaned node_modules (no parent manifest) are a rare edge case,
+    # and the time savings from unconditional skip are large on dev machines.
     (
         frozenset({
             "requirements.txt", "requirements-dev.txt",
@@ -119,7 +115,9 @@ SKIP_DIR_NAMES_COMMON: FrozenSet[str] = frozenset({
     ".git", ".svn", ".hg", ".bzr",
     ".idea", ".vscode",
     ".sonarwork",
-    "cache", "caches",
+    "cache", "caches", ".cache",
+    "tmp", "temp",
+    "node_modules",
     "crashreports",
     "logs",
     "docker",
