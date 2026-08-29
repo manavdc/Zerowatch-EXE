@@ -22,6 +22,7 @@ permissions:
 env:
   PYTHON_VERSION: "3.11"
   BINARY_BASENAME: "SentinelAgent"
+  ZEROWATCH_API_URL: "https://zerowatch.deepcytes.io/api"
 
 # ===========================================================================
 # JOB 1: Windows — Nuitka onefile build
