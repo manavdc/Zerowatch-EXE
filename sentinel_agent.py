@@ -563,6 +563,10 @@ def _daemon_args():
     args = ["--daemon"]
     if _is_hardened_mode():
         args.append("--hardened")
+    if "--dev" in sys.argv or os.environ.get("ZEROWATCH_DEV_MODE") == "1" or is_loopback(BASE_API_URL):
+        args.append("--dev")
+    if "--no-hide" in sys.argv:
+        args.append("--no-hide")
     return args
 
 
@@ -594,29 +598,48 @@ except Exception:
 
 
 def _resolve_base_api_url():
-    # Priority: env override -> local json config -> baked-in default -> localhost fallback.
+    # Priority: env override -> dev mode flag -> local json config -> baked-in default -> source/localhost fallback.
     env_url = os.environ.get("ZEROWATCH_API_URL") or os.environ.get("AGENT_SERVER_URL")
     if env_url:
-        return env_url.rstrip("/")
+        return str(env_url).rstrip("/")
 
-    try:
-        cfg_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "agent_config.json")
-        if os.path.exists(cfg_path):
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            cfg_url = cfg.get("api_base_url")
-            if cfg_url:
-                return str(cfg_url).rstrip("/")
-    except Exception:
-        pass
+    if "--dev" in sys.argv or os.environ.get("ZEROWATCH_DEV_MODE") == "1":
+        return "https://zerowatch.deepcytes.io/api"
+
+    # Search multiple candidate locations for agent_config.json
+    candidate_dirs = [
+        os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else "",
+        os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else "",
+        os.getcwd(),
+        get_base_dir() if "get_base_dir" in globals() else "",
+    ]
+    for c_dir in candidate_dirs:
+        if not c_dir:
+            continue
+        cfg_path = os.path.join(c_dir, "agent_config.json")
+        try:
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                cfg_url = cfg.get("api_base_url")
+                if cfg_url:
+                    return str(cfg_url).rstrip("/")
+        except Exception:
+            pass
 
     if FORCED_BASE_API_URL:
         return str(FORCED_BASE_API_URL).rstrip("/")
+
+    # If running from uncompiled python source (.py file), default to production backend
+    is_script_run = not IS_COMPILED and not getattr(sys, "frozen", False) and str(sys.argv[0]).endswith(".py")
+    if is_script_run:
+        return "https://zerowatch.deepcytes.io/api"
 
     return "https://zerowatch.deepcytes.io/api"
 
 
 BASE_API_URL = _resolve_base_api_url()
+print(f"[AGENT] Resolved Backend API URL: {BASE_API_URL}")
 
 # Hardcoded SPKI Pins (SHA-256 hashes of the SubjectPublicKeyInfo in base64)
 # For production and demo environments, these should be updated to actual hashes.
@@ -5835,6 +5858,12 @@ def main_agent():
             "Initial Windows Layer 0 baseline collected (%d installed-software items).",
             len(baseline_software),
         )
+        if baseline_software and zw_client.jwt:
+            try:
+                zw_client.sync_full(baseline_software, baseline_hardware, inventory_scope="partial")
+                logging.info("[STARTUP_SCAN] Initial Layer 0 baseline synced to backend immediately.")
+            except Exception as e:
+                logging.warning(f"[STARTUP_SCAN] Immediate Layer 0 baseline sync failed: {e}")
     else:
         baseline_software = []
         baseline_hardware = get_detailed_hardware_profile() if is_inventory_scan_enabled() else {}
@@ -6811,6 +6840,16 @@ class EnrollmentFrame(tk.Frame):
         def _post_enrollment_tasks():
             _append_gui_log(self.zw_client.base_dir, "Starting post-enrollment system integration...")
             
+            # Send immediate baseline inventory sync so backend builds CVE feed right away
+            try:
+                hardware_data = get_detailed_hardware_profile()
+                fast_software = get_installed_software_registry()
+                if fast_software and self.zw_client.jwt:
+                    synced = self.zw_client.sync_full(fast_software, hardware_data, inventory_scope="partial")
+                    logging.info("[GUI] Immediate post-enrollment Layer 0 sync: %s (%d items)", synced, len(fast_software))
+            except Exception as exc:
+                logging.warning("[GUI] Post-enrollment initial inventory sync error: %s", exc)
+
             # Register startup persistence so daemon survives reboots
             try:
                 task_ok = register_task_scheduler()
@@ -6819,9 +6858,7 @@ class EnrollmentFrame(tk.Frame):
             except Exception as exc:
                 logging.warning("Post-enrollment persistence registration failed: %s", exc)
 
-            # Ensure the detached daemon process exists. The daemon owns
-            # approval detection and synchronization; this callback must not
-            # start a competing process during the approval race.
+            # Ensure the detached daemon process exists.
             try:
                 _auto_bootstrap_background_agent()
             except Exception as exc:
@@ -7960,70 +7997,31 @@ class DashboardFrame(tk.Frame):
                     return
 
                 # 2. Ensure initial inventory scan & sync runs if server has no software
-                # Inventory belongs to the background daemon.  When the GUI
-                # also starts a scan here, it can race the daemon and upload
-                # a registry-only fallback repeatedly, masking the deep-scan
-                # result in the backend.
-                # Inventory is owned by the daemon. Dashboard refreshes only
-                # display state and must never start scans or daemon retries.
-                if False and not getattr(self, "inventory_synced", False) and not _is_daemon_running():
+                if not getattr(self, "inventory_synced", False):
                     product_count = (info.get("stats", {}) or {}).get("productCount") if isinstance(info, dict) else None
                     if product_count is None or product_count == 0:
-                        logging.info("GUI: No server inventory detected. Triggering full scan (60s deadline)...")
+                        logging.info("GUI: No server inventory detected. Syncing Layer 0 baseline immediately...")
                         hardware_data = get_detailed_hardware_profile()
-                        
-                        _FULL_SCAN_TIMEOUT = 60  # seconds
-                        full_items = []
-                        full_scan_done = threading.Event()
-                        full_scan_err = []
-
-                        def _run_full():
+                        l0_software = get_installed_software_registry()
+                        if l0_software and self.zw_client.jwt:
                             try:
-                                res = get_full_software_inventory(self.zw_client.base_dir, include_filesystem=True)
-                                if isinstance(res, list):
-                                    full_items.extend(res)
-                            except Exception as exc:
-                                full_scan_err.append(exc)
-                            finally:
-                                full_scan_done.set()
-
-                        scan_thread = threading.Thread(target=_run_full, daemon=True, name="gui-initial-full-scan")
-                        scan_thread.start()
-
-                        # Wait up to 60 seconds for full scan to complete
-                        completed_in_time = full_scan_done.wait(timeout=_FULL_SCAN_TIMEOUT)
-
-                        if completed_in_time and not full_scan_err and full_items:
-                            logging.info("GUI: Full scan completed within %ds — syncing %d items in one shot.", _FULL_SCAN_TIMEOUT, len(full_items))
-                            if self.zw_client.sync_full(full_items, hardware_data, inventory_scope="complete"):
-                                self.inventory_synced = True
-                        else:
-                            # 60s deadline exceeded or error: fallback to fast L0 sync immediately
-                            if not completed_in_time:
-                                logging.warning("GUI: Full scan exceeded %ds timeout — falling back to L0-only immediate sync.", _FULL_SCAN_TIMEOUT)
-                            else:
-                                logging.warning("GUI: Full scan error (%s) — falling back to L0-only sync.", full_scan_err[0] if full_scan_err else "unknown")
-
-                            try:
-                                l0_software = get_installed_software_registry()
                                 if self.zw_client.sync_full(l0_software, hardware_data, inventory_scope="partial"):
                                     self.inventory_synced = True
-                                    logging.info("GUI: Fallback L0 sync completed (%d items).", len(l0_software) if isinstance(l0_software, list) else 0)
-
-                                # Follow up with deep scan deltas once the background thread completes
-                                def _bg_wait_and_delta():
-                                    full_scan_done.wait()
-                                    if full_items:
-                                        try:
-                                            self.zw_client.sync_full(full_items, hardware_data, inventory_scope="complete")
-                                            logging.info("GUI: Background full scan sync completed (%d items).", len(full_items))
-                                        except Exception as bg_err:
-                                            logging.debug("GUI background sync error: %s", bg_err)
-
-                                threading.Thread(target=_bg_wait_and_delta, daemon=True, name="gui-bg-followup").start()
-
+                                    logging.info("GUI: Layer 0 baseline synced successfully (%d items).", len(l0_software))
                             except Exception as fb_exc:
-                                logging.error("GUI: Fallback L0 sync failed: %s", fb_exc)
+                                logging.error("GUI: Layer 0 baseline sync failed: %s", fb_exc)
+
+                        # Deep filesystem scan in background (does not block UI)
+                        def _run_full_bg():
+                            try:
+                                full_items = get_full_software_inventory(self.zw_client.base_dir, include_filesystem=True)
+                                if isinstance(full_items, list) and full_items and self.zw_client.jwt:
+                                    self.zw_client.sync_full(full_items, hardware_data, inventory_scope="complete")
+                                    logging.info("GUI: Deep scan sync completed (%d items).", len(full_items))
+                            except Exception as deep_err:
+                                logging.debug("GUI deep scan error: %s", deep_err)
+
+                        threading.Thread(target=_run_full_bg, daemon=True, name="gui-deep-scan-bg").start()
 
                         # Re-fetch asset info immediately to show fresh stats
                         try:
