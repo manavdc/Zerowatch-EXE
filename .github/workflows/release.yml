@@ -436,6 +436,7 @@ jobs:
             | macOS arm64 | `SentinelAgent-macos-arm64` |
           draft: false
           prerelease: false
+          clobber: true
           files: |
             dist/binary-windows/SentinelAgent-windows-x64.exe
             dist/binary-linux/SentinelAgent-linux-x64
