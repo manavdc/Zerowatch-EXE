@@ -61,20 +61,30 @@ def register_startup_registry(exe_path: str, daemon_cmd: str = "--daemon") -> bo
 
 
 def unregister_startup_registry() -> bool:
-    """Removes SentinelAgent from Registry Run keys."""
+    """Removes SentinelAgent from Registry Run keys.
+    
+    Also removes the legacy 'ZerowatchSentinelAgent' orphan value
+    that was created by an older version of set_auto_start_enabled().
+    """
     success = False
+    _VALUE_NAMES = ("SentinelAgent", "ZerowatchSentinelAgent")
     for hive, path in [
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
         (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
     ]:
         try:
             key = winreg.OpenKey(hive, path, 0, winreg.KEY_SET_VALUE)
-            winreg.DeleteValue(key, "SentinelAgent")
+            for vname in _VALUE_NAMES:
+                try:
+                    winreg.DeleteValue(key, vname)
+                    success = True
+                except FileNotFoundError:
+                    pass
             winreg.CloseKey(key)
-            success = True
         except Exception:
             pass
     return success
+
 
 
 class WindowsPersistenceManager(PersistenceManager):

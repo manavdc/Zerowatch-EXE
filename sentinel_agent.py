@@ -604,7 +604,7 @@ def _resolve_base_api_url():
         return str(env_url).rstrip("/")
 
     if "--dev" in sys.argv or os.environ.get("ZEROWATCH_DEV_MODE") == "1":
-        return "https://zerowatch.deepcytes.io/api"
+        return "http://localhost:3000/api"
 
     # Search multiple candidate locations for agent_config.json
     candidate_dirs = [
@@ -630,12 +630,12 @@ def _resolve_base_api_url():
     if FORCED_BASE_API_URL:
         return str(FORCED_BASE_API_URL).rstrip("/")
 
-    # If running from uncompiled python source (.py file), default to production backend
+    # If running from uncompiled python source (.py file), default to localhost backend
     is_script_run = not IS_COMPILED and not getattr(sys, "frozen", False) and str(sys.argv[0]).endswith(".py")
     if is_script_run:
-        return "https://zerowatch.deepcytes.io/api"
+        return "http://localhost:3000/api"
 
-    return "https://zerowatch.deepcytes.io/api"
+    return "http://localhost:3000/api"
 
 
 BASE_API_URL = _resolve_base_api_url()
@@ -3852,31 +3852,36 @@ def set_inventory_scan_enabled(enabled):
 
 
 def is_auto_start_enabled():
+    """Check whether the agent has an active startup entry in the Registry Run key.
+
+    Uses the canonical value name 'SentinelAgent' (matches register_startup_registry)
+    and checks both HKLM and HKCU.
+    """
     if sys.platform != "win32":
         return True
 
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
-        val, _ = winreg.QueryValueEx(key, "ZerowatchSentinelAgent")
-        winreg.CloseKey(key)
-        return True
-    except Exception:
-        return False
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            key = winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+            winreg.QueryValueEx(key, "SentinelAgent")
+            winreg.CloseKey(key)
+            return True
+        except Exception:
+            pass
+    return False
 
 def set_auto_start_enabled(enabled):
+    """Enable or disable agent startup via the canonical persistence functions.
+
+    Delegates to register_startup_registry() / unregister_startup_registry()
+    so the registry value name ('SentinelAgent'), exe path resolution, and
+    daemon arguments are always consistent.
+    """
     try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
         if enabled:
-            exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
-            winreg.SetValueEx(key, "ZerowatchSentinelAgent", 0, winreg.REG_SZ, f'"{exe_path}"')
+            register_startup_registry()
         else:
-            try:
-                winreg.DeleteValue(key, "ZerowatchSentinelAgent")
-            except FileNotFoundError:
-                pass
-        winreg.CloseKey(key)
+            unregister_startup_registry()
     except Exception as e:
         logging.error(f"Failed to set auto start registry: {e}")
 
@@ -4680,6 +4685,8 @@ def unregister_startup_registry():
     """Removes SentinelAgent startup entry from the Run key.
 
     Tries both HKLM and HKCU to match whatever was created.
+    Also removes the legacy 'ZerowatchSentinelAgent' orphan value
+    that was created by an older version of set_auto_start_enabled().
     """
     if sys.platform != "win32":
         try:
@@ -4691,37 +4698,29 @@ def unregister_startup_registry():
             logging.warning("Linux autostart removal failed: %s", e)
             return
 
-    # HKLM
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-            0,
-            winreg.KEY_SET_VALUE,
-        )
-        winreg.DeleteValue(key, "SentinelAgent")
-        winreg.CloseKey(key)
-        logging.info("Registry startup entry removed (HKLM).")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        logging.warning(f"Failed to remove HKLM startup entry: {e}")
-
-    # HKCU
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-            0,
-            winreg.KEY_SET_VALUE,
-        )
-        winreg.DeleteValue(key, "SentinelAgent")
-        winreg.CloseKey(key)
-        logging.info("Registry startup entry removed (HKCU).")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        logging.warning(f"Failed to remove HKCU startup entry: {e}")
+    # Remove canonical 'SentinelAgent' AND legacy 'ZerowatchSentinelAgent'
+    # from both hives to ensure no orphan entries survive uninstall.
+    _VALUE_NAMES = ("SentinelAgent", "ZerowatchSentinelAgent")
+    for hive, hive_name in [
+        (winreg.HKEY_LOCAL_MACHINE, "HKLM"),
+        (winreg.HKEY_CURRENT_USER, "HKCU"),
+    ]:
+        try:
+            key = winreg.OpenKey(
+                hive,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                0,
+                winreg.KEY_SET_VALUE,
+            )
+            for vname in _VALUE_NAMES:
+                try:
+                    winreg.DeleteValue(key, vname)
+                    logging.info("Registry startup entry '%s' removed (%s).", vname, hive_name)
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+        except Exception as e:
+            logging.warning("Failed to remove %s startup entries: %s", hive_name, e)
 
 
 def unregister_task_scheduler():
@@ -8920,6 +8919,77 @@ def _wait_for_restart_parent() -> None:
         logging.warning("[OTA] Could not wait for restart parent PID %s: %s", parent_pid, exc)
 
 
+def full_uninstall():
+    """Remove ALL persistence artifacts created by the agent.
+
+    This is the nuclear cleanup option — removes every registry entry,
+    scheduled task, Windows service, and state file created by the agent.
+    Used by the --uninstall CLI flag and by external uninstallers.
+    """
+    print("[SentinelAgent] Removing all persistence artifacts...")
+
+    # 1. Registry Run keys (canonical + legacy orphan)
+    try:
+        unregister_startup_registry()
+        print("  [OK] Registry startup entries removed.")
+    except Exception as e:
+        print(f"  [WARN] Registry cleanup partial: {e}")
+
+    # 2. Scheduled tasks
+    try:
+        unregister_task_scheduler()
+        print("  [OK] Scheduled tasks removed.")
+    except Exception as e:
+        print(f"  [WARN] Task scheduler cleanup partial: {e}")
+
+    # 3. Windows service
+    try:
+        unregister_windows_service()
+        print("  [OK] Windows service removed.")
+    except Exception as e:
+        print(f"  [WARN] Service cleanup partial: {e}")
+
+    # 4. ZeroWatch agent registry keys (SOFTWARE\Zerowatch\Agent)
+    if sys.platform == "win32":
+        for hive, hive_name in [
+            (winreg.HKEY_LOCAL_MACHINE, "HKLM"),
+            (winreg.HKEY_CURRENT_USER, "HKCU"),
+        ]:
+            for subkey in (r"SOFTWARE\Zerowatch\Agent", r"SOFTWARE\Zerowatch"):
+                try:
+                    winreg.DeleteKey(hive, subkey)
+                    logging.info("Removed registry key %s\\%s.", hive_name, subkey)
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass  # Key may have subkeys — ignore
+        print("  [OK] ZeroWatch registry keys cleaned.")
+
+    # 5. State directory (%PROGRAMDATA%\ZeroWatch\state)
+    try:
+        base_dir = get_base_dir()
+        state_dir = _secure_state_dir(base_dir)
+        if os.path.isdir(state_dir):
+            shutil.rmtree(state_dir, ignore_errors=True)
+            print(f"  [OK] State directory removed: {state_dir}")
+        # Also try to remove the parent ZeroWatch folder if empty
+        parent = os.path.dirname(state_dir)
+        if os.path.isdir(parent) and not os.listdir(parent):
+            os.rmdir(parent)
+    except Exception as e:
+        print(f"  [WARN] State directory cleanup partial: {e}")
+
+    # 6. Shutdown signal (prevent watchdog from reviving)
+    try:
+        base_dir = get_base_dir()
+        request_shutdown_signal(base_dir, "uninstall")
+    except Exception:
+        pass
+
+    print("\n[SentinelAgent] Uninstall complete. All agent persistence removed.")
+    print("  Reboot to confirm no agent processes start automatically.")
+
+
 def main():
     """
     Entry point resolver. The same binary serves multiple purposes:
@@ -8928,11 +8998,17 @@ def main():
       --daemon            -> Silent background agent (detached)
       --password-prompt   -> Show the visible kill CLI
       --watchdog          -> Internal watchdog process
+      --uninstall         -> Remove all persistence artifacts
       (default)           -> Interactive routing (Enroll -> Dashboard)
     """
     # A Windows OTA child starts immediately, then waits here until the old
     # process releases all executable and agent resources.
     _wait_for_restart_parent()
+
+    # 0. Full uninstall (must run before console hiding)
+    if "--uninstall" in sys.argv:
+        full_uninstall()
+        return
 
     # 1. Immediate Console Hiding
     if "--password-prompt" not in sys.argv and "--reset" not in sys.argv:
