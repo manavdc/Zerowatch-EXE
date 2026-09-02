@@ -100,7 +100,7 @@ jobs:
   # ===========================================================================
   build-linux:
     name: "Build Linux (x64)"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       binary-name: ${{ steps.set-names.outputs.binary }}
     steps:
@@ -112,16 +112,16 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install system dependencies (tkinter + patchelf)
+      - name: Install system dependencies (tkinter + ccache)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-tk patchelf ccache
+          sudo apt-get install -y python3-tk ccache
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-linux.txt
-          pip install nuitka>=2.0 ordered-set zstandard
+          pip install "nuitka>=2.0" ordered-set zstandard
 
       - name: Set binary name
         id: set-names
