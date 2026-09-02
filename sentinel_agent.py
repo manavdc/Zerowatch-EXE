@@ -6083,11 +6083,12 @@ def main_agent():
                             on_delta=_on_fs_delta,
                         )
                         if zw_client.jwt:
-                            zw_client.sync_full(
-                                deep_items, hardware_data, inventory_scope="complete"
+                            sync_ok = zw_client.sync_complete_inventory(
+                                deep_items, hardware_data
                             )
                             logging.info(
-                                "Background Windows deep scan sync completed (%d items).",
+                                "Background Windows deep scan sync completed: %s (%d items).",
+                                sync_ok,
                                 len(deep_items),
                             )
                     except Exception as _deep_err:
@@ -8015,8 +8016,8 @@ class DashboardFrame(tk.Frame):
                             try:
                                 full_items = get_full_software_inventory(self.zw_client.base_dir, include_filesystem=True)
                                 if isinstance(full_items, list) and full_items and self.zw_client.jwt:
-                                    self.zw_client.sync_full(full_items, hardware_data, inventory_scope="complete")
-                                    logging.info("GUI: Deep scan sync completed (%d items).", len(full_items))
+                                    sync_ok = self.zw_client.sync_complete_inventory(full_items, hardware_data)
+                                    logging.info("GUI: Deep scan sync completed: %s (%d items).", sync_ok, len(full_items))
                             except Exception as deep_err:
                                 logging.debug("GUI deep scan error: %s", deep_err)
 
