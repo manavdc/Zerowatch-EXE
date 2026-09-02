@@ -604,7 +604,7 @@ def _resolve_base_api_url():
         return str(env_url).rstrip("/")
 
     if "--dev" in sys.argv or os.environ.get("ZEROWATCH_DEV_MODE") == "1":
-        return "http://localhost:3000/api"
+        return "https://zerowatch.deepcytes.io/api"
 
     # Search multiple candidate locations for agent_config.json
     candidate_dirs = [
@@ -630,12 +630,12 @@ def _resolve_base_api_url():
     if FORCED_BASE_API_URL:
         return str(FORCED_BASE_API_URL).rstrip("/")
 
-    # If running from uncompiled python source (.py file), default to localhost backend
+    # If running from uncompiled python source (.py file), default to production backend
     is_script_run = not IS_COMPILED and not getattr(sys, "frozen", False) and str(sys.argv[0]).endswith(".py")
     if is_script_run:
-        return "http://localhost:3000/api"
+        return "https://zerowatch.deepcytes.io/api"
 
-    return "http://localhost:3000/api"
+    return "https://zerowatch.deepcytes.io/api"
 
 
 BASE_API_URL = _resolve_base_api_url()
