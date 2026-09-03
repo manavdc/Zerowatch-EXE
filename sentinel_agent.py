@@ -2147,14 +2147,17 @@ class ZeroWatchClient:
         This keeps large filesystem inventories deliverable through proxies
         with smaller request limits.
         """
-        if self.sync_full(software_list, hardware_info, inventory_scope="complete"):
-            return True
-        if self.last_server_status != 413:
-            return False
-
         items = list(software_list or [])
         if not items:
             return False
+
+        if len(items) >= 400:
+            logging.info(f"Inventory too large ({len(items)} items); bypassing proxy limits via chunked sync.")
+        else:
+            if self.sync_full(items, hardware_info, inventory_scope="complete"):
+                return True
+            if self.last_server_status not in (413, 0, 502, 504):
+                return False
 
         batches = []
         current = []
