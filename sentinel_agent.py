@@ -6802,23 +6802,26 @@ class EnrollmentFrame(tk.Frame):
         self.show_screen("PENDING")
         self._start_polling()
 
-        # Spawn the background daemon NOW so it can independently detect
-        # approval even if the user closes the GUI before the admin accepts.
-        # The daemon's _wait_for_enrollment loop polls the backend every 5s
-        # and will pick up the pending join state from the shared state file.
-        def _pre_approval_daemon_bootstrap():
+        # 1. Spawn daemon IMMEDIATELY and synchronously on the spot so it is
+        # guaranteed to be alive before the user can close the GUI window.
+        try:
+            with _daemon_spawn_lock:
+                if not _is_daemon_running():
+                    started, pid = _spawn_daemon_process()
+                    logging.info("[GUI] Background daemon spawned on entering PENDING (started=%s, pid=%s).", started, pid)
+        except Exception as exc:
+            logging.warning("[GUI] Pre-approval daemon immediate spawn failed: %s", exc)
+
+        # 2. Register startup persistence in a non-daemon thread so closing the
+        # GUI does not abruptly kill the registration process.
+        def _pre_approval_persistence():
             try:
                 task_ok = register_task_scheduler()
                 if not task_ok:
                     register_startup_registry()
             except Exception as exc:
                 logging.warning("Pre-approval persistence registration failed: %s", exc)
-            try:
-                _auto_bootstrap_background_agent()
-                logging.info("[GUI] Background daemon spawned while enrollment is pending.")
-            except Exception as exc:
-                logging.warning("[GUI] Pre-approval daemon spawn failed: %s", exc)
-        threading.Thread(target=_pre_approval_daemon_bootstrap, daemon=True).start()
+        threading.Thread(target=_pre_approval_persistence, daemon=False).start()
 
     def _start_polling(self):
         if self._polling_active:
@@ -8544,8 +8547,21 @@ class UnifiedSentinelGUI(tk.Tk):
 
         _apply_macos_button_theme(self)
 
+        self.protocol("WM_DELETE_WINDOW", self._on_window_close)
+
         self.after(50, self._bring_to_front)
         self.after(200, self._force_show_window)
+
+    def _on_window_close(self):
+        """Called when user clicks 'X' button to close the GUI window."""
+        try:
+            # If enrollment is pending or already enrolled, guarantee background daemon is running
+            if self.zw_client and (self.zw_client.has_pending_join() or self.zw_client.is_enrolled()):
+                if not _is_daemon_running():
+                    _spawn_daemon_process()
+        except Exception:
+            pass
+        self.destroy()
 
     def _bring_to_front(self):
         try:

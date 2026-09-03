@@ -364,4 +364,128 @@ When persistence is registered, if `ZEROWATCH_API_URL` is set in the current she
 
 ---
 
+## 11. Windows Security & Code Signing
+
+### 11.1 Why Defender May Flag the Agent
+
+Windows Defender and other AV engines use heuristic analysis to score executables. The SentinelAgent legitimately performs several operations that share behavioral patterns with malware:
+
+| Agent Behavior | Heuristic Signal |
+|---|---|
+| Registry Run key creation (`HKLM\...\Run`) | Startup persistence (common in malware) |
+| Scheduled Task creation (`schtasks /create`) | Persistence mechanism |
+| Detached process spawning (`CREATE_NO_WINDOW`) | Hidden process execution |
+| Process DACL hardening (hardened mode only) | Anti-termination (malware self-defense) |
+| Console control handler interception | Signal suppression |
+| Windows Service registration (hardened mode only) | System-level persistence |
+
+**Without an Authenticode code signature, these behaviors cause AV engines to classify the binary as potentially malicious.** This is not a bug in the agent — it is the expected behavior of heuristic AV engines when encountering unsigned binaries that perform system-level operations.
+
+### 11.2 Resolution: Authenticode Code Signing
+
+The definitive fix for Defender detection is to sign the production EXE with a trusted Authenticode certificate. Options:
+
+| Certificate Type | Approximate Cost | SmartScreen Trust |
+|---|---|---|
+| **EV Code Signing** | $300–500/year | Instant reputation |
+| **Standard OV Certificate** | $100–200/year | Requires reputation building (weeks) |
+| **Azure Trusted Signing** | ~$10/month | Microsoft-backed |
+
+**Implementation steps:**
+
+1. Purchase a code-signing certificate from a Certificate Authority (DigiCert, Sectigo, GlobalSign)
+2. Export the certificate as a `.pfx` file
+3. Store the Base64-encoded `.pfx` and its password as GitHub Secrets:
+   - `CODE_SIGNING_CERT_BASE64`
+   - `CODE_SIGNING_CERT_PASSWORD`
+4. Add a signing step to `.github/workflows/release.yml` after the Nuitka build:
+
+```yaml
+- name: Sign Windows binary (Authenticode)
+  env:
+    CERTIFICATE_BASE64: ${{ secrets.CODE_SIGNING_CERT_BASE64 }}
+    CERTIFICATE_PASSWORD: ${{ secrets.CODE_SIGNING_CERT_PASSWORD }}
+  shell: powershell
+  run: |
+    $certBytes = [Convert]::FromBase64String($env:CERTIFICATE_BASE64)
+    $certPath = "cert.pfx"
+    [IO.File]::WriteAllBytes($certPath, $certBytes)
+    & signtool sign /f $certPath /p $env:CERTIFICATE_PASSWORD `
+      /tr http://timestamp.digicert.com /td sha256 /fd sha256 `
+      "dist/windows/SentinelAgent-windows-x64.exe"
+    Remove-Item $certPath
+```
+
+5. Install the Windows SDK on the CI runner to provide `signtool.exe`
+
+### 11.3 Hardened Mode vs Standard Mode
+
+The agent operates in two profiles to manage the AV detection tradeoff:
+
+- **Standard mode** (default): Avoids aggressive self-protection. Uses Registry Run keys and Task Scheduler for persistence, but does NOT apply DACL hardening, Windows Service registration, or file ACL protection. This minimizes AV heuristic score.
+
+- **Hardened mode** (`--hardened` flag or `SENTINEL_HARDENED_MODE=1`): Enables full self-protection including DACL process hardening, Windows Service registration, and NTFS ACL file protection. **This mode should only be used with a signed binary**, as the additional behaviors significantly increase heuristic AV scores.
+
+### 11.4 Smart App Control
+
+On Windows 11, Smart App Control (SAC) blocks unsigned/untrusted applications independently of Defender. Previous releases worked after disabling SAC because the heuristic score was below Defender's threshold. As new features add more system-level operations, the cumulative heuristic score can cross that threshold — code signing is the permanent solution.
+
+---
+
+## 12. Uninstall Lifecycle
+
+### 12.1 `--uninstall` Flag
+
+The agent supports a `--uninstall` CLI flag that performs comprehensive cleanup of all persistence artifacts:
+
+```bash
+SentinelAgent.exe --uninstall
+```
+
+This removes:
+1. **Registry Run keys** — Both `SentinelAgent` and legacy `ZerowatchSentinelAgent` values from HKLM and HKCU
+2. **Scheduled Tasks** — `SentinelAgent`, `SentinelAgentStartup`, `SentinelAgentResume`
+3. **Windows Service** — `SentinelAgent` (stop + delete)
+4. **ZeroWatch registry keys** — `SOFTWARE\Zerowatch\Agent` and `SOFTWARE\Zerowatch`
+5. **State directory** — `%PROGRAMDATA%\ZeroWatch\state` (tokens, fingerprint, logs, cache)
+6. **Shutdown signal** — Prevents watchdog from reviving the agent
+
+> **Note**: HKLM cleanup requires administrator privileges. If run without admin, only HKCU entries are cleaned. The compiled EXE typically runs with admin privileges via the scheduled task or UAC.
+
+### 12.2 Registry Value Name Convention
+
+All persistence functions use the canonical value name `SentinelAgent` in the Registry Run key. The legacy value name `ZerowatchSentinelAgent` (from an older code path) is cleaned up by both `unregister_startup_registry()` and `--uninstall` to prevent orphaned entries that could cause `.py` files to open on reboot.
+
+---
+
+## 13. Production Deployment Notes
+
+### 13.1 Build Pipeline
+
+The production build uses **Nuitka** (Python-to-C compiler) via:
+- **CI/CD**: `.github/workflows/release.yml` — triggered by pushing a version tag (e.g., `v6.0`)
+- **Local**: `build_agent.bat` — for developer builds with server preset selection
+
+The PyInstaller build script (`build_agent_pyinstaller_enc.bat`) has been removed. It used AES bytecode encryption which provided no real security (the key shipped with the binary) and was a significant AV false-positive trigger.
+
+### 13.2 Reboot Persistence
+
+After enrollment, the agent registers persistence via:
+1. **Task Scheduler** (primary) — `schtasks /create /tn SentinelAgent /sc ONLOGON /rl HIGHEST`
+2. **Registry Run key** (fallback) — `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\SentinelAgent`
+
+Both point to `"<exe_path>" --daemon` which starts the background agent.
+
+### 13.3 Clean Installation Lifecycle
+
+```
+Install:    Download SentinelAgent.exe → Run → Enroll → Daemon auto-starts
+Persist:    Task Scheduler + Registry Run key → Daemon auto-starts on reboot
+Update:     OTA via GitHub Releases → Ed25519-verified binary swap
+Uninstall:  SentinelAgent.exe --uninstall → All persistence removed → Reboot clean
+```
+
+---
+
 The above description should provide exhaustive insight into every function, flow control decision, and interaction within the endpoint agent codebase. Use this as reference when debugging, extending, or integrating the agent with the backend.
+

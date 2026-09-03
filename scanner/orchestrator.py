@@ -855,7 +855,10 @@ class ScanOrchestrator:
             self._last_snapshot = {item.dedup_key(): item for item in unique}
 
         # ── Update cache meta ──────────────────────────────────────────────
-        self._cache.set_meta("last_full_scan_at", self._utc_now_iso())
+        try:
+            self._cache.set_meta("last_full_scan_at", self._utc_now_iso())
+        except Exception as exc:
+            logger.debug("Non-fatal meta update error: %s", exc)
 
         return [item.to_api_dict() for item in unique]
 

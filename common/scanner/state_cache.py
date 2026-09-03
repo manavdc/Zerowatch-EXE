@@ -143,18 +143,24 @@ class ScanCache:
         return row[0] if row else default
 
     def set_meta(self, key: str, value: str) -> None:
-        self._conn().execute(
-            "INSERT INTO full_scan_meta(key, value) VALUES(?,?)"
-            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-        self._conn().commit()
+        try:
+            self._conn().execute(
+                "INSERT INTO full_scan_meta(key, value) VALUES(?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            self._conn().commit()
+        except sqlite3.OperationalError as exc:
+            logger.warning("Cache set_meta non-fatal error: %s", exc)
 
     def delete_meta(self, key: str) -> None:
-        self._conn().execute(
-            "DELETE FROM full_scan_meta WHERE key=?", (key,)
-        )
-        self._conn().commit()
+        try:
+            self._conn().execute(
+                "DELETE FROM full_scan_meta WHERE key=?", (key,)
+            )
+            self._conn().commit()
+        except sqlite3.OperationalError as exc:
+            logger.warning("Cache delete_meta non-fatal error: %s", exc)
 
     def lookup(
         self, path: str, mtime_ns: int, size_bytes: int
