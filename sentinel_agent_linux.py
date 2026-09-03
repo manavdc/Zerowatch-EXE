@@ -458,28 +458,6 @@ def _build_hardware_profile(platform) -> dict:
         return self._session.patch(url, json=payload, headers=self.headers, timeout=timeout)
 
 
-# ── Inventory helpers ─────────────────────────────────────────────────────────
-
-def _build_hardware_profile(platform) -> dict:
-    try:
-        hc = platform.hardware_collector
-        profile = hc.get_detailed_hardware_profile()
-        inv     = hc.get_hardware_inventory()
-        return {
-            "hardware": {
-                "cpu": next((x for x in inv if x.get("category") == "cpu"), {}),
-                "ram": next((x for x in inv if x.get("category") == "ram"), {}),
-                "gpu": [],
-                "disks": [],
-            },
-            "os_info": profile.get("os_info", {}),
-            "fingerprint": hc.collect_fingerprint(),
-        }
-    except Exception as exc:
-        logger.warning("Hardware profile failed: %s", exc)
-        return {}
-
-
 def _items_to_dicts(items) -> list:
     """Convert SoftwareItem list to API-compatible dicts."""
     result = []
@@ -670,9 +648,15 @@ class LinuxAgent:
                         if status == "approved" and data.get("jwt"):
                             self._session.save_jwt(data["jwt"])
                             
-                            # Update join_state.json to "approved" so _claim_approval_sync works
-                            state["status"] = "approved"
-                            self._session.save_join_state(state)
+                            # Refresh state from disk to avoid overwriting GUI changes
+                            fresh_state = self._session.load_join_state() or {}
+                            fresh_state["status"] = "approved"
+                            fresh_state["teamCode"] = data.get("teamCode") or fresh_state.get("teamCode")
+                            fresh_state["teamName"] = data.get("teamName") or fresh_state.get("teamName")
+                            fresh_state["teamId"] = data.get("teamId") or fresh_state.get("teamId")
+                            fresh_state["organizationName"] = data.get("organizationName") or fresh_state.get("organizationName")
+                            fresh_state["requestId"] = data.get("requestId") or fresh_state.get("requestId")
+                            self._session.save_join_state(fresh_state)
                             
                             logger.info(
                                 "[APPROVAL_DETECTED] Persisted enrollment approved; "
@@ -817,6 +801,17 @@ class LinuxAgent:
                                     token = status_data.get("jwt")
                                     if token:
                                         self._session.save_jwt(token)
+                                        
+                                        # Update join_state.json so _claim_approval_sync works
+                                        fresh_state = self._session.load_join_state() or {}
+                                        fresh_state["status"] = "approved"
+                                        fresh_state["teamCode"] = status_data.get("teamCode") or fresh_state.get("teamCode")
+                                        fresh_state["teamName"] = status_data.get("teamName") or fresh_state.get("teamName")
+                                        fresh_state["teamId"] = status_data.get("teamId") or fresh_state.get("teamId")
+                                        fresh_state["organizationName"] = status_data.get("organizationName") or fresh_state.get("organizationName")
+                                        fresh_state["requestId"] = status_data.get("requestId") or fresh_state.get("requestId")
+                                        self._session.save_join_state(fresh_state)
+
                                         logger.info(
                                             "[APPROVAL_DETECTED] Device join approved! "
                                             "Enrollment completed (device_id=%s).",
@@ -892,7 +887,7 @@ class LinuxAgent:
         return False
 
     def _sync_full(self, software: list, hardware: dict | None = None,
-                   inventory_scope: str = "complete") -> bool:
+                   inventory_scope: str = "complete") -> int:
         """Push full software inventory and hardware profile to backend."""
         if hardware is None:
             try:
