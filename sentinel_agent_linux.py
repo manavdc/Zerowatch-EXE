@@ -445,18 +445,6 @@ def _build_hardware_profile(platform) -> dict:
         logger.warning("Hardware profile failed: %s", exc)
         return {}
 
-    def post(self, path: str, payload: dict, timeout: int = 30) -> requests.Response:
-        url = f"{self._api_url}{path}"
-        return self._session.post(url, json=payload, headers=self.headers, timeout=timeout)
-
-    def get(self, path: str, timeout: int = 30) -> requests.Response:
-        url = f"{self._api_url}{path}"
-        return self._session.get(url, headers=self.headers, timeout=timeout)
-
-    def patch(self, path: str, payload: dict, timeout: int = 30) -> requests.Response:
-        url = f"{self._api_url}{path}"
-        return self._session.patch(url, json=payload, headers=self.headers, timeout=timeout)
-
 
 def _items_to_dicts(items) -> list:
     """Convert SoftwareItem list to API-compatible dicts."""
