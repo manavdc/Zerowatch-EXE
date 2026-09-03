@@ -948,11 +948,7 @@ class ScanOrchestrator:
                         # Deep scan uses walk_drives() instead of walk_specified_dirs()
                         new_items, removed_items = self._run_full_drive_scan(
                             stop_event=self._bg_stop,
-                            on_batch=(
-                                lambda batch, removed: self._emit_fs_delta(
-                                    batch, removed, on_delta
-                                )
-                            ) if on_delta else None,
+                            on_batch=None,
                         )
                         self._emit_fs_delta(new_items, removed_items, on_delta)
                         self._cache.set_meta("last_fs_scan_at", self._utc_now_iso())
