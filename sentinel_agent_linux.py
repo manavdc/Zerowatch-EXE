@@ -669,6 +669,11 @@ class LinuxAgent:
                         status = str(data.get("status") or "").lower()
                         if status == "approved" and data.get("jwt"):
                             self._session.save_jwt(data["jwt"])
+                            
+                            # Update join_state.json to "approved" so _claim_approval_sync works
+                            state["status"] = "approved"
+                            self._session.save_join_state(state)
+                            
                             logger.info(
                                 "[APPROVAL_DETECTED] Persisted enrollment approved; "
                                 "daemon authenticated (device_id=%s).",
@@ -691,6 +696,7 @@ class LinuxAgent:
                             "[ENROLLMENT] Join-status returned HTTP %d; clearing pending state.",
                             response.status_code,
                         )
+                        clear_device_state(self._state_dir)
                         return False
                     else:
                         consecutive_errors += 1
@@ -999,10 +1005,23 @@ class LinuxAgent:
         }
         try:
             resp = self._session.post("/agent/heartbeat", payload)
+            if resp.status_code == 404:
+                logger.warning("Heartbeat returned HTTP 404. Device unlinked remotely.")
+                self._handle_unlinked()
+                return False
             return resp.status_code in (200, 204)
         except Exception as exc:
             logger.debug("Heartbeat error: %s", exc)
             return False
+
+    def _handle_unlinked(self) -> None:
+        """Handle backend reporting the device is unlinked."""
+        logger.warning("Handling remote unlink. Clearing state...")
+        self._orchestrator.close()
+        clear_device_state(self._state_dir)
+        self._session.clear_jwt()
+        # systemd will restart the daemon automatically
+        sys.exit(0)
 
     def _sync_full_with_retry(self, software: list, hardware: dict | None = None,
                               inventory_scope: str = "complete") -> bool:
