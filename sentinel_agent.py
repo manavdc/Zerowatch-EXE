@@ -6802,6 +6802,24 @@ class EnrollmentFrame(tk.Frame):
         self.show_screen("PENDING")
         self._start_polling()
 
+        # Spawn the background daemon NOW so it can independently detect
+        # approval even if the user closes the GUI before the admin accepts.
+        # The daemon's _wait_for_enrollment loop polls the backend every 5s
+        # and will pick up the pending join state from the shared state file.
+        def _pre_approval_daemon_bootstrap():
+            try:
+                task_ok = register_task_scheduler()
+                if not task_ok:
+                    register_startup_registry()
+            except Exception as exc:
+                logging.warning("Pre-approval persistence registration failed: %s", exc)
+            try:
+                _auto_bootstrap_background_agent()
+                logging.info("[GUI] Background daemon spawned while enrollment is pending.")
+            except Exception as exc:
+                logging.warning("[GUI] Pre-approval daemon spawn failed: %s", exc)
+        threading.Thread(target=_pre_approval_daemon_bootstrap, daemon=True).start()
+
     def _start_polling(self):
         if self._polling_active:
             return
