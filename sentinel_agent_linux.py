@@ -917,16 +917,31 @@ class LinuxAgent:
             return 0
 
     def _sync_complete_inventory(self, software_list: list, hardware: dict | None = None) -> bool:
-        """Sync complete inventory, falling back to chunked delta batches on HTTP 413 (Payload Too Large)."""
-        status_code = self._sync_full(software_list, hardware, inventory_scope="complete")
-        if status_code in (200, 201, 204):
-            return True
-        if status_code != 413:
-            return False
+        """Sync complete inventory, proactively chunking large payloads.
 
+        Cloudflare and similar WAF/proxy layers silently kill SSL connections
+        for oversized request bodies (returning SSLEOFError, status 0).  To
+        avoid this, inventories with >= 400 items are chunked proactively
+        without attempting the full payload first.  Smaller inventories still
+        try a single request and only fall back to chunking on 413 or
+        connection errors.
+        """
         items = list(software_list or [])
         if not items:
             return False
+
+        # For small inventories, try sending everything in one request.
+        if len(items) < 400:
+            status_code = self._sync_full(items, hardware, inventory_scope="complete")
+            if status_code in (200, 201, 204):
+                return True
+            # Only fall back to chunking on 413 or connection-level failures
+            # (status 0 = exception before any HTTP response, e.g. SSLEOFError).
+            if status_code not in (413, 0):
+                return False
+            logger.info("[SYNC] Full sync returned %d; falling back to chunked delivery.", status_code)
+        else:
+            logger.info("[SYNC] Large inventory (%d items); proactively chunking to avoid proxy drops.", len(items))
 
         batches = []
         current = []
@@ -941,7 +956,7 @@ class LinuxAgent:
         if current:
             batches.append(current)
 
-        logger.info("[SYNC] Chunking oversized inventory (%d items) into %d requests (HTTP 413 fallback).", len(items), len(batches))
+        logger.info("[SYNC] Chunking inventory (%d items) into %d requests.", len(items), len(batches))
         first_status = self._sync_full(batches[0], hardware, inventory_scope="complete")
         if first_status not in (200, 201, 204):
             return False

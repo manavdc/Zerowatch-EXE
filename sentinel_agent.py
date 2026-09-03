@@ -2147,17 +2147,17 @@ class ZeroWatchClient:
         This keeps large filesystem inventories deliverable through proxies
         with smaller request limits.
         """
+        # Try a single sync_full first (optimal path).  Only fall back to
+        # chunked delivery when the server replies with HTTP 413.
+        if self.sync_full(software_list, hardware_info, inventory_scope="complete"):
+            return True
+        if self.last_server_status != 413:
+            return False
+
         items = list(software_list or [])
         if not items:
             return False
 
-        if len(items) >= 400:
-            logging.info(f"Inventory too large ({len(items)} items); bypassing proxy limits via chunked sync.")
-        else:
-            if self.sync_full(items, hardware_info, inventory_scope="complete"):
-                return True
-            if self.last_server_status not in (413, 0, 502, 504):
-                return False
 
         batches = []
         current = []
@@ -6805,26 +6805,29 @@ class EnrollmentFrame(tk.Frame):
         self.show_screen("PENDING")
         self._start_polling()
 
-        # 1. Spawn daemon IMMEDIATELY and synchronously on the spot so it is
-        # guaranteed to be alive before the user can close the GUI window.
-        try:
-            with _daemon_spawn_lock:
-                if not _is_daemon_running():
-                    started, pid = _spawn_daemon_process()
-                    logging.info("[GUI] Background daemon spawned on entering PENDING (started=%s, pid=%s).", started, pid)
-        except Exception as exc:
-            logging.warning("[GUI] Pre-approval daemon immediate spawn failed: %s", exc)
-
-        # 2. Register startup persistence in a non-daemon thread so closing the
-        # GUI does not abruptly kill the registration process.
-        def _pre_approval_persistence():
+        # On Windows, spawn daemon immediately so that closing the GUI
+        # before approval does not leave the device silent.  On macOS,
+        # launchd owns the daemon lifecycle and spawning here causes
+        # competing orphan processes.
+        if sys.platform != "darwin":
             try:
-                task_ok = register_task_scheduler()
-                if not task_ok:
-                    register_startup_registry()
+                with _daemon_spawn_lock:
+                    if not _is_daemon_running():
+                        started, pid = _spawn_daemon_process()
+                        logging.info("[GUI] Background daemon spawned on entering PENDING (started=%s, pid=%s).", started, pid)
             except Exception as exc:
-                logging.warning("Pre-approval persistence registration failed: %s", exc)
-        threading.Thread(target=_pre_approval_persistence, daemon=False).start()
+                logging.warning("[GUI] Pre-approval daemon immediate spawn failed: %s", exc)
+
+            # Register startup persistence in a non-daemon thread so closing the
+            # GUI does not abruptly kill the registration process.
+            def _pre_approval_persistence():
+                try:
+                    task_ok = register_task_scheduler()
+                    if not task_ok:
+                        register_startup_registry()
+                except Exception as exc:
+                    logging.warning("Pre-approval persistence registration failed: %s", exc)
+            threading.Thread(target=_pre_approval_persistence, daemon=False).start()
 
     def _start_polling(self):
         if self._polling_active:
@@ -6864,15 +6867,19 @@ class EnrollmentFrame(tk.Frame):
         def _post_enrollment_tasks():
             _append_gui_log(self.zw_client.base_dir, "Starting post-enrollment system integration...")
             
-            # Send immediate baseline inventory sync so backend builds CVE feed right away
-            try:
-                hardware_data = get_detailed_hardware_profile()
-                fast_software = get_installed_software_registry()
-                if fast_software and self.zw_client.jwt:
-                    synced = self.zw_client.sync_full(fast_software, hardware_data, inventory_scope="partial")
-                    logging.info("[GUI] Immediate post-enrollment Layer 0 sync: %s (%d items)", synced, len(fast_software))
-            except Exception as exc:
-                logging.warning("[GUI] Post-enrollment initial inventory sync error: %s", exc)
+            # Send immediate baseline inventory sync so backend builds CVE
+            # feed right away.  Skip on macOS where the background daemon
+            # owns inventory collection — running a GUI scan here races
+            # with the daemon and can upload an empty/partial result.
+            if sys.platform != "darwin":
+                try:
+                    hardware_data = get_detailed_hardware_profile()
+                    fast_software = get_installed_software_registry()
+                    if fast_software and self.zw_client.jwt:
+                        synced = self.zw_client.sync_full(fast_software, hardware_data, inventory_scope="partial")
+                        logging.info("[GUI] Immediate post-enrollment Layer 0 sync: %s (%d items)", synced, len(fast_software))
+                except Exception as exc:
+                    logging.warning("[GUI] Post-enrollment initial inventory sync error: %s", exc)
 
             # Register startup persistence so daemon survives reboots
             try:
@@ -8020,8 +8027,12 @@ class DashboardFrame(tk.Frame):
                     self.after(0, self.master.show_enrollment)
                     return
 
-                # 2. Ensure initial inventory scan & sync runs if server has no software
-                if not getattr(self, "inventory_synced", False):
+                # 2. Ensure initial inventory scan & sync runs if server has no software.
+                # On macOS, inventory is owned entirely by the background daemon
+                # (managed by launchd).  Allowing the GUI to trigger scans races
+                # with the daemon and can overwrite the deep-scan result with a
+                # partial/empty registry-only scan.
+                if sys.platform != "darwin" and not getattr(self, "inventory_synced", False):
                     product_count = (info.get("stats", {}) or {}).get("productCount") if isinstance(info, dict) else None
                     if product_count is None or product_count == 0:
                         logging.info("GUI: No server inventory detected. Syncing Layer 0 baseline immediately...")
@@ -8550,13 +8561,17 @@ class UnifiedSentinelGUI(tk.Tk):
 
         _apply_macos_button_theme(self)
 
-        self.protocol("WM_DELETE_WINDOW", self._on_window_close)
+        # On Windows, ensure the background daemon is spawned when the user
+        # closes the GUI so the agent keeps running silently.  On macOS,
+        # launchd manages daemon lifecycle — spawning here causes duplicates.
+        if sys.platform != "darwin":
+            self.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
         self.after(50, self._bring_to_front)
         self.after(200, self._force_show_window)
 
     def _on_window_close(self):
-        """Called when user clicks 'X' button to close the GUI window."""
+        """Called when user clicks 'X' button to close the GUI window (Windows/Linux only)."""
         try:
             # If enrollment is pending or already enrolled, guarantee background daemon is running
             if self.zw_client and (self.zw_client.has_pending_join() or self.zw_client.is_enrolled()):
