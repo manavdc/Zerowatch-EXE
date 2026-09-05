@@ -5602,12 +5602,11 @@ def watchdog_process(target_exe_path):
 
     while True:
         try:
-            # Check intentional shutdown before checking the main mutex.
+            # Check the main mutex before interpreting shutdown signals.  During
+            # an OTA restart the old daemon writes an ``ota-restart`` signal
+            # while it is still alive; returning here would make the watchdog
+            # disappear before it can supervise the replacement process.
             base_dir = os.path.dirname(target_exe_path)
-            if os.path.exists(_shutdown_signal_path(base_dir)):
-                logging.info("[WATCHDOG] Shutdown signal detected; exiting watchdog.")
-                return
-
             # Check if main agent holds its mutex.
             # The GUI agent holds MUTEX_NAME; the daemon holds DAEMON_MUTEX_NAME.
             # The watchdog must check BOTH — if either is held, the agent is alive.

@@ -42,8 +42,16 @@ class DaemonOTAMonitor:
             if perform_update(dest, self.current_exe):
                 if os.name == "nt":
                     from common.os_replacer import _relaunch_detached
-                    if not _relaunch_detached(self.current_exe, reopen_gui=False):
-                        raise RuntimeError("Windows replacement process could not be launched")
+                    relaunched = _relaunch_detached(self.current_exe, reopen_gui=False)
+                    if not relaunched:
+                        # The old daemon must still exit after a successful
+                        # swap.  This leaves the watchdog responsible for the
+                        # retry/rollback path instead of leaving the new exe
+                        # stranded beside a permanent .bak file.
+                        logger.error(
+                            "[OTA] Windows replacement could not be launched; "
+                            "requesting watchdog recovery."
+                        )
                 logger.info("[OTA] Update applied; supervisor restart requested.")
                 self.shutdown_event.set()
         except Exception as exc:
