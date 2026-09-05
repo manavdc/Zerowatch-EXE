@@ -220,10 +220,19 @@ def _relaunch_detached(current_exe: str) -> bool:
         launch_args.extend(["--restart-wait-pid", str(os.getpid())])
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0
+
+        # Preserve headless behavior for daemon restarts, but restore normal
+        # window display for interactive GUI restarts.
+        if "--daemon" in launch_args:
+            si.wShowWindow = 0  # SW_HIDE
+            creation_flags = detached | new_group | subprocess.CREATE_NO_WINDOW
+        else:
+            si.wShowWindow = 1  # SW_SHOWNORMAL
+            creation_flags = detached | new_group
+
         child = subprocess.Popen(
             [target, *launch_args],
-            creationflags=detached | new_group | subprocess.CREATE_NO_WINDOW,
+            creationflags=creation_flags,
             startupinfo=si,
             close_fds=True,
             cwd=os.path.dirname(os.path.abspath(current_exe)) or None,
