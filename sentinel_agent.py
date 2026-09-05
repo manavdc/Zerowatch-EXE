@@ -6782,8 +6782,13 @@ class EnrollmentFrame(tk.Frame):
         try:
             if getattr(self, "is_individual", False):
                 res = self.zw_client.request_individual_join(self.individual_code)
-                if res.get("success") and res.get("jwt"):
-                    self.after(0, self._on_success)
+                if res.get("success"):
+                    if res.get("status") == "pending":
+                        self.after(0, lambda: self._goto_pending())
+                    elif res.get("jwt"):
+                        self.after(0, self._on_success)
+                    else:
+                        self.after(0, lambda: self._goto_pending())
                 else:
                     msg = res.get("message", "Registration failed")
                     self.after(0, lambda: self.status_label_meta.config(text=msg, fg="#f87171"))
