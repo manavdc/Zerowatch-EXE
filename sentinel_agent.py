@@ -449,6 +449,57 @@ def _state_path(base_dir, filename):
     return os.path.join(_secure_state_dir(base_dir), filename)
 
 
+def _repair_state_file_acls():
+    """Re-own state files so the current (non-elevated) user can write to them.
+
+    Files in %PROGRAMDATA%\\ZeroWatch\\state are sometimes created by an
+    admin-elevated process (Task Scheduler, GUI launched via "Run as admin",
+    or the first-run installer).  Those files inherit ``Administrators: F``
+    but only ``Users: RX``, so a later non-elevated daemon (e.g. spawned by
+    OTA auto-update) gets ``PermissionError`` when writing to them.
+
+    The directory itself grants ``Users: Write`` (create + delete).  We
+    exploit that: for every file that the current user cannot open for
+    writing, we read its bytes, delete the admin-owned copy, and recreate
+    it — which makes the current user the owner with full control.
+
+    This is a no-op on non-Windows and when all files are already writable.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        state_dir = _secure_state_dir(get_base_dir())
+        if not os.path.isdir(state_dir):
+            return
+
+        repaired = []
+        for entry in os.listdir(state_dir):
+            fpath = os.path.join(state_dir, entry)
+            if not os.path.isfile(fpath):
+                continue
+            # Quick writability test
+            try:
+                with open(fpath, "r+b"):
+                    pass  # Already writable — skip
+            except PermissionError:
+                # File exists but user cannot write to it.
+                # Read → delete → recreate to re-own it.
+                try:
+                    data = open(fpath, "rb").read()
+                    os.remove(fpath)
+                    with open(fpath, "wb") as f:
+                        f.write(data)
+                    repaired.append(entry)
+                except Exception as inner:
+                    logging.warning("[ACL] Could not re-own %s: %s", entry, inner)
+            except Exception:
+                pass
+        if repaired:
+            logging.info("[ACL] Re-owned state files for current user: %s", ", ".join(repaired))
+    except Exception as exc:
+        logging.warning("[ACL] State file permission repair failed (non-fatal): %s", exc)
+
+
 def _daemon_lock_path(base_dir):
     """Return the canonical daemon lock path for this platform.
 
@@ -5557,15 +5608,20 @@ def watchdog_process(target_exe_path):
                 logging.info("[WATCHDOG] Shutdown signal detected; exiting watchdog.")
                 return
 
-            # Check if main agent holds its mutex
-            agent_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
-            last_err = ctypes.windll.kernel32.GetLastError()
-            if agent_mutex:
-                ctypes.windll.kernel32.CloseHandle(agent_mutex)
+            # Check if main agent holds its mutex.
+            # The GUI agent holds MUTEX_NAME; the daemon holds DAEMON_MUTEX_NAME.
+            # The watchdog must check BOTH — if either is held, the agent is alive.
+            agent_alive = False
+            for probe_name in (MUTEX_NAME, DAEMON_MUTEX_NAME):
+                probe_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, probe_name)
+                probe_err = ctypes.windll.kernel32.GetLastError()
+                if probe_mutex:
+                    ctypes.windll.kernel32.CloseHandle(probe_mutex)
+                if probe_err == 183:  # ERROR_ALREADY_EXISTS — mutex is held
+                    agent_alive = True
+                    break
 
-            # Normal state: last_err == 183 (ERROR_ALREADY_EXISTS) meaning main agent holds it.
-            # If last_err != 183, the watchdog just successfully acquired the vacant mutex, meaning agent is dead!
-            if last_err != 183:
+            if not agent_alive:
                 # If the agent was intentionally shut down (via disable/stop), it will
                 # create a shutdown signal file. In that case, the watchdog should
                 # not pop up a password prompt.
@@ -9108,6 +9164,17 @@ def main():
     try:
         from common.os_replacer import startup_bak_cleanup
         startup_bak_cleanup(get_exe_path())
+    except Exception:
+        pass  # Never block startup
+
+    # 1.55 Repair state file ACLs after an OTA update.
+    #      Files in %PROGRAMDATA%\ZeroWatch\state created by an admin-elevated
+    #      process inherit only admin-level ACLs.  When the OTA-spawned daemon
+    #      restarts as the normal user, it cannot write to these files and dies.
+    #      This step grants the current user FullControl on every existing file
+    #      in the state directory so the agent can operate normally.
+    try:
+        _repair_state_file_acls()
     except Exception:
         pass  # Never block startup
 
