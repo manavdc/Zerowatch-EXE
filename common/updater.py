@@ -82,7 +82,7 @@ RESTART_CHECK_TIME: int = 180
 UPDATE_CHECK_INTERVAL_SECS: int = RESTART_CHECK_TIME
 
 # Download streaming chunk size
-_CHUNK_SIZE: int = 8 * 1024  # 8 KiB
+_CHUNK_SIZE: int = 128 * 1024  # 128 KiB
 
 # HTTP timeout for CDN requests
 _HTTP_TIMEOUT: int = 30  # seconds
@@ -724,32 +724,56 @@ class BinaryDownloader:
         bytes_done = 0
         total = target.size
 
+        retries = 0
+        max_retries = 5
+
         try:
-            resp = self._session.get(
-                target.url,
-                stream=True,
-                timeout=(_HTTP_TIMEOUT, 300),  # (connect, read) timeout
-            )
-            resp.raise_for_status()
-
             with open(tmp_path, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
-                    if chunk:
-                        fh.write(chunk)
-                        sha256.update(chunk)
-                        bytes_done += len(chunk)
-                        if progress_cb:
-                            try:
-                                progress_cb(bytes_done, total)
-                            except Exception:
-                                pass
+                while bytes_done < total and retries <= max_retries:
+                    headers = {}
+                    if bytes_done > 0:
+                        headers["Range"] = f"bytes={bytes_done}-"
 
-        except requests.HTTPError as exc:
+                    try:
+                        resp = self._session.get(
+                            target.url,
+                            headers=headers,
+                            stream=True,
+                            timeout=(_HTTP_TIMEOUT, 300),
+                        )
+                        resp.raise_for_status()
+
+                        for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
+                            if chunk:
+                                fh.write(chunk)
+                                sha256.update(chunk)
+                                bytes_done += len(chunk)
+                                if progress_cb:
+                                    try:
+                                        progress_cb(bytes_done, total)
+                                    except Exception:
+                                        pass
+                        
+                        # Break if we finished successfully
+                        if bytes_done >= total:
+                            break
+                            
+                    except requests.RequestException as exc:
+                        retries += 1
+                        if retries > max_retries:
+                            raise OTAError(f"Network error downloading binary after {max_retries} retries: {exc}") from exc
+                        logger.warning("Download interrupted at %s/%s (retry %d/%d): %s", bytes_done, total, retries, max_retries, exc)
+                        import time
+                        time.sleep(2)
+
+            if bytes_done < total:
+                raise OTAError(f"Incomplete download: {bytes_done}/{total} bytes")
+
+        except Exception as exc:
             self._cleanup(tmp_path)
-            raise OTAError(f"HTTP error downloading binary: {exc}") from exc
-        except requests.RequestException as exc:
-            self._cleanup(tmp_path)
-            raise OTAError(f"Network error downloading binary: {exc}") from exc
+            if isinstance(exc, OTAError):
+                raise
+            raise OTAError(f"Failed to download binary: {exc}") from exc
 
         # SHA-256 integrity check
         computed_hash = sha256.hexdigest()
