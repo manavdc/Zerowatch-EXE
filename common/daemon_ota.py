@@ -16,12 +16,14 @@ logger = logging.getLogger("ota.daemon")
 
 class DaemonOTAMonitor:
     def __init__(self, current_exe: str, current_version: str,
-                 shutdown_event: Optional[threading.Event] = None) -> None:
+                 shutdown_event: Optional[threading.Event] = None,
+                 check_interval: Optional[int] = None) -> None:
         self.current_exe = os.path.abspath(current_exe)
         self.shutdown_event = shutdown_event or threading.Event()
         self._monitor = updater.BackgroundUpdateMonitor(
             current_version=current_version,
             on_update_available=self._apply_update,
+            check_interval_secs=check_interval,
         )
 
     def start(self) -> None:
@@ -51,7 +53,8 @@ class DaemonOTAMonitor:
 
 
 def start_daemon_ota_monitor(current_exe: str, current_version: str,
-                             shutdown_event: threading.Event) -> DaemonOTAMonitor:
-    monitor = DaemonOTAMonitor(current_exe, current_version, shutdown_event)
+                             shutdown_event: threading.Event,
+                             check_interval: Optional[int] = None) -> DaemonOTAMonitor:
+    monitor = DaemonOTAMonitor(current_exe, current_version, shutdown_event, check_interval=check_interval)
     monitor.start()
     return monitor

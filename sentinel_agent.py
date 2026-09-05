@@ -290,6 +290,7 @@ WATCHDOG_MUTEX_NAME = "Global\\SentinelAgent_Watchdog_4F9A2E1B"
 PROMPT_MUTEX_NAME = "Global\\SentinelAgent_Prompt_4F9A2E1B"  # Prevents multiple password prompts
 HEARTBEAT_INTERVAL = 30  # Reduced from 60 to lower CPU
 MONITOR_INTERVAL = 60     # Reduced from 30 to lower CPU
+RESTART_CHECK_TIME = 180  # 4 hours in seconds (OTA update & restart check interval)
 OFFLINE_FLUSH_MIN_INTERVAL = 15
 OFFLINE_FLUSH_MAX_INTERVAL = 300
 USERNAME_MAX_LENGTH = 20
@@ -6152,7 +6153,7 @@ def main_agent():
         try:
             from common.daemon_ota import start_daemon_ota_monitor
             ota_monitor = start_daemon_ota_monitor(
-                get_exe_path(), AGENT_VERSION, ota_shutdown
+                get_exe_path(), AGENT_VERSION, ota_shutdown, check_interval=RESTART_CHECK_TIME
             )
         except Exception as exc:
             logging.warning("[OTA] Background update monitor unavailable: %s", exc)
@@ -7755,7 +7756,7 @@ class DashboardFrame(tk.Frame):
 
                 # 1. Wait for auxiliary processes before scheduling relaunch.
                 _wait_for_auxiliary_processes()
-                success = _relaunch_detached(current_exe)
+                success = _relaunch_detached(current_exe, reopen_gui=True)
                 if not success:
                     # Relaunch failed — undo the shutdown signal so the watchdog keeps running
                     try:

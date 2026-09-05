@@ -177,18 +177,64 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
     return True
 
 
-def _relaunch_detached(current_exe: str) -> bool:
-    """Launch the replacement agent after the current Windows process exits."""
+def _is_gui_window_open() -> bool:
+    """Check if any SentinelAgent GUI window is currently open and visible on Windows."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        found = False
+
+        def enum_windows_callback(hwnd, _extra):
+            nonlocal found
+            if ctypes.windll.user32.IsWindowVisible(hwnd):
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    ctypes.windll.user32.GetWindowTextW(hwnd, buff, length + 1)
+                    title = buff.value.upper()
+                    if "ZEROWATCH SENTINEL AGENT" in title or "ZEROWATCH AGENT" in title:
+                        found = True
+                        return False
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        ctypes.windll.user32.EnumWindows(WNDENUMPROC(enum_windows_callback), 0)
+        return found
+    except Exception:
+        return False
+
+
+def _relaunch_detached(current_exe: str, reopen_gui: Optional[bool] = None) -> bool:
+    """Launch the replacement agent after the current Windows process exits.
+
+    Args:
+        current_exe: Absolute path to the executable to launch.
+        reopen_gui: If True, force GUI restart (visible window).
+                    If False, force headless daemon restart (--daemon).
+                    If None, auto-detect: restart GUI only if a GUI window is currently open.
+    """
+    if reopen_gui is None:
+        if "--daemon" in sys.argv[1:]:
+            reopen_gui = _is_gui_window_open()
+        else:
+            reopen_gui = _is_gui_window_open() or True
+
     if sys.platform != "win32":
         try:
+            launch_cmd = [current_exe]
+            if not reopen_gui and "--daemon" not in launch_cmd:
+                launch_cmd.append("--daemon")
             subprocess.Popen(
-                [current_exe],
+                launch_cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
                 close_fds=True,
             )
-            logger.info("[POSIX SWAP] Relaunched updated binary: %s", current_exe)
+            logger.info("[POSIX SWAP] Relaunched updated binary: %s (gui=%s)", current_exe, reopen_gui)
             return True
         except Exception as exc:
             logger.warning("[POSIX SWAP] Failed to relaunch updated binary: %s", exc)
@@ -208,27 +254,25 @@ def _relaunch_detached(current_exe: str) -> bool:
             target = current_exe
             launch_args = []
 
-        # A GUI restart must not inherit stale internal or installer flags.
-        # Preserve daemon mode because headless service restarts must remain
-        # headless; interactive restarts intentionally use normal routing.
-        if "--daemon" in sys.argv[1:]:
-            launch_args.append("--daemon")
+        if reopen_gui:
+            # Interactive GUI restart: show window normally without --daemon
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 1  # SW_SHOWNORMAL
+            creation_flags = detached | new_group
+        else:
+            # Headless daemon restart: enforce --daemon and keep hidden
+            if "--daemon" not in launch_args:
+                launch_args.append("--daemon")
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0  # SW_HIDE
+            creation_flags = detached | new_group | subprocess.CREATE_NO_WINDOW
 
         # Start the replacement directly instead of through PowerShell/cmd.
         # Its entry point waits on this PID before doing any agent work, so it
         # cannot race the old GUI, daemon, or watchdog shutdown.
         launch_args.extend(["--restart-wait-pid", str(os.getpid())])
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-        # Preserve headless behavior for daemon restarts, but restore normal
-        # window display for interactive GUI restarts.
-        if "--daemon" in launch_args:
-            si.wShowWindow = 0  # SW_HIDE
-            creation_flags = detached | new_group | subprocess.CREATE_NO_WINDOW
-        else:
-            si.wShowWindow = 1  # SW_SHOWNORMAL
-            creation_flags = detached | new_group
 
         child = subprocess.Popen(
             [target, *launch_args],
@@ -238,8 +282,8 @@ def _relaunch_detached(current_exe: str) -> bool:
             cwd=os.path.dirname(os.path.abspath(current_exe)) or None,
         )
         logger.info(
-            "[WIN SWAP] Started replacement PID %s; waiting for parent PID %s.",
-            child.pid, os.getpid(),
+            "[WIN SWAP] Started replacement PID %s (gui=%s); waiting for parent PID %s.",
+            child.pid, reopen_gui, os.getpid(),
         )
         return True
     except Exception as exc:
