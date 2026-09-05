@@ -5628,8 +5628,79 @@ def watchdog_process(target_exe_path):
                 base_dir = os.path.dirname(target_exe_path)
                 shutdown_file = _shutdown_signal_path(base_dir)
                 if os.path.exists(shutdown_file):
-                    logging.info("[WATCHDOG] Shutdown signal detected; exiting watchdog.")
-                    sys.exit(0)
+                    # Read the signal to check if it's an OTA restart
+                    shutdown_data = consume_shutdown_signal(base_dir)
+                    shutdown_reason = (shutdown_data or {}).get("reason", "") if isinstance(shutdown_data, dict) else ""
+                    if shutdown_reason == "ota-restart":
+                        logging.info("[WATCHDOG] OTA restart signal detected. Waiting for replacement agent...")
+                        # Fall through to OTA recovery below
+                    else:
+                        logging.info("[WATCHDOG] Shutdown signal detected (reason=%s); exiting watchdog.", shutdown_reason)
+                        sys.exit(0)
+                else:
+                    shutdown_reason = ""
+
+                # --- OTA Recovery ---
+                # If a .bak file exists OR we got an ota-restart signal, the agent
+                # is restarting for an OTA update. Wait for the replacement to
+                # acquire the daemon mutex. If it never starts, relaunch or rollback.
+                bak_path = target_exe_path + ".bak"
+                has_bak = os.path.exists(bak_path)
+                if has_bak or shutdown_reason == "ota-restart":
+                    logging.info(
+                        "[WATCHDOG] OTA update in progress (bak=%s, signal=%s). "
+                        "Waiting up to 5 minutes for replacement agent...",
+                        has_bak, shutdown_reason == "ota-restart",
+                    )
+                    replacement_started = False
+                    for _wait_tick in range(60):  # 60 × 5s = 5 minutes
+                        time.sleep(5)
+                        # Check if the replacement agent acquired a mutex
+                        for probe_name in (MUTEX_NAME, DAEMON_MUTEX_NAME):
+                            probe_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, probe_name)
+                            probe_err = ctypes.windll.kernel32.GetLastError()
+                            if probe_mutex:
+                                ctypes.windll.kernel32.CloseHandle(probe_mutex)
+                            if probe_err == 183:  # ERROR_ALREADY_EXISTS
+                                replacement_started = True
+                                break
+                        if replacement_started:
+                            break
+                        # Also check if a new shutdown signal appeared
+                        if os.path.exists(_shutdown_signal_path(base_dir)):
+                            logging.info("[WATCHDOG] Shutdown signal during OTA wait; exiting.")
+                            sys.exit(0)
+
+                    if replacement_started:
+                        logging.info("[WATCHDOG] Replacement agent started successfully. Exiting watchdog.")
+                        sys.exit(0)
+
+                    # Replacement never started — try to relaunch the current exe
+                    logging.warning("[WATCHDOG] Replacement agent did not start within 5 minutes. Attempting relaunch...")
+                    try:
+                        from common.os_replacer import _relaunch_detached
+                        if _relaunch_detached(target_exe_path, reopen_gui=False):
+                            logging.info("[WATCHDOG] Relaunched agent from current exe. Exiting watchdog.")
+                            sys.exit(0)
+                    except Exception as relaunch_exc:
+                        logging.error("[WATCHDOG] Relaunch failed: %s", relaunch_exc)
+
+                    # Relaunch failed — rollback from .bak if available
+                    if has_bak:
+                        logging.warning("[WATCHDOG] Relaunch failed. Rolling back from .bak...")
+                        try:
+                            import shutil
+                            shutil.copy2(bak_path, target_exe_path)
+                            logging.info("[WATCHDOG] Rolled back to previous version from .bak.")
+                            from common.os_replacer import _relaunch_detached
+                            if _relaunch_detached(target_exe_path, reopen_gui=False):
+                                logging.info("[WATCHDOG] Relaunched rolled-back agent. Exiting watchdog.")
+                                sys.exit(0)
+                        except Exception as rollback_exc:
+                            logging.critical("[WATCHDOG] Rollback also failed: %s. Manual recovery needed.", rollback_exc)
+
+                    logging.critical("[WATCHDOG] All OTA recovery attempts failed. Exiting.")
+                    sys.exit(1)
 
                 logging.info("[WATCHDOG] Main agent killed! Exiting watchdog (termination protection disabled).")
                 sys.exit(0)
@@ -6234,6 +6305,7 @@ def main_agent():
     while True:
         try:
             if ota_shutdown.is_set():
+                request_shutdown_signal(base_dir, "ota-restart")
                 logging.info("[OTA] Updated agent restart requested.")
                 break
             shutdown_request = consume_shutdown_signal(base_dir)
@@ -6276,6 +6348,7 @@ def main_agent():
                     break
                 # Also respect OTA update restart or shutdown signal mid-sleep
                 if ota_shutdown.is_set():
+                    request_shutdown_signal(base_dir, "ota-restart")
                     logging.info("[MAIN] OTA restart requested mid-sleep. Exiting heartbeat loop.")
                     shutdown_during_sleep = True
                     break
