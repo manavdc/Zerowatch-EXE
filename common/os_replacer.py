@@ -226,9 +226,9 @@ def _relaunch_detached(current_exe: str, reopen_gui: Optional[bool] = None) -> b
     """
     if reopen_gui is None:
         if "--daemon" in sys.argv[1:]:
-            reopen_gui = _is_gui_window_open()
+            reopen_gui = False
         else:
-            reopen_gui = _is_gui_window_open() or True
+            reopen_gui = _is_gui_window_open()
 
     if sys.platform != "win32":
         try:

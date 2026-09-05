@@ -2671,12 +2671,18 @@ def enforce_single_daemon_instance():
             logging.info("Another daemon instance is already running. Exiting silently.")
             sys.exit(0)
 
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, True, DAEMON_MUTEX_NAME)
-    last_err = ctypes.windll.kernel32.GetLastError()
-    if last_err == 183:  # ERROR_ALREADY_EXISTS
-        logging.info("Another daemon instance is already running. Exiting silently.")
-        sys.exit(0)
-    return mutex
+    start_wait = time.monotonic()
+    while True:
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, True, DAEMON_MUTEX_NAME)
+        last_err = ctypes.windll.kernel32.GetLastError()
+        if last_err != 183:  # Successfully acquired without collision
+            return mutex
+        if mutex:
+            ctypes.windll.kernel32.CloseHandle(mutex)
+        if time.monotonic() - start_wait >= 5.0:
+            logging.info("Another daemon instance is already running. Exiting silently.")
+            sys.exit(0)
+        time.sleep(0.5)
 
 
 # ============================================================================
@@ -6212,7 +6218,11 @@ def main_agent():
                             logging.warning("[MAIN] Error closing orchestrator: %s", _ce)
                     _orchestrator_closed_for_unlink = True
                     break
-                # Also respect shutdown signal mid-sleep
+                # Also respect OTA update restart or shutdown signal mid-sleep
+                if ota_shutdown.is_set():
+                    logging.info("[MAIN] OTA restart requested mid-sleep. Exiting heartbeat loop.")
+                    shutdown_during_sleep = True
+                    break
                 if consume_shutdown_signal(base_dir):
                     logging.info("[MAIN] Shutdown signal detected mid-sleep. Exiting.")
                     shutdown_during_sleep = True
@@ -8972,6 +8982,9 @@ def _wait_for_restart_parent() -> None:
             result = ctypes.windll.kernel32.WaitForSingleObject(parent, 30000)
             if result == WAIT_TIMEOUT:
                 logging.warning("[OTA] Timed out waiting for restart parent PID %s.", parent_pid)
+            else:
+                # Allow a brief moment for OS to clean up kernel handles and mutexes
+                time.sleep(0.5)
         finally:
             ctypes.windll.kernel32.CloseHandle(parent)
     except Exception as exc:
