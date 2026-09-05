@@ -301,6 +301,33 @@ def _relaunch_detached(current_exe: str, reopen_gui: Optional[bool] = None) -> b
         return False
 
 
+def _trigger_windows_daemon_task() -> bool:
+    """Ask the registered Windows supervisor to start the daemon.
+
+    A successful ``CreateProcess`` only means that Windows accepted the child;
+    it does not mean the child survived startup.  The scheduled task is an
+    independent launch path and is therefore used as a daemon-only fallback.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        result = subprocess.run(
+            ["schtasks", "/run", "/tn", "SentinelAgent"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            startupinfo=subprocess.STARTUPINFO(),
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode == 0:
+            logger.info("[WIN SWAP] Scheduled daemon task triggered.")
+            return True
+        logger.warning("[WIN SWAP] Scheduled daemon task failed: %s", result.stderr.strip())
+    except Exception as exc:
+        logger.warning("[WIN SWAP] Could not trigger scheduled daemon task: %s", exc)
+    return False
+
+
 def _swap_linux(new_binary: str, current_exe: str, zw_client=None) -> bool:
     """
     Linux POSIX atomic swap:

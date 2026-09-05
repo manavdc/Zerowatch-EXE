@@ -41,8 +41,15 @@ class DaemonOTAMonitor:
             from common.os_replacer import perform_update
             if perform_update(dest, self.current_exe):
                 if os.name == "nt":
-                    from common.os_replacer import _relaunch_detached
+                    from common.os_replacer import (
+                        _relaunch_detached,
+                        _trigger_windows_daemon_task,
+                    )
                     relaunched = _relaunch_detached(self.current_exe, reopen_gui=False)
+                    # Do not trust Popen alone: it can succeed even when the
+                    # child later exits during bootstrap.  The task is the
+                    # independent supervisor fallback for daemon updates.
+                    task_triggered = _trigger_windows_daemon_task()
                     if not relaunched:
                         # The old daemon must still exit after a successful
                         # swap.  This leaves the watchdog responsible for the
@@ -51,6 +58,11 @@ class DaemonOTAMonitor:
                         logger.error(
                             "[OTA] Windows replacement could not be launched; "
                             "requesting watchdog recovery."
+                        )
+                    if not task_triggered:
+                        logger.warning(
+                            "[OTA] Scheduled daemon fallback was unavailable; "
+                            "watchdog remains responsible for recovery."
                         )
                 logger.info("[OTA] Update applied; supervisor restart requested.")
                 self.shutdown_event.set()
