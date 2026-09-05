@@ -42,7 +42,7 @@ class DaemonOTAMonitor:
             if perform_update(dest, self.current_exe):
                 if os.name == "nt":
                     from common.os_replacer import _relaunch_detached
-                    if not _relaunch_detached(self.current_exe):
+                    if not _relaunch_detached(self.current_exe, reopen_gui=False):
                         raise RuntimeError("Windows replacement process could not be launched")
                 logger.info("[OTA] Update applied; supervisor restart requested.")
                 self.shutdown_event.set()
