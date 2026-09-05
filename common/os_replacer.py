@@ -207,6 +207,14 @@ def _is_gui_window_open() -> bool:
         return False
 
 
+def _clean_env():
+    """Remove Nuitka/PyInstaller-specific environment variables for safe subprocess launching."""
+    env = os.environ.copy()
+    for key in list(env.keys()):
+        if key.startswith("NUITKA_") or key.startswith("_MEIPASS") or key in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"]:
+            env.pop(key, None)
+    return env
+
 def _relaunch_detached(current_exe: str, reopen_gui: Optional[bool] = None) -> bool:
     """Launch the replacement agent after the current Windows process exits.
 
@@ -233,6 +241,7 @@ def _relaunch_detached(current_exe: str, reopen_gui: Optional[bool] = None) -> b
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
                 close_fds=True,
+                env=_clean_env(),
             )
             logger.info("[POSIX SWAP] Relaunched updated binary: %s (gui=%s)", current_exe, reopen_gui)
             return True
@@ -280,6 +289,7 @@ def _relaunch_detached(current_exe: str, reopen_gui: Optional[bool] = None) -> b
             startupinfo=si,
             close_fds=True,
             cwd=os.path.dirname(os.path.abspath(current_exe)) or None,
+            env=_clean_env(),
         )
         logger.info(
             "[WIN SWAP] Started replacement PID %s (gui=%s); waiting for parent PID %s.",
