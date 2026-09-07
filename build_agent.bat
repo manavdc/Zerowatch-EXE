@@ -221,10 +221,11 @@ if /I "%BUILD_STYLE%"=="onefile" (
     if not exist "!TCL_ROOT!\tcl8.6\init.tcl" if not exist "!TCL_ROOT!\init.tcl" (
         echo [WARN] Tcl library not found at standard path !TCL_ROOT!, relying on Nuitka tk-inter plugin auto-detection...
     )
-    rem Compress the outer onefile launcher so it does not retain a second
-    rem full, uncompressed runtime on disk. The shared cache still lets the
-    rem GUI, daemon, and watchdog reuse one extracted runtime.
-    set "STYLE_FLAGS=--onefile --onefile-no-compression --enable-plugin=tk-inter --onefile-tempdir-spec={CACHE_DIR}/ZeroWatch/extracted"
+    rem Use Nuitka's default per-process extraction directory
+    rem ({TEMP}/onefile_{PID}_{TIME}). A fixed extraction directory is unsafe
+    rem for OTA: the old and replacement onefile processes overlap briefly,
+    rem and the replacement can fail before Python reaches --restart-wait-pid.
+    set "STYLE_FLAGS=--onefile --onefile-no-compression --enable-plugin=tk-inter"
 ) else (
     set "STYLE_FLAGS=--standalone --enable-plugin=tk-inter"
 )

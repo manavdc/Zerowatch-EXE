@@ -72,7 +72,6 @@ jobs:
             --standalone ^
             --onefile ^
             --windows-console-mode=disable ^
-            --onefile-tempdir-spec={CACHE_DIR}/ZeroWatch/extracted ^
             --enable-plugin=tk-inter ^
             --output-dir=dist\windows ^
             --output-filename=SentinelAgent-windows-x64.exe ^

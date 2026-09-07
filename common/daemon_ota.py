@@ -46,10 +46,6 @@ class DaemonOTAMonitor:
                         _trigger_windows_daemon_task,
                     )
                     relaunched = _relaunch_detached(self.current_exe, reopen_gui=False)
-                    # Do not trust Popen alone: it can succeed even when the
-                    # child later exits during bootstrap.  The task is the
-                    # independent supervisor fallback for daemon updates.
-                    task_triggered = _trigger_windows_daemon_task()
                     if not relaunched:
                         # The old daemon must still exit after a successful
                         # swap.  This leaves the watchdog responsible for the
@@ -59,6 +55,16 @@ class DaemonOTAMonitor:
                             "[OTA] Windows replacement could not be launched; "
                             "requesting watchdog recovery."
                         )
+                        # Do not start the scheduled task in parallel with a
+                        # successful direct launch.  Two onefile launches at
+                        # the same time can create duplicate daemon/watchdog
+                        # trees and race state-file initialization.  Use the
+                        # registered task only when CreateProcess itself
+                        # failed; the existing watchdog handles a child that
+                        # later crashes during bootstrap.
+                        task_triggered = _trigger_windows_daemon_task()
+                    else:
+                        task_triggered = True
                     if not task_triggered:
                         logger.warning(
                             "[OTA] Scheduled daemon fallback was unavailable; "

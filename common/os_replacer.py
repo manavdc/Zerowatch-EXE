@@ -627,12 +627,12 @@ def startup_bak_cleanup(current_exe: str) -> None:
 
     This function runs entirely INSIDE the new agent's own process:
       1. Check if <current_exe>.bak exists (signals a pending update commit)
-      2. Start a daemon thread that waits 30 seconds (startup stability window)
-      3. If the agent is still running after 30 s → remove .bak safely
+      2. Remove the backup after the replacement process reaches Python
+         startup, which is the commit point for the swap.
 
-    No subprocess spawning. No extraction conflicts. No ghost processes.
-    If the agent crashes within 30 s, the daemon thread dies with the process
-    and .bak is preserved for manual recovery.
+    No subprocess spawning and no extra onefile extraction process is created.
+    If the replacement cannot reach Python startup, the .bak remains for the
+    watchdog rollback path.
 
     Args:
         current_exe: Absolute path to the running executable (from get_exe_path()).
