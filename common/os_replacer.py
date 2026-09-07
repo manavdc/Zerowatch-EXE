@@ -784,15 +784,20 @@ def startup_bak_cleanup(current_exe: str) -> None:
         ", ".join(backup_paths),
     )
 
-    # Reaching this function means the replacement process has started.  The
-    # first delete may race Windows releasing the old executable image, so do
-    # not block startup and do not require a GUI launch to retry it later.
-    threading.Thread(
-        target=_retry_commit_updates,
-        args=(backup_paths,),
-        name="post-update-backup-cleanup",
-        daemon=True,
-    ).start()
+    # Preserve the original behavior: make an immediate cleanup attempt when
+    # the replacement reaches Python startup.  If Windows is still releasing
+    # the old executable image, continue retrying in the running daemon so a
+    # GUI launch is never required as a second cleanup trigger.
+    pending_paths = [path for path in backup_paths if not _commit_update(path)]
+    if pending_paths:
+        threading.Thread(
+            target=_retry_commit_updates,
+            args=(pending_paths,),
+            name="post-update-backup-cleanup",
+            daemon=True,
+        ).start()
+    else:
+        logger.info("[OTA] Post-update backup cleanup complete.")
 
 
 def _rollback(
