@@ -273,6 +273,16 @@ def _get_state_dir() -> str:
     return local_dir
 
 
+def _inventory_scan_enabled() -> bool:
+    """Read the administrator-controlled inventory setting."""
+    path = os.path.join(_get_state_dir(), "inventory_scan_enabled")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip() != "0"
+    except OSError:
+        return True
+
+
 # ── Single-instance lock ───────────────────────────────────────────────
 
 _LOCK_FILE_PATH = "/Library/Application Support/ZeroWatch/state/.zerowatch.lock"
@@ -1084,6 +1094,13 @@ class MacOSAgent:
         The full-disk exhaustive walk is NOT run at startup.
         It runs on the existing 24h cadence via start_periodic_scans().
         """
+        if not _inventory_scan_enabled():
+            logger.info("Inventory scan disabled by administrator; skipping initial inventory upload.")
+            if approval_sync_claimed:
+                self._finish_approval_sync(False)
+            self._initial_scan_done.set()
+            return
+
         _SAFETY_TIMEOUT = 90
         startup_items = []
         scan_done = threading.Event()
@@ -1195,6 +1212,9 @@ class MacOSAgent:
 
             # ── Fast L0 delta (app bundles, pkgutil, Homebrew, etc.) ───────
             if now - last_l0_delta >= L0_INTERVAL:
+                if not _inventory_scan_enabled():
+                    self._shutdown_event.wait(timeout=5)
+                    continue
                 try:
                     added, removed = self._orchestrator.run_registry_delta()
                     if added or removed:
@@ -1258,8 +1278,11 @@ class MacOSAgent:
 
         # Start periodic filesystem scans (priority + deep) so macOS does a
         # true folder/file deep scan instead of only hardware/software inventory.
-        self._orchestrator.start_periodic_scans(on_delta=self._on_fs_delta)
-        logger.info("Periodic filesystem scan started (priority every 4h / deep every 24h).")
+        if _inventory_scan_enabled():
+            self._orchestrator.start_periodic_scans(on_delta=self._on_fs_delta)
+            logger.info("Periodic filesystem scan started (priority every 4h / deep every 24h).")
+        else:
+            logger.info("Periodic filesystem scan disabled by administrator.")
 
         ota_monitor = None
         try:

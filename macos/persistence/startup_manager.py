@@ -447,9 +447,53 @@ class MacOSPersistenceManager(PersistenceManager):
                 ["/usr/bin/osascript", "-e", script],
                 capture_output=True, text=True, timeout=60,
             )
-            return result.returncode == 0
+            if result.returncode == 0:
+                # Do not leave the fallback LaunchAgent running beside the
+                # newly authorized system LaunchDaemon.
+                try:
+                    _bootout_user(LAUNCHAGENT_PATH)
+                    if os.path.isfile(LAUNCHAGENT_PATH):
+                        os.remove(LAUNCHAGENT_PATH)
+                except OSError:
+                    pass
+                return True
+            return False
         except (OSError, subprocess.TimeoutExpired) as exc:
             logger.error("Authorized LaunchDaemon installation failed: %s", exc)
+            return False
+
+    def unregister_startup_authorized(self) -> bool:
+        """Remove the system LaunchDaemon through macOS admin authorization.
+
+        The GUI is intentionally running as the logged-in Aqua user, so a
+        plain ``os.remove``/``launchctl bootout`` would fail even when the
+        application was originally started with sudo.  Ask macOS for the
+        administrator authorization at the point where the setting changes.
+        """
+        script = (
+            'do shell script '
+            '"/bin/launchctl bootout system ' + PLIST_PATH + ' 2>/dev/null || true; '
+            '/bin/rm -f ' + PLIST_PATH + '" '
+            'with administrator privileges'
+        )
+        try:
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-e", script],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode == 0:
+                try:
+                    _bootout_user(LAUNCHAGENT_PATH)
+                    if os.path.isfile(LAUNCHAGENT_PATH):
+                        os.remove(LAUNCHAGENT_PATH)
+                except OSError:
+                    pass
+                logger.info("Authorized LaunchDaemon removal succeeded: %s", LAUNCHD_LABEL)
+                return True
+            logger.error("Authorized LaunchDaemon removal failed: %s", result.stderr.strip())
+            return False
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logger.error("Authorized LaunchDaemon removal failed: %s", exc)
             return False
 
     def unregister_startup(self) -> bool:

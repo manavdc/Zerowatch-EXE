@@ -449,6 +449,15 @@ def _state_path(base_dir, filename):
     return os.path.join(_secure_state_dir(base_dir), filename)
 
 
+def _make_macos_shared_file(path):
+    """Allow the root LaunchDaemon and console user to share state files."""
+    if sys.platform == "darwin":
+        try:
+            os.chmod(path, 0o666)
+        except OSError:
+            pass
+
+
 def _repair_state_file_acls():
     """Re-own state files so the current (non-elevated) user can write to them.
 
@@ -969,7 +978,18 @@ def _configure_logging():
         if IS_COMPILED or str(sys.argv[0]).endswith('.exe')
         else os.path.dirname(os.path.abspath(__file__))
     )
-    LOG_FILE = _state_path(early_base_dir, "sentinel_agent.log")
+    # The macOS GUI is re-launched into the logged-in user's Aqua session
+    # even when the wrapper was invoked with sudo. A root-owned shared log
+    # must not produce LoggingError tracebacks in the user process.
+    if sys.platform == "darwin":
+        macos_log_dir = os.path.expanduser("~/Library/Logs/ZeroWatch")
+        try:
+            os.makedirs(macos_log_dir, exist_ok=True)
+            LOG_FILE = os.path.join(macos_log_dir, "sentinel_agent.log")
+        except OSError:
+            LOG_FILE = os.path.join("/tmp", "ZeroWatch", "sentinel_agent.log")
+    else:
+        LOG_FILE = _state_path(early_base_dir, "sentinel_agent.log")
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
     root_logger.setLevel(logging.INFO)
@@ -1329,6 +1349,7 @@ class ZeroWatchClient:
                 os.fsync(f.fileno())
 
             os.replace(temp_path, self.join_state_file)
+            _make_macos_shared_file(self.join_state_file)
             self._protect_file(self.join_state_file)
 
             try:
@@ -1696,6 +1717,7 @@ class ZeroWatchClient:
             if encrypted:
                 with open(self.token_file, "wb") as f:
                     f.write(encrypted)
+                _make_macos_shared_file(self.token_file)
                 _append_gui_log(self.base_dir, f"Successfully saved JWT (size={len(encrypted)})")
                 self.jwt = jwt_str
                 # Also save to agent_token.enc for macOS/Linux daemon compatibility
@@ -2528,6 +2550,7 @@ class ZeroWatchClient:
             if encrypted:
                 with open(path, "wb") as f:
                     f.write(encrypted)
+                _make_macos_shared_file(path)
         except Exception:
             pass
 
@@ -2553,6 +2576,7 @@ class ZeroWatchClient:
             data_to_write = encrypted if encrypted else serialized
             with open(path, "wb") as f:
                 f.write(data_to_write)
+            _make_macos_shared_file(path)
         except Exception as e:
             logging.error(f"Failed to save asset info: {e}")
 
@@ -3892,6 +3916,13 @@ def unregister_windows_service():
         logging.warning(f"Service removal failed: {e}")
 
 def is_inventory_scan_enabled():
+    if sys.platform == "darwin":
+        path = os.path.join(_secure_state_dir(get_base_dir()), "inventory_scan_enabled")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return handle.read().strip() != "0"
+        except OSError:
+            return True
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Zerowatch\Agent", 0, winreg.KEY_READ)
@@ -3902,6 +3933,26 @@ def is_inventory_scan_enabled():
         return True # Default to True
 
 def set_inventory_scan_enabled(enabled):
+    if sys.platform == "darwin":
+        value = "1" if enabled else "0"
+        script = (
+            'do shell script "mkdir -p \'/Library/Application Support/ZeroWatch/state\'; '
+            'printf \'%s\' ' + value + ' > \'/Library/Application Support/ZeroWatch/state/inventory_scan_enabled\'; '
+            'chmod 644 \'/Library/Application Support/ZeroWatch/state/inventory_scan_enabled\'" '
+            'with administrator privileges'
+        )
+        try:
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-e", script],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode == 0:
+                logging.info("macOS inventory setting updated with administrator authorization: %s", value)
+                return True
+            logging.error("macOS inventory setting authorization failed: %s", result.stderr.strip())
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logging.error("macOS inventory setting authorization failed: %s", exc)
+        return False
     try:
         import winreg
         try:
@@ -3921,6 +3972,12 @@ def is_auto_start_enabled():
     Uses the canonical value name 'SentinelAgent' (matches register_startup_registry)
     and checks both HKLM and HKCU.
     """
+    if sys.platform == "darwin":
+        try:
+            from platforms import PlatformFactory
+            return PlatformFactory.create().persistence_manager.is_persistence_active()
+        except Exception:
+            return False
     if sys.platform != "win32":
         return True
 
@@ -3941,6 +3998,21 @@ def set_auto_start_enabled(enabled):
     so the registry value name ('SentinelAgent'), exe path resolution, and
     daemon arguments are always consistent.
     """
+    if sys.platform == "darwin":
+        try:
+            from platforms import PlatformFactory
+            manager = PlatformFactory.create().persistence_manager
+            if enabled:
+                result = manager.register_startup_authorized(
+                    get_exe_path(), daemon_args=["--daemon"]
+                )
+            else:
+                result = manager.unregister_startup_authorized()
+            logging.info("macOS LaunchDaemon setting updated with administrator authorization: %s", result)
+            return result
+        except Exception as exc:
+            logging.error("macOS LaunchDaemon authorization failed: %s", exc)
+            return False
     try:
         if enabled:
             register_startup_registry()
@@ -4390,6 +4462,7 @@ def _write_fingerprint_json(base_dir, payload):
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temp_path, path)
+    _make_macos_shared_file(path)
     try:
         subprocess.run(
             ["attrib", "+H", "+S", path],
@@ -4705,6 +4778,21 @@ def _relaunch_macos_gui_as_console_user() -> bool:
     except KeyError:
         logging.error("macOS GUI console user %r could not be resolved.", username)
         return False
+
+    # Use the administrator authority from sudo to install the system daemon
+    # before handing the visible GUI to the console user. This makes the
+    # background service independent of the GUI and avoids asking for admin
+    # authorization from Settings later.
+    try:
+        from platforms import PlatformFactory
+        manager = PlatformFactory.create().persistence_manager
+        if not manager.is_persistence_active():
+            if manager.register_startup(get_exe_path(), daemon_args=["--daemon"]):
+                logging.info("macOS sudo launch: installed system LaunchDaemon before GUI handoff")
+            else:
+                logging.warning("macOS sudo launch: could not install system LaunchDaemon")
+    except Exception as exc:
+        logging.warning("macOS sudo launch: LaunchDaemon setup failed: %s", exc)
 
     # In source mode argv[0] is the .py file and must be run by Python.  In a
     # Nuitka/PyInstaller build, argv[0] is the standalone executable.
@@ -5766,6 +5854,7 @@ def export_products_csv(base_dir, inventory):
         f.flush()
         os.fsync(f.fileno())
     os.replace(temp_path, filepath)
+    _make_macos_shared_file(filepath)
     try:
         subprocess.run(
             ["attrib", "+H", "+S", filepath],
@@ -6958,11 +7047,17 @@ class EnrollmentFrame(tk.Frame):
         self.show_screen("PENDING")
         self._start_polling()
 
-        # On Windows, spawn daemon immediately so that closing the GUI
-        # before approval does not leave the device silent.  On macOS,
-        # launchd owns the daemon lifecycle and spawning here causes
-        # competing orphan processes.
-        if sys.platform != "darwin":
+        # Pending enrollment must be owned by a process independent of Tk.
+        # macOS previously skipped this branch while deferring launchd
+        # registration until approval; closing the GUI then killed the only
+        # approval poller. The bootstrap is idempotent and uses the system
+        # LaunchDaemon when available, otherwise a user LaunchAgent.
+        if sys.platform == "darwin":
+            try:
+                _auto_bootstrap_background_agent()
+            except Exception as exc:
+                logging.warning("[GUI] macOS pending-state daemon bootstrap failed: %s", exc)
+        else:
             try:
                 with _daemon_spawn_lock:
                     if not _is_daemon_running():
@@ -7545,7 +7640,8 @@ class DashboardFrame(tk.Frame):
         header.pack(fill=tk.X, pady=(0, 12))
         tk.Label(header, text="SETTINGS", fg=self.c_white, bg=self.c_bg_base, font=("Arial", 22, "bold")).pack(side=tk.LEFT)
         
-        desc = tk.Label(parent_frame, text="Configure how this device operates. Changes require administrator privileges.", fg=self.c_gray, bg=self.c_bg_base, font=self.f_normal, justify=tk.LEFT)
+        settings_description = "Configure how this device operates. Changes require administrator privileges."
+        desc = tk.Label(parent_frame, text=settings_description, fg=self.c_gray, bg=self.c_bg_base, font=self.f_normal, justify=tk.LEFT)
         desc.pack(anchor="w", pady=(0, 24))
         
         container = tk.Frame(parent_frame, bg=self.c_bg_base)
@@ -7593,18 +7689,17 @@ class DashboardFrame(tk.Frame):
         
         inventory_enabled = tk.BooleanVar()
         inventory_enabled.set(is_inventory_scan_enabled())
-            
+
         def toggle_inventory():
             enabled = inventory_enabled.get()
-            set_inventory_scan_enabled(enabled)
-            if enabled:
-                show_windows_notification("Zerowatch", "Sentinel Agent running in Background")
-            else:
-                show_windows_notification("Zerowatch", "Sentinel Agent stopped scanning")
-                
+            setting_ok = set_inventory_scan_enabled(enabled)
+            if sys.platform == "darwin" and not setting_ok:
+                inventory_enabled.set(not enabled)
+                from tkinter import messagebox
+                messagebox.showerror("Administrator Authorization Required", "An administrator must authorize this inventory setting change.")
+
         make_toggle(top, inventory_enabled, toggle_inventory).pack(side=tk.RIGHT)
-        
-        tk.Label(card, text="Automatically scan and collect hardware and software inventory.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
+        tk.Label(card, text="Automatically scan and collect hardware and software inventory. Administrator authorization is required on macOS.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
         
         card2 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=24, pady=18)
         card2.pack(fill=tk.X, pady=(0, 10))
@@ -7615,18 +7710,17 @@ class DashboardFrame(tk.Frame):
         
         auto_start_enabled = tk.BooleanVar()
         auto_start_enabled.set(is_auto_start_enabled())
-            
+
         def toggle_auto_start():
             enabled = auto_start_enabled.get()
-            set_auto_start_enabled(enabled)
-            if enabled:
-                show_windows_notification("Zerowatch", "Agent will now auto start on boot")
-            else:
-                show_windows_notification("Zerowatch", "Auto start on boot disabled")
-                
+            setting_ok = set_auto_start_enabled(enabled)
+            if sys.platform == "darwin" and not setting_ok:
+                auto_start_enabled.set(not enabled)
+                from tkinter import messagebox
+                messagebox.showerror("Administrator Authorization Required", "An administrator must authorize this launchd setting change.")
+
         make_toggle(top2, auto_start_enabled, toggle_auto_start).pack(side=tk.RIGHT)
-        
-        tk.Label(card2, text="Automatically start the agent when the computer boots.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
+        tk.Label(card2, text="Automatically start the agent through launchd. Administrator authorization is required on macOS.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
 
         card3 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=24, pady=18)
         card3.pack(fill=tk.X, pady=(0, 10))
@@ -9043,11 +9137,22 @@ def run_interactive():
         
         if is_enrolled_locally:
             logging.info("Startup: Device enrolled locally. Verifying with server (2s timeout)...")
-            # Perform a quick synchronous check to see if we should auto-reset
-            verify_res = zw_client.refresh_join_status_once() # This has a timeout
+            # macOS approval is already represented by the authenticated JWT.
+            # Re-querying join-status during GUI startup can return a transient
+            # non-approved response after the request has been consumed and
+            # incorrectly wipe valid local state (as seen in the attached
+            # logs). Verify the authenticated device instead; only an explicit
+            # unlink response is destructive. Keep the old join-status check
+            # unchanged for Windows/Linux.
+            if sys.platform == "darwin" and zw_client.jwt:
+                verify_res = {"status": zw_client.heartbeat()}
+            else:
+                verify_res = zw_client.refresh_join_status_once() # This has a timeout
             
             # If server explicitly says we are NOT approved, wipe and show enrollment
-            if verify_res.get("status") in {"denied", "unlinked"}:
+            if verify_res.get("status") == "unlinked" or (
+                sys.platform != "darwin" and verify_res.get("status") == "denied"
+            ):
                 logging.info("Startup: Server rejected enrollment. Wiping local state.")
                 zw_client.clear_local_state()
                 is_enrolled_locally = False
