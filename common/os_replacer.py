@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import base64
+import ctypes
 import os
 import shutil
 import stat
@@ -53,6 +54,10 @@ _LINUX_SERVICE_NAME = "zerowatch-agent.service"
 # macOS: launchd label (macos/persistence/startup_manager.py line 66)
 _MACOS_LAUNCHD_LABEL = "io.deepcytes.zerowatch.agent"
 _MACOS_PLIST_PATH    = f"/Library/LaunchDaemons/{_MACOS_LAUNCHD_LABEL}.plist"
+_MACOS_LAUNCHAGENT_LABEL = "io.deepcytes.zerowatch.agent.user"
+_MACOS_LAUNCHAGENT_PLIST = os.path.expanduser(
+    "~/Library/LaunchAgents/io.deepcytes.zerowatch.agent.user.plist"
+)
 
 # Watchdog: window within which the updated agent must prove liveness
 WATCHDOG_TIMEOUT_SECS: int = 120
@@ -498,10 +503,80 @@ def _swap_macos(new_binary: str, current_exe: str, zw_client=None) -> bool:
             return True
         raise SwapError(f"os.replace failed: {exc}") from exc
 
+    # Keep the backup until the replacement has authenticated and sent a
+    # heartbeat.  The new process commits it after that health check.
+    pending_path = current_exe + ".ota-pending"
+    try:
+        with open(pending_path, "w", encoding="utf-8") as marker:
+            marker.write(str(time.time()))
+        os.chmod(pending_path, 0o644)
+    except OSError as exc:
+        logger.error("[MACOS SWAP] Could not create OTA health marker: %s", exc)
+        _restore_macos_backup(current_exe, bak_path)
+        raise SwapError(f"Could not create OTA health marker: {exc}") from exc
+
     # 6. Kick launchd — the new agent will call startup_bak_cleanup()
-    _launchctl_kickstart()
+    if not _launchctl_kickstart():
+        _restore_macos_backup(current_exe, bak_path)
+        raise SwapError("macOS launchd restart failed after binary replacement")
 
     return True
+
+
+def _restore_macos_backup(current_exe: str, bak_path: str) -> bool:
+    """Restore a failed macOS update and remove its health marker."""
+    try:
+        if os.path.exists(bak_path):
+            os.replace(bak_path, current_exe)
+        try:
+            os.remove(current_exe + ".ota-pending")
+        except FileNotFoundError:
+            pass
+        logger.warning("[MACOS OTA] Previous binary restored: %s", current_exe)
+        return True
+    except OSError as exc:
+        logger.critical("[MACOS OTA] Rollback failed: %s", exc)
+        return False
+
+
+def recover_macos_update(current_exe: str, timeout_seconds: int = WATCHDOG_TIMEOUT_SECS) -> bool:
+    """Rollback an update whose replacement never became healthy.
+
+    Called before normal macOS startup.  A marker younger than the health
+    window is left in place while launchd retries the replacement process.
+    Once the window expires, the previous binary is restored and launchd can
+    start it on the next cycle.
+    """
+    if sys.platform != "darwin":
+        return False
+    marker = current_exe + ".ota-pending"
+    backup = current_exe + ".bak"
+    if not (os.path.exists(marker) and os.path.exists(backup)):
+        return False
+    try:
+        age = max(0.0, time.time() - os.path.getmtime(marker))
+    except OSError:
+        return False
+    if age < timeout_seconds:
+        return False
+    return _restore_macos_backup(current_exe, backup)
+
+
+def commit_macos_update(current_exe: str) -> bool:
+    """Commit a macOS update after authenticated heartbeat succeeds."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        for path in (current_exe + ".bak", current_exe + ".ota-pending"):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        logger.info("[MACOS OTA] Health check passed; update committed.")
+        return True
+    except OSError as exc:
+        logger.warning("[MACOS OTA] Could not commit update: %s", exc)
+        return False
 
 
 def _authorized_replace_macos(new_binary: str, current_exe: str, bak_path: str) -> bool:
@@ -512,7 +587,8 @@ def _authorized_replace_macos(new_binary: str, current_exe: str, bak_path: str) 
         f"/bin/cp {shlex.quote(current_exe)} {shlex.quote(bak_path)}; "
         f"/bin/cp {shlex.quote(new_binary)} {shlex.quote(current_exe)}; "
         f"/bin/chmod 755 {shlex.quote(current_exe)}; "
-        f"/bin/rm -f {shlex.quote(new_binary)} {shlex.quote(bak_path)}"
+        # Keep the backup until the replacement heartbeat commits it.
+        f"/bin/rm -f {shlex.quote(new_binary)}"
     )
     encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
     script = ('do shell script "echo ' + encoded +
@@ -576,38 +652,76 @@ def _launchctl_kickstart() -> bool:
     if shutil.which("launchctl") is None:
         logger.warning("[MACOS SWAP] launchctl not found.")
         return False
-    try:
-        result = subprocess.run(
-            ["launchctl", "kickstart", "-k",
-             f"system/{_MACOS_LAUNCHD_LABEL}"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            logger.info("[MACOS SWAP] launchctl kickstart succeeded.")
-            return True
-        logger.warning(
-            "[MACOS SWAP] launchctl kickstart returned rc=%d: %s",
-            result.returncode, result.stderr.strip()
-        )
-        return False
-    except Exception as exc:
-        logger.warning("[MACOS SWAP] launchctl error: %s", exc)
-        return False
-
-
+    if os.path.isfile(_MACOS_PLIST_PATH):
+        domains = [f"system/{_MACOS_LAUNCHD_LABEL}"]
+    else:
+        uid = os.getuid()
+        domains = [
+            f"gui/{uid}/{_MACOS_LAUNCHAGENT_LABEL}",
+            f"user/{uid}/{_MACOS_LAUNCHAGENT_LABEL}",
+        ]
+    for service in domains:
+        try:
+            result = subprocess.run(
+                ["launchctl", "kickstart", "-k", service],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                logger.info("[MACOS SWAP] launchctl kickstart succeeded: %s", service)
+                return True
+            logger.warning(
+                "[MACOS SWAP] launchctl kickstart returned rc=%d for %s: %s",
+                result.returncode, service, result.stderr.strip()
+            )
+        except Exception as exc:
+            logger.warning("[MACOS SWAP] launchctl error for %s: %s", service, exc)
+    return False
 # ---------------------------------------------------------------------------
 # Startup: post-update .bak cleanup (called by the newly started agent)
 # ---------------------------------------------------------------------------
 
 
-def _commit_update(bak_path: str) -> None:
-    """Remove the .bak file to commit the successful update."""
+def _commit_update(bak_path: str) -> bool:
+    """Remove the .bak file to commit the successful update.
+
+    Windows can briefly keep the renamed image open while the old onefile
+    process is shutting down.  Treat that as a retryable condition rather
+    than losing the cleanup opportunity forever.
+    """
+    if not os.path.exists(bak_path):
+        return True
     try:
-        if os.path.exists(bak_path):
-            os.remove(bak_path)
-            logger.info("[OTA] .bak removed: %s — update committed.", bak_path)
+        if sys.platform == "win32":
+            # A stale read-only/hidden/system attribute must not prevent the
+            # daemon from committing an otherwise successful update.
+            try:
+                ctypes.windll.kernel32.SetFileAttributesW(bak_path, 0x80)  # NORMAL
+            except Exception:
+                pass
+        os.remove(bak_path)
+        logger.info("[OTA] .bak removed: %s — update committed.", bak_path)
+        return True
     except OSError as exc:
         logger.warning("[OTA] Failed to remove .bak: %s", exc)
+        return False
+
+
+def _retry_commit_updates(backup_paths: list[str], attempts: int = 24,
+                          interval_seconds: float = 5.0) -> None:
+    """Retry backup cleanup without delaying daemon startup."""
+    pending = list(backup_paths)
+    for attempt in range(attempts):
+        pending = [path for path in pending if not _commit_update(path)]
+        if not pending:
+            logger.info("[OTA] Post-update backup cleanup complete.")
+            return
+        if attempt + 1 < attempts:
+            time.sleep(interval_seconds)
+    logger.error(
+        "[OTA] Could not remove post-update backup(s) after %.0f seconds: %s",
+        max(0, attempts - 1) * interval_seconds,
+        ", ".join(pending),
+    )
 
 
 def startup_bak_cleanup(current_exe: str) -> None:
@@ -637,6 +751,16 @@ def startup_bak_cleanup(current_exe: str) -> None:
     Args:
         current_exe: Absolute path to the running executable (from get_exe_path()).
     """
+    if sys.platform == "darwin":
+        # macOS commits only after the replacement has authenticated and sent
+        # a heartbeat.  Do not delete the backup merely because Python
+        # started; a replacement can still fail during daemon initialization.
+        if recover_macos_update(current_exe):
+            # Let launchd restart the restored binary instead of continuing
+            # execution from the failed replacement image.
+            raise SystemExit(0)
+        return
+
     bak_path = current_exe + ".bak"
     backup_paths = [bak_path]
     if sys.platform == "win32":
@@ -660,11 +784,15 @@ def startup_bak_cleanup(current_exe: str) -> None:
         ", ".join(backup_paths),
     )
 
-    # Reaching this function means the replacement process has started. Remove
-    # the backup now so successful updates never leave a .bak artifact behind.
-    for backup_path in backup_paths:
-        _commit_update(backup_path)
-    logger.info("[OTA] Post-update cleanup complete.")
+    # Reaching this function means the replacement process has started.  The
+    # first delete may race Windows releasing the old executable image, so do
+    # not block startup and do not require a GUI launch to retry it later.
+    threading.Thread(
+        target=_retry_commit_updates,
+        args=(backup_paths,),
+        name="post-update-backup-cleanup",
+        daemon=True,
+    ).start()
 
 
 def _rollback(

@@ -69,6 +69,7 @@ from platforms import PlatformFactory
 from scanner import ScanOrchestrator
 from common.daemon_ota import start_daemon_ota_monitor
 from common.state_cleanup import clear_device_state
+from common.os_replacer import commit_macos_update
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT CONFIGURATION
@@ -1253,6 +1254,8 @@ class MacOSAgent:
         logger.info("Sending immediate post-enrollment heartbeat...")
         heartbeat_ok = self._heartbeat()
         logger.info("Immediate post-enrollment heartbeat %s.", "succeeded" if heartbeat_ok else "failed")
+        if heartbeat_ok:
+            commit_macos_update(os.path.abspath(sys.argv[0]))
         monitor = threading.Thread(
             target=self._monitor_loop,
             daemon=True,
