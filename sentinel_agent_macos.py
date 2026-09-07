@@ -95,7 +95,8 @@ else:
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
         "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
-        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4="
+        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
+        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="
     ],
     "zerowatch-testing.eastasia.cloudapp.azure.com": [
         "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",
