@@ -338,6 +338,64 @@ def _trigger_windows_daemon_task() -> bool:
     return False
 
 
+def _terminate_stale_windows_watchdogs(current_exe: str) -> int:
+    """Stop stale SentinelAgent watchdogs holding a previous .bak image.
+
+    The watchdog is intentionally launched as a separate copy of the onefile
+    executable.  After an OTA rename, that copy can continue running from the
+    old image and keep ``.bak`` open.  Only processes whose command line
+    contains both our executable path and ``--watchdog`` are targeted; the
+    daemon and GUI are never selected.
+    """
+    if sys.platform != "win32":
+        return 0
+    try:
+        powershell = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"),
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+        )
+        if not os.path.isfile(powershell):
+            powershell = "powershell.exe"
+        target = os.path.abspath(current_exe).replace("'", "''")
+        script = f"""
+$target = '{target}'
+$targetBak = $target + '.bak'
+$agentPid = {os.getpid()}
+$matches = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {{
+    $_.ProcessId -ne $agentPid -and
+    $_.CommandLine -and
+    $_.CommandLine -match '(?i)--watchdog' -and
+    ($_.CommandLine -like ('*' + $target + '*') -or $_.CommandLine -like ('*' + $targetBak + '*'))
+}})
+foreach ($process in $matches) {{
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+}}
+Write-Output $matches.Count
+"""
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+             "-EncodedCommand", encoded],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode != 0:
+            logger.warning("[OTA] Stale watchdog cleanup failed: %s", result.stderr.strip())
+            return 0
+        try:
+            count = int((result.stdout or "0").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            count = 0
+        if count:
+            logger.warning("[OTA] Terminated %d stale watchdog process(es) holding the old image.", count)
+        return count
+    except Exception as exc:
+        logger.warning("[OTA] Could not inspect stale watchdog processes: %s", exc)
+        return 0
+
+
 def _swap_linux(new_binary: str, current_exe: str, zw_client=None) -> bool:
     """
     Linux POSIX atomic swap:

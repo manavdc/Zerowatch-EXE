@@ -6570,8 +6570,20 @@ def main_agent():
                     if now - last_update_cleanup_check >= 30:
                         last_update_cleanup_check = now
                         try:
-                            from common.os_replacer import startup_bak_cleanup
-                            startup_bak_cleanup(get_exe_path())
+                            current_exe = get_exe_path()
+                            bak_path = current_exe + ".bak"
+                            from common.os_replacer import (
+                                _terminate_stale_windows_watchdogs,
+                                startup_bak_cleanup,
+                            )
+                            if sys.platform == "win32" and os.path.exists(bak_path):
+                                stale_watchdogs = _terminate_stale_windows_watchdogs(current_exe)
+                                if stale_watchdogs and not skip_watchdog:
+                                    # Restore exactly one watchdog after the
+                                    # old image has been released.
+                                    time.sleep(1)
+                                    spawn_watchdog()
+                            startup_bak_cleanup(current_exe)
                         except Exception as cleanup_exc:
                             logging.debug("[OTA] Deferred .bak cleanup skipped: %s", cleanup_exc)
 
