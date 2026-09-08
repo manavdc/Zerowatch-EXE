@@ -481,6 +481,25 @@ def _repair_state_file_acls():
         if not os.path.isdir(state_dir):
             return
 
+        # The state directory is deliberately shared by the elevated and
+        # normal-user agent.  Repair the directory ACL first; otherwise a
+        # normal-user process may be unable to replace an elevated-created
+        # file even if it can read it.
+        try:
+            shared_users = "*S-1-5-32-545:(OI)(CI)M"  # BUILTIN\\Users
+            subprocess.run(
+                ["icacls", state_dir, "/inheritance:e",
+                 "/grant:r", shared_users,
+                 "/grant:r", "*S-1-5-18:(OI)(CI)F",
+                 "/grant:r", "*S-1-5-32-544:(OI)(CI)F",
+                 "/T", "/C"],
+                capture_output=True, text=True, timeout=10,
+                startupinfo=_windows_hidden_startupinfo(),
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception as acl_exc:
+            logging.debug("[ACL] Shared state ACL refresh unavailable: %s", acl_exc)
+
         repaired = []
         for entry in os.listdir(state_dir):
             fpath = os.path.join(state_dir, entry)
@@ -1289,7 +1308,10 @@ class ZeroWatchClient:
     def _build_join_state(self, status, team_code=None, request_id=None, team_id=None, team_name=None,
                           organization_name=None, region_name=None, branch_name=None, plan_type=None,
                           approval_sync_status=None, approval_sync_request_id=None):
-        existing = self.join_state if isinstance(self.join_state, dict) else {}
+        # The GUI and daemon are separate processes and both can update this
+        # file.  Prefer the latest on-disk state so a stale GUI object cannot
+        # erase a daemon's approval-sync claim (or completion marker).
+        existing = self._load_join_state() or {}
         if str(status or "").strip().lower() == "approved":
             if approval_sync_status is None:
                 approval_sync_status = existing.get("approvalSyncStatus")
@@ -1474,6 +1496,15 @@ class ZeroWatchClient:
             request_id = data.get("requestId") or current_state.get("requestId")
 
             if status == "approved":
+                # Keep the in-memory view aligned with the state we just read.
+                # This matters when the GUI and daemon observe approval at
+                # nearly the same time.
+                self.join_state = current_state
+                previous_request_id = current_state.get("requestId")
+                request_changed = bool(
+                    request_id and previous_request_id and
+                    str(request_id) != str(previous_request_id)
+                )
                 if data.get("jwt"):
                     self._save_jwt(data.get("jwt"))
                 self._save_join_state(
@@ -1486,6 +1517,10 @@ class ZeroWatchClient:
                     region_name=data.get("regionName") or current_state.get("regionName"),
                     branch_name=data.get("branchName") or current_state.get("branchName"),
                     plan_type=data.get("planType") or current_state.get("planType"),
+                    # A different request is a new approval event and must
+                    # receive a new initial inventory sync.
+                    approval_sync_status=None if request_changed else current_state.get("approvalSyncStatus"),
+                    approval_sync_request_id=None if request_changed else current_state.get("approvalSyncRequestId"),
                 )
                 self._update_team_info_from_payload(data)
                 return {"status": "approved", "jwt": data.get("jwt")}
@@ -2069,13 +2104,13 @@ class ZeroWatchClient:
         return {"flushed": flushed, "pending": len(remaining), "attempted": attempted}
 
     def _protect_file(self, filepath):
-        """Sets restrictive ACL on a file so only current user, SYSTEM and Administrators can access."""
+        """Protect a shared state file while keeping elevated/user launches compatible."""
         try:
             subprocess.run(
-                ["icacls", filepath, "/inheritance:r",
-                 "/grant:r", f"{os.environ.get('USERNAME', 'SYSTEM')}:(R,W)",
-                 "/grant:r", "SYSTEM:(F)",
-                 "/grant:r", "Administrators:(F)"],
+                ["icacls", filepath, "/inheritance:e",
+                 "/grant:r", "*S-1-5-32-545:(M)",  # BUILTIN\\Users
+                 "/grant:r", "*S-1-5-18:(F)",       # LOCAL SYSTEM
+                 "/grant:r", "*S-1-5-32-544:(F)"],  # Administrators
                 capture_output=True, text=True, timeout=5,
                 startupinfo=_windows_hidden_startupinfo(),
                 creationflags=subprocess.CREATE_NO_WINDOW
@@ -2191,11 +2226,13 @@ class ZeroWatchClient:
 
     def approval_sync_complete(self):
         state = self._load_join_state()
+        request_id = state.get("requestId") if isinstance(state, dict) else None
         return (
             isinstance(state, dict)
             and str(state.get("status")).lower() == "approved"
             and state.get("approvalSyncStatus") == "complete"
-            and state.get("approvalSyncRequestId")
+            and request_id
+            and state.get("approvalSyncRequestId") == request_id
         )
 
     def finish_approval_sync(self, success):
@@ -4457,11 +4494,23 @@ def _write_fingerprint_json(base_dir, payload):
     encrypted = encrypt_data(serialized)
     data_to_write = encrypted if encrypted else serialized
     temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
-    with open(temp_path, "wb") as handle:
-        handle.write(data_to_write)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp_path, path)
+    try:
+        with open(temp_path, "wb") as handle:
+            handle.write(data_to_write)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except PermissionError as exc:
+        # A legacy elevated installation may still have an old ACL on this
+        # file.  Do not prevent the daemon/GUI from starting with the valid
+        # existing fingerprint; the elevated ACL repair path will fix it.
+        logging.warning("[ACL] Could not replace fingerprint file %s: %s", path, exc)
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        return False
     _make_macos_shared_file(path)
     try:
         subprocess.run(
@@ -4474,6 +4523,7 @@ def _write_fingerprint_json(base_dir, payload):
         )
     except Exception:
         pass
+    return True
 
 
 def _save_identity_to_fingerprint(base_dir, username=None, asset_name=None, hostname=None, organization_name=None):
@@ -5825,8 +5875,10 @@ def export_fingerprint_json(base_dir, fingerprint, username=None, asset_name=Non
         payload["organization_name"] = _sanitize_organization_name(organization_name)
     payload["identity_updated_at"] = datetime.datetime.now().isoformat()
     filepath = _fingerprint_json_path(base_dir)
-    _write_fingerprint_json(base_dir, payload)
-    logging.info(f"Fingerprint saved: {filepath}")
+    if _write_fingerprint_json(base_dir, payload):
+        logging.info(f"Fingerprint saved: {filepath}")
+    else:
+        logging.warning("Fingerprint metadata was not updated; existing fingerprint retained: %s", filepath)
 
 def export_products_csv(base_dir, inventory):
     """Exports the full inventory to products.csv."""
@@ -8847,12 +8899,13 @@ class UnifiedSentinelGUI(tk.Tk):
     def _on_window_close(self):
         """Called when user clicks 'X' button to close the GUI window (Windows/Linux only)."""
         try:
-            # If enrollment is pending or already enrolled, guarantee background daemon is running
+            # If enrollment is pending or already enrolled, guarantee the
+            # background daemon is running through the same idempotent path
+            # used by approval notifications and startup repair.
             if self.zw_client and (self.zw_client.has_pending_join() or self.zw_client.is_enrolled()):
-                if not _is_daemon_running():
-                    _spawn_daemon_process()
-        except Exception:
-            pass
+                _auto_bootstrap_background_agent()
+        except Exception as exc:
+            logging.warning("Background daemon bootstrap on GUI close failed: %s", exc)
         self.destroy()
 
     def _bring_to_front(self):
