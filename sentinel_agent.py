@@ -6394,6 +6394,7 @@ def main_agent():
     last_heartbeat = 0
     last_watchdog_check = 0
     last_asset_poll = 0
+    last_update_cleanup_check = 0
     was_offline = False
 
     pin_mismatch_backoff_idx = 0
@@ -6560,6 +6561,20 @@ def main_agent():
                 elif result is True:
                     logging.info("[HEARTBEAT] Success (status=%s).", zw_client.last_server_status)
                     pin_mismatch_backoff_idx = 0
+
+                    # The old OTA watchdog is launched from the renamed
+                    # .bak image and may release that file only after it sees
+                    # this replacement daemon alive.  Retry the commit after
+                    # a real heartbeat so cleanup does not depend on opening
+                    # the GUI later.
+                    if now - last_update_cleanup_check >= 30:
+                        last_update_cleanup_check = now
+                        try:
+                            from common.os_replacer import startup_bak_cleanup
+                            startup_bak_cleanup(get_exe_path())
+                        except Exception as cleanup_exc:
+                            logging.debug("[OTA] Deferred .bak cleanup skipped: %s", cleanup_exc)
+
                     if was_offline:
                         was_offline = False
                         logging.info("[ONLINE] Reconnected to backend.")

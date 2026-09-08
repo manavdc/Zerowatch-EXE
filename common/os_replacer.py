@@ -65,6 +65,11 @@ WATCHDOG_TIMEOUT_SECS: int = 120
 # Heartbeat validation poll interval inside watchdog
 _WATCHDOG_POLL_SECS: int = 10
 
+# Prevent repeated heartbeat checks from creating multiple cleanup workers
+# while Windows still has the old executable image open.
+_BACKUP_CLEANUP_LOCK = threading.Lock()
+_BACKUP_CLEANUP_ACTIVE = False
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -709,19 +714,24 @@ def _commit_update(bak_path: str) -> bool:
 def _retry_commit_updates(backup_paths: list[str], attempts: int = 24,
                           interval_seconds: float = 5.0) -> None:
     """Retry backup cleanup without delaying daemon startup."""
+    global _BACKUP_CLEANUP_ACTIVE
     pending = list(backup_paths)
-    for attempt in range(attempts):
-        pending = [path for path in pending if not _commit_update(path)]
-        if not pending:
-            logger.info("[OTA] Post-update backup cleanup complete.")
-            return
-        if attempt + 1 < attempts:
-            time.sleep(interval_seconds)
-    logger.error(
-        "[OTA] Could not remove post-update backup(s) after %.0f seconds: %s",
-        max(0, attempts - 1) * interval_seconds,
-        ", ".join(pending),
-    )
+    try:
+        for attempt in range(attempts):
+            pending = [path for path in pending if not _commit_update(path)]
+            if not pending:
+                logger.info("[OTA] Post-update backup cleanup complete.")
+                return
+            if attempt + 1 < attempts:
+                time.sleep(interval_seconds)
+        logger.error(
+            "[OTA] Could not remove post-update backup(s) after %.0f seconds: %s",
+            max(0, attempts - 1) * interval_seconds,
+            ", ".join(pending),
+        )
+    finally:
+        with _BACKUP_CLEANUP_LOCK:
+            _BACKUP_CLEANUP_ACTIVE = False
 
 
 def startup_bak_cleanup(current_exe: str) -> None:
@@ -790,12 +800,16 @@ def startup_bak_cleanup(current_exe: str) -> None:
     # GUI launch is never required as a second cleanup trigger.
     pending_paths = [path for path in backup_paths if not _commit_update(path)]
     if pending_paths:
-        threading.Thread(
-            target=_retry_commit_updates,
-            args=(pending_paths,),
-            name="post-update-backup-cleanup",
-            daemon=True,
-        ).start()
+        global _BACKUP_CLEANUP_ACTIVE
+        with _BACKUP_CLEANUP_LOCK:
+            if not _BACKUP_CLEANUP_ACTIVE:
+                _BACKUP_CLEANUP_ACTIVE = True
+                threading.Thread(
+                    target=_retry_commit_updates,
+                    args=(pending_paths,),
+                    name="post-update-backup-cleanup",
+                    daemon=True,
+                ).start()
     else:
         logger.info("[OTA] Post-update backup cleanup complete.")
 
