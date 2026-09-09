@@ -879,6 +879,22 @@ def encrypt_data(data_bytes, purpose="default"):
     if sys.platform == "win32":
         return _windows_dpapi_encrypt(data_bytes)
 
+    # macOS enrollment state is shared by a console user and a root
+    # LaunchDaemon.  A normal user cannot write /Library/Keychains/System.keychain
+    # (SecItemAdd returns errSecWrPerm / OSStatus(-61)); trying to use that
+    # keychain for every JSON state update caused the repeated error storm in
+    # the logs.  State files already carry an HMAC/checksum, so keep this
+    # cross-UID coordination data in the shared state directory.  JWT handling
+    # remains on the native Keychain path for the root daemon; the unprivileged
+    # GUI uses the explicit RAW envelope until the daemon has taken ownership.
+    if sys.platform == "darwin" and (
+        purpose != "jwt"
+        or not hasattr(os, "geteuid")
+        or os.geteuid() != 0
+    ):
+        import base64
+        return b"RAW::" + base64.b64encode(data_bytes)
+
     # macOS GUI and LaunchDaemon can run in different Keychain contexts.
     # When Security.framework rejects a root/user Keychain operation, keep the
     # shared GUI/daemon enrollment state usable with an explicit RAW:: fallback.
@@ -4799,12 +4815,13 @@ def _spawn_daemon_process():
 
 
 def _detach_macos_daemon_from_terminal() -> None:
-    """Detach a directly-launched macOS daemon from its Terminal session.
+    """Route direct macOS daemon invocations through launchd.
 
-    launchd and GUI-spawned children already have an independent session, but
-    operators also commonly run ``agent --daemon`` directly from Terminal.
-    Forking once and creating a new session makes terminal closure harmless in
-    that path as well.  The launchd path (parent PID 1) is left untouched.
+    A direct ``sudo … --daemon`` call is an installation/bootstrap request,
+    not a second service owner.  The process must ask launchd to load or
+    kickstart the LaunchDaemon and then exit; only launchd may keep the agent
+    process alive.  The launchd path (parent PID 1) continues into the real
+    daemon loop.
     """
     if (
         sys.platform != "darwin"
@@ -4814,39 +4831,50 @@ def _detach_macos_daemon_from_terminal() -> None:
     ):
         return
     try:
-        pid = os.fork()
-        if pid > 0:
+        from platforms import PlatformFactory
+
+        manager = PlatformFactory.create().persistence_manager
+        if manager.ensure_running(get_exe_path(), daemon_args=_daemon_args()):
+            logging.info("Direct macOS daemon invocation handed off to launchd.")
             raise SystemExit(0)
-        os.setsid()
-        os.environ["ZEROWATCH_DAEMON_DETACHED"] = "1"
-        if hasattr(signal, "SIGHUP"):
-            signal.signal(signal.SIGHUP, signal.SIG_IGN)
-        with open(os.devnull, "rb", buffering=0) as devnull:
-            os.dup2(devnull.fileno(), sys.stdin.fileno())
-        try:
-            daemon_log_dir = os.path.join(
-                _secure_state_dir(get_base_dir()), "logs"
-            )
-            os.makedirs(daemon_log_dir, exist_ok=True)
-            daemon_log = open(
-                os.path.join(daemon_log_dir, "agent-daemon.log"),
-                "ab", buffering=0,
-            )
-            os.dup2(daemon_log.fileno(), sys.stdout.fileno())
-            os.dup2(daemon_log.fileno(), sys.stderr.fileno())
-        except OSError:
-            # /dev/null is preferable to retaining a terminal descriptor.
-            with open(os.devnull, "wb", buffering=0) as devnull:
-                os.dup2(devnull.fileno(), sys.stdout.fileno())
-                os.dup2(devnull.fileno(), sys.stderr.fileno())
-    except SystemExit:
-        raise
+        logging.error("Could not hand direct macOS daemon invocation to launchd.")
+        raise SystemExit(1)
     except Exception as exc:
-        logging.warning("macOS daemon detachment failed; continuing: %s", exc)
+        logging.error("macOS launchd handoff failed: %s", exc)
+        raise SystemExit(1)
 
 
 def _auto_bootstrap_background_agent() -> None:
     """Ensure startup persistence and background daemon are active for GUI sessions."""
+    # macOS has a real service manager.  Once the LaunchDaemon is installed,
+    # activation must go through launchd; spawning ``python sentinel_agent.py
+    # --daemon`` from Tk creates a second agent and leaves its lifetime coupled
+    # to the GUI/Terminal session.  Linux and Windows retain their existing
+    # detached-process paths below.
+    if sys.platform == "darwin":
+        try:
+            from platforms import PlatformFactory
+
+            manager = PlatformFactory.create().persistence_manager
+            daemon_args = _daemon_args()
+            if manager.ensure_running(get_exe_path(), daemon_args=daemon_args):
+                logging.info("macOS background agent is owned by launchd.")
+                return
+
+            # A normal GUI user cannot bootstrap /Library/LaunchDaemons.  The
+            # sudo launcher installs it before handing control to Aqua; if a
+            # user started the GUI directly, use the existing one-time admin
+            # authorization flow rather than starting a user-owned duplicate.
+            if manager.register_startup_authorized(
+                get_exe_path(), daemon_args=daemon_args
+            ):
+                logging.info("macOS LaunchDaemon installed/repaired through administrator authorization.")
+                return
+            logging.warning("macOS LaunchDaemon is not running; administrator authorization may be required.")
+        except Exception as exc:
+            logging.warning("macOS launchd bootstrap failed: %s", exc)
+        return
+
     global _last_daemon_spawn_at
     # Make startup persistence idempotent so a single GUI launch is enough.
     try:
@@ -7276,6 +7304,28 @@ class EnrollmentFrame(tk.Frame):
         self._stop_event.clear()
 
         def poll():
+            if sys.platform == "darwin":
+                # Approval polling belongs to the LaunchDaemon.  The GUI only
+                # observes the shared state written by that daemon, so closing
+                # this window cannot interrupt enrollment or cause two clients
+                # to consume the same approval transition.
+                while not self._stop_event.is_set():
+                    try:
+                        state = self.zw_client._load_join_state() or {}
+                        if str(state.get("status") or "").lower() == "approved":
+                            self.zw_client.join_state = state
+                            if not getattr(self.zw_client, "jwt", None):
+                                self.zw_client.jwt = self.zw_client._load_jwt()
+                            self.after(0, self._on_success)
+                            return
+                    except Exception as exc:
+                        logging.debug("[GUI] macOS local enrollment-state poll failed: %s", exc)
+                    for _ in range(10):
+                        if self._stop_event.is_set():
+                            return
+                        time.sleep(0.5)
+                return
+
             while not self._stop_event.is_set(): # Keep polling even if not in PENDING, to handle auto-routing if server comes back
                 res = self.zw_client.refresh_join_status_once()
                 if res.get("status") == "approved":
@@ -9628,7 +9678,12 @@ def main():
 
         is_linked = os.path.exists(token_win) or os.path.exists(token_nix)
 
-        if not is_linked and not os.path.exists(consent_file):
+        # macOS launchd must be allowed to start before enrollment.  The
+        # daemon owns pending-request polling and waits for shared enrollment
+        # state; exiting here makes a fresh LaunchDaemon repeatedly die before
+        # the GUI has submitted its first request.  Windows/Linux retain their
+        # existing consent gate.
+        if sys.platform != "darwin" and not is_linked and not os.path.exists(consent_file):
             logging.info(
                 "Daemon blocked: Consent not accepted yet and agent is not linked."
             )

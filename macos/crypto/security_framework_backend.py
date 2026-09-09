@@ -124,6 +124,7 @@ class OSStatus:
     errSecAllocate           = -108       # Memory allocation failure
     errSecNotAvailable       = -25291     # No keychain is available
     errSecUserCanceled       = -128       # User cancelled operation
+    errSecWrPerm             = -61        # Write permission denied
 
     # Human-readable mapping for logging (metadata only, no secrets)
     _NAMES: dict[int, str] = {
@@ -136,6 +137,7 @@ class OSStatus:
         -108:    "errSecAllocate",
         -25291:  "errSecNotAvailable",
         -128:    "errSecUserCanceled",
+        -61:     "errSecWrPerm",
     }
 
     @classmethod
@@ -837,14 +839,11 @@ class SecurityFrameworkBackend:
             logger.warning("retrieve: SecurityFrameworkBackend not available")
             return None
 
-        # A LaunchDaemon has no safe UI context.  Explicitly fail rather than
-        # repeatedly asking the logged-in user for a Keychain password.  The
-        # interactive GUI retains the normal authorization path.
-        headless = bool(
-            sys.platform == "darwin"
-            and hasattr(os, "geteuid")
-            and os.geteuid() == 0
-        )
+        # Agent reads are non-interactive even when initiated by the GUI. The
+        # GUI is not the credential owner and must never turn a state refresh
+        # into a recurring Keychain password prompt. Authorization is handled
+        # once by the administrator-controlled LaunchDaemon installation.
+        headless = sys.platform == "darwin"
         copy_matching = self._bindings.sec_item_copy_matching
         try:
             status, data = copy_matching(

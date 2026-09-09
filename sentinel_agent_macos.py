@@ -421,6 +421,20 @@ class MacOSAgentSession:
         Always validates the returned token before returning — prevents writing
         corrupt non-token bytes to disk which would cause decrypt failures later.
         """
+        # Shared enrollment state is coordination data between the console
+        # user and the root LaunchDaemon. Do not turn it into a per-UID
+        # Keychain reference.
+        if purpose != "jwt":
+            import base64
+            return b"RAW::" + base64.b64encode(data)
+
+        # The normal GUI user cannot write the System keychain. The daemon
+        # owns the credential record; the GUI uses an explicit transitional
+        # envelope instead of repeatedly provoking errSecWrPerm (-61).
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            import base64
+            return b"RAW::" + base64.b64encode(data)
+
         try:
             named_encrypt = getattr(self._platform.secure_store, "encrypt_named", None)
             result = (

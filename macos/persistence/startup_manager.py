@@ -54,6 +54,7 @@ import logging
 import base64
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 from typing import List, Optional, Tuple
@@ -82,6 +83,7 @@ _LAUNCHCTL_TIMEOUT = 30   # seconds
 
 # System domain target for launchd bootstrap (system LaunchDaemons)
 _SYSTEM_DOMAIN = "system"
+_SYSTEM_SERVICE_TARGET = f"{_SYSTEM_DOMAIN}/{LAUNCHD_LABEL}"
 
 
 def _current_uid() -> int:
@@ -137,9 +139,16 @@ def _build_plist(
 
     # Persist the API URL so launchd-managed restarts (after reboot or crash)
     # connect to the same server that was configured at enrollment time.
+    # launchd supplies a deliberately small environment.  Keep command lookup
+    # deterministic for collectors and preserve the configured backend URL on
+    # reboot/restart.
+    environment = {
+        "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    }
     api_url = os.environ.get("ZEROWATCH_API_URL", "").strip()
     if api_url:
-        plist["EnvironmentVariables"] = {"ZEROWATCH_API_URL": api_url}
+        environment["ZEROWATCH_API_URL"] = api_url
+    plist["EnvironmentVariables"] = environment
 
     if stdout_path:
         plist["StandardOutPath"] = stdout_path
@@ -262,6 +271,40 @@ def _bootstrap(plist_path: str) -> bool:
     return ok
 
 
+def _service_loaded() -> bool:
+    """Return whether launchd has the system service loaded.
+
+    A plist existing on disk is not proof that launchd owns the job.  This
+    distinction matters after an installer handoff, a bootout, or a launchd
+    restart: the GUI must repair the service through launchd instead of
+    starting a second copy of the agent itself.
+    """
+    ok, _stdout, _stderr = _launchctl("print", _SYSTEM_SERVICE_TARGET)
+    return ok
+
+
+def _service_running() -> bool:
+    """Return whether launchd reports a live PID for the service."""
+    ok, stdout, _stderr = _launchctl("print", _SYSTEM_SERVICE_TARGET)
+    if not ok:
+        return False
+    output = stdout.lower()
+    return bool(
+        re.search(r"\bpid\s*=\s*[1-9][0-9]*\b", output)
+        or re.search(r"\bstate\s*=\s*running\b", output)
+    )
+
+
+def _kickstart() -> bool:
+    """Ask launchd to start an already-loaded service."""
+    ok, _stdout, stderr = _launchctl("kickstart", _SYSTEM_SERVICE_TARGET)
+    if ok:
+        logger.info("launchd kickstart succeeded: %s", LAUNCHD_LABEL)
+    else:
+        logger.warning("launchd kickstart failed: %s", stderr.strip())
+    return ok
+
+
 def _bootstrap_user(plist_path: str) -> bool:
     """Bootstrap a LaunchAgent for the current user session."""
     uid = _current_uid()
@@ -378,8 +421,9 @@ class MacOSPersistenceManager(PersistenceManager):
         if not _validate_exe_path(exe_path):
             return False
 
-        # If a system LaunchDaemon is already installed, skip user LaunchAgent
-        # registration to prevent duplicate root+user background processes.
+        # If a system LaunchDaemon is already installed, never create or spawn
+        # a second per-user agent.  Repair only the launchd registration when
+        # necessary.
         if os.geteuid() != 0 and os.path.isfile(PLIST_PATH):
             # Best-effort cleanup of legacy per-user agent from older builds.
             try:
@@ -391,11 +435,13 @@ class MacOSPersistenceManager(PersistenceManager):
                     os.remove(LAUNCHAGENT_PATH)
             except OSError:
                 pass
+            loaded = _service_loaded()
             logger.info(
-                "System LaunchDaemon already present (%s). Skipping user LaunchAgent registration.",
+                "System LaunchDaemon already present (%s); %s.",
                 PLIST_PATH,
+                "launchd service is loaded" if loaded else "repairing launchd registration",
             )
-            return True
+            return loaded or _bootstrap(PLIST_PATH) or _kickstart()
 
         if os.geteuid() == 0:
             plist_data = _build_plist(
@@ -407,7 +453,12 @@ class MacOSPersistenceManager(PersistenceManager):
             plist_path = _write_plist(plist_data, PLIST_PATH)
             if plist_path is None:
                 return False
-            return _bootstrap(plist_path)
+            if not _bootstrap(plist_path):
+                return False
+            # bootstrap can return before the job is visible to print(1).  A
+            # short verification makes installation failures observable while
+            # still leaving KeepAlive to handle normal process restarts.
+            return _service_running() or _kickstart()
 
         # Non-root fallback: persist as LaunchAgent for the current user.
         user_logs_dir = os.path.expanduser("~/Library/Logs")
@@ -426,6 +477,39 @@ class MacOSPersistenceManager(PersistenceManager):
             return False
         return _bootstrap_user(plist_path)
 
+    def ensure_running(
+        self,
+        exe_path: str,
+        daemon_args: Optional[List[str]] = None,
+    ) -> bool:
+        """Ensure exactly one macOS background service is owned by launchd.
+
+        This is the GUI-safe activation path.  It never calls ``Popen`` and
+        therefore cannot tie the agent lifetime to Tk, Terminal, or a second
+        helper process.  A system plist is preferred; an unprivileged caller
+        can still use the existing per-user fallback when no system daemon is
+        installed.
+        """
+        if not _validate_exe_path(exe_path):
+            return False
+
+        if os.path.isfile(PLIST_PATH):
+            if _service_running():
+                return True
+            if _service_loaded() and os.geteuid() != 0:
+                logger.info("System LaunchDaemon is loaded but not currently running; requesting launchd kickstart.")
+                return _kickstart()
+            if os.geteuid() == 0:
+                return _bootstrap(PLIST_PATH) and (_service_running() or _kickstart())
+            # launchctl bootstrap of the system domain requires authorization;
+            # the caller should use register_startup_authorized in that case.
+            logger.warning(
+                "System LaunchDaemon plist exists but is not loaded; administrator authorization is required to repair it."
+            )
+            return False
+
+        return self.register_startup(exe_path, daemon_args=daemon_args)
+
     def register_startup_authorized(
         self, exe_path: str, daemon_args: Optional[List[str]] = None
     ) -> bool:
@@ -438,7 +522,15 @@ class MacOSPersistenceManager(PersistenceManager):
         """
         if not _validate_exe_path(exe_path):
             return False
-        plist = plistlib.dumps(_build_plist(exe_path, daemon_args), fmt=plistlib.FMT_XML)
+        plist = plistlib.dumps(
+            _build_plist(
+                exe_path,
+                daemon_args,
+                stdout_path="/var/log/zerowatch-agent.log",
+                stderr_path="/var/log/zerowatch-agent-error.log",
+            ),
+            fmt=plistlib.FMT_XML,
+        )
         encoded = base64.b64encode(plist).decode("ascii")
         script = (
             'do shell script "mkdir -p /Library/LaunchDaemons; '
