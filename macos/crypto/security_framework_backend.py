@@ -71,8 +71,9 @@ Target: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
   - Survives reboot (item persists while device is locked after first unlock)
 
 For a root LaunchDaemon:
-  - The System keychain is the target
-  - kSecUseKeychain must specify the System keychain explicitly
+  - The System keychain is the default target when running as root
+  - No kSecUseKeychain needed — SecItemAdd defaults to the correct keychain
+    based on the execution context (login for interactive, System for root)
   - kSecAttrAccessGroup may be needed for signed binaries
 
 ALL of the above requires native validation on real macOS hardware.
@@ -98,10 +99,16 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import logging
+import os
 import sys
 from typing import Optional
 
 logger = logging.getLogger("macos.crypto.security_framework_backend")
+
+# Kept as a named constant for installers and native validation.  The
+# LaunchDaemon credential is intended for the system keychain, not a per-user
+# login keychain, so the daemon can operate after logout and reboot.
+SYSTEM_KEYCHAIN_PATH = "/Library/Keychains/System.keychain"
 
 # ── OSStatus constants ────────────────────────────────────────────────────────
 # Documented: https://developer.apple.com/documentation/security/keychain_services
@@ -193,6 +200,7 @@ class _NativeSecurityBindings:
         self._cf   = self._load_framework(_CF_FW_PATH,         "CoreFoundation.framework")
         self._setup_function_signatures()
         self._constants = self._load_constants()
+        self._system_keychain = self._open_system_keychain()
         logger.debug("_NativeSecurityBindings: Security.framework loaded")
 
     # ── Framework loading ─────────────────────────────────────────────────────
@@ -285,6 +293,13 @@ class _NativeSecurityBindings:
         sec.SecItemDelete.argtypes = [ctypes.c_void_p]
         sec.SecItemDelete.restype  = ctypes.c_int32
 
+        # SecKeychainOpen(path, keychain) → OSStatus
+        if hasattr(sec, "SecKeychainOpen"):
+            sec.SecKeychainOpen.argtypes = [
+                ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)
+            ]
+            sec.SecKeychainOpen.restype = ctypes.c_int32
+
     # ── Constant loading ──────────────────────────────────────────────────────
 
     def _load_constants(self) -> dict[str, int]:
@@ -319,10 +334,18 @@ class _NativeSecurityBindings:
             # Attributes
             "kSecAttrService":              load(sec, "kSecAttrService"),
             "kSecAttrAccount":              load(sec, "kSecAttrAccount"),
-            "kSecAttrAccessible":           load(sec, "kSecAttrAccessible"),
             "kSecUseKeychain":              load(sec, "kSecUseKeychain"),
+            "kSecAttrAccessible":           load(sec, "kSecAttrAccessible"),
+            # Keychain target.  _build_query binds the shared System keychain
+            # when Security.framework can open it; otherwise the API falls
+            # back to the execution context.
             "kSecAttrSynchronizable":       load(sec, "kSecAttrSynchronizable"),
             "kSecAttrSynchronizableAny":    load(sec, "kSecAttrSynchronizableAny"),
+            # Background daemons must never summon a GUI authorization prompt.
+            # The visible GUI performs the first authorization when needed;
+            # headless reads fail fast until that authorization exists.
+            "kSecUseAuthenticationUI":      load(sec, "kSecUseAuthenticationUI"),
+            "kSecUseAuthenticationUIFail":  load(sec, "kSecUseAuthenticationUIFail"),
             # kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
             # Available after boot unlock; device-specific; survives reboot.
             # Appropriate for a root LaunchDaemon credential.
@@ -339,6 +362,18 @@ class _NativeSecurityBindings:
         }
         logger.debug("Loaded %d Security.framework constants", len(constants))
         return constants
+
+    def _open_system_keychain(self) -> Optional[int]:
+        """Open the shared System keychain when Security.framework supports it."""
+        opener = getattr(self._sec, "SecKeychainOpen", None)
+        if opener is None:
+            return None
+        ref = ctypes.c_void_p(None)
+        status = int(opener(SYSTEM_KEYCHAIN_PATH.encode("utf-8"), ctypes.byref(ref)))
+        if status != OSStatus.errSecSuccess or not ref.value:
+            logger.warning("System keychain unavailable (OSStatus=%s); using execution-context default", status)
+            return None
+        return ref.value
 
     # ── CoreFoundation helpers ────────────────────────────────────────────────
 
@@ -428,22 +463,29 @@ class _NativeSecurityBindings:
 
         svc_ref  = self._cf_string(service)
         acct_ref = self._cf_string(account)
-        keychain_ref = self._cf_string("/Library/Keychains/System.keychain")
 
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecClass"]),
                                    ctypes.c_void_p(c["kSecClassGenericPassword"]))
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecAttrService"]),  ctypes.c_void_p(svc_ref))
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecAttrAccount"]),  ctypes.c_void_p(acct_ref))
-        cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecUseKeychain"]), ctypes.c_void_p(keychain_ref))
+        if getattr(self, "_system_keychain", None):
+            # Keep GUI and LaunchDaemon credential lookups in one keychain.
+            # The first interactive write may legitimately require
+            # administrator authorization; subsequent daemon operations use
+            # the same item and do not prompt.
+            cf.CFDictionaryAddValue(
+                d,
+                ctypes.c_void_p(c["kSecUseKeychain"]),
+                ctypes.c_void_p(self._system_keychain),
+            )
         # Disable iCloud sync — agent credentials are device-specific
         cf.CFDictionaryAddValue(d, ctypes.c_void_p(c["kSecAttrSynchronizable"]),
                                    ctypes.c_void_p(c["kCFBooleanFalse"]))
 
-        # Note: svc_ref, acct_ref, and keychain_ref are retained by the dict
+        # Note: svc_ref and acct_ref are retained by the dict
         # (CF retain semantics). Release our temporary references now.
         cf.CFRelease(svc_ref)
         cf.CFRelease(acct_ref)
-        cf.CFRelease(keychain_ref)
 
         return d
 
@@ -468,6 +510,14 @@ class _NativeSecurityBindings:
         cf.CFDictionaryAddValue(query,
                                 ctypes.c_void_p(c["kSecValueData"]),
                                 ctypes.c_void_p(data_ref))
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            # A LaunchDaemon has no WindowServer/UI context.  Never make a
+            # background store operation trigger a login-keychain prompt.
+            cf.CFDictionaryAddValue(
+                query,
+                ctypes.c_void_p(c["kSecUseAuthenticationUI"]),
+                ctypes.c_void_p(c["kSecUseAuthenticationUIFail"]),
+            )
         try:
             status = sec.SecItemAdd(ctypes.c_void_p(query), None)
             return int(status)
@@ -475,7 +525,8 @@ class _NativeSecurityBindings:
             cf.CFRelease(ctypes.c_void_p(data_ref))
             cf.CFRelease(ctypes.c_void_p(query))
 
-    def sec_item_copy_matching(self, service: str, account: str) -> tuple[int, Optional[bytes]]:
+    def sec_item_copy_matching(self, service: str, account: str,
+                               allow_interaction: bool = True) -> tuple[int, Optional[bytes]]:
         """
         Call SecItemCopyMatching. Returns (OSStatus, bytes_or_None).
 
@@ -496,6 +547,12 @@ class _NativeSecurityBindings:
         cf.CFDictionaryAddValue(query,
                                 ctypes.c_void_p(c["kSecAttrSynchronizable"]),
                                 ctypes.c_void_p(c["kSecAttrSynchronizableAny"]))
+        if not allow_interaction:
+            cf.CFDictionaryAddValue(
+                query,
+                ctypes.c_void_p(c["kSecUseAuthenticationUI"]),
+                ctypes.c_void_p(c["kSecUseAuthenticationUIFail"]),
+            )
 
         result_ref = ctypes.c_void_p(None)
         try:
@@ -538,6 +595,12 @@ class _NativeSecurityBindings:
         cf.CFDictionaryAddValue(attrs,
                                 ctypes.c_void_p(c["kSecValueData"]),
                                 ctypes.c_void_p(data_ref))
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            cf.CFDictionaryAddValue(
+                query,
+                ctypes.c_void_p(c["kSecUseAuthenticationUI"]),
+                ctypes.c_void_p(c["kSecUseAuthenticationUIFail"]),
+            )
         try:
             status = sec.SecItemUpdate(ctypes.c_void_p(query), ctypes.c_void_p(attrs))
             return int(status)
@@ -774,7 +837,23 @@ class SecurityFrameworkBackend:
             logger.warning("retrieve: SecurityFrameworkBackend not available")
             return None
 
-        status, data = self._bindings.sec_item_copy_matching(service, account)
+        # A LaunchDaemon has no safe UI context.  Explicitly fail rather than
+        # repeatedly asking the logged-in user for a Keychain password.  The
+        # interactive GUI retains the normal authorization path.
+        headless = bool(
+            sys.platform == "darwin"
+            and hasattr(os, "geteuid")
+            and os.geteuid() == 0
+        )
+        copy_matching = self._bindings.sec_item_copy_matching
+        try:
+            status, data = copy_matching(
+                service, account, allow_interaction=not headless
+            )
+        except TypeError:
+            # Test/injected bindings from older builds expose the original
+            # two-argument contract.
+            status, data = copy_matching(service, account)
 
         if status == OSStatus.errSecSuccess and data is not None:
             logger.info(

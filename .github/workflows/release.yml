@@ -22,6 +22,7 @@ permissions:
 env:
   PYTHON_VERSION: "3.11"
   BINARY_BASENAME: "SentinelAgent"
+  ZEROWATCH_API_URL: "https://zerowatch.deepcytes.io/api"
 
 # ===========================================================================
 # JOB 1: Windows — Nuitka onefile build
@@ -71,7 +72,6 @@ jobs:
             --standalone ^
             --onefile ^
             --windows-console-mode=disable ^
-            --onefile-tempdir-spec={CACHE_DIR}/ZeroWatch/extracted ^
             --enable-plugin=tk-inter ^
             --output-dir=dist\windows ^
             --output-filename=SentinelAgent-windows-x64.exe ^
@@ -99,7 +99,7 @@ jobs:
   # ===========================================================================
   build-linux:
     name: "Build Linux (x64)"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     outputs:
       binary-name: ${{ steps.set-names.outputs.binary }}
     steps:
@@ -111,16 +111,16 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install system dependencies (tkinter + patchelf)
+      - name: Install system dependencies (tkinter + ccache)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-tk patchelf ccache
+          sudo apt-get install -y python3-tk ccache
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-linux.txt
-          pip install nuitka>=2.0 ordered-set zstandard
+          pip install "nuitka>=2.0" ordered-set zstandard
 
       - name: Set binary name
         id: set-names
@@ -435,6 +435,7 @@ jobs:
             | macOS arm64 | `SentinelAgent-macos-arm64` |
           draft: false
           prerelease: false
+          clobber: true
           files: |
             dist/binary-windows/SentinelAgent-windows-x64.exe
             dist/binary-linux/SentinelAgent-linux-x64

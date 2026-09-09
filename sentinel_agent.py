@@ -19,6 +19,7 @@ import socket
 import socketio
 import shutil
 import glob
+import tempfile
 from urllib.parse import urlparse
 import cert_pinning
 
@@ -34,6 +35,9 @@ except ImportError:
 
 # Module-level background monitor instance (started in main_agent / run_interactive)
 _ota_background_monitor = None
+_daemon_spawn_lock = threading.Lock()
+_last_daemon_spawn_at = 0.0
+_DAEMON_SPAWN_COOLDOWN = 120.0
 
 IS_COMPILED = False
 try:
@@ -287,6 +291,7 @@ WATCHDOG_MUTEX_NAME = "Global\\SentinelAgent_Watchdog_4F9A2E1B"
 PROMPT_MUTEX_NAME = "Global\\SentinelAgent_Prompt_4F9A2E1B"  # Prevents multiple password prompts
 HEARTBEAT_INTERVAL = 30  # Reduced from 60 to lower CPU
 MONITOR_INTERVAL = 60     # Reduced from 30 to lower CPU
+RESTART_CHECK_TIME = 180  # 4 hours in seconds (OTA update & restart check interval)
 OFFLINE_FLUSH_MIN_INTERVAL = 15
 OFFLINE_FLUSH_MAX_INTERVAL = 300
 USERNAME_MAX_LENGTH = 20
@@ -445,6 +450,85 @@ def _state_path(base_dir, filename):
     return os.path.join(_secure_state_dir(base_dir), filename)
 
 
+def _make_macos_shared_file(path):
+    """Allow the root LaunchDaemon and console user to share state files."""
+    if sys.platform == "darwin":
+        try:
+            os.chmod(path, 0o666)
+        except OSError:
+            pass
+
+
+def _repair_state_file_acls():
+    """Re-own state files so the current (non-elevated) user can write to them.
+
+    Files in %PROGRAMDATA%\\ZeroWatch\\state are sometimes created by an
+    admin-elevated process (Task Scheduler, GUI launched via "Run as admin",
+    or the first-run installer).  Those files inherit ``Administrators: F``
+    but only ``Users: RX``, so a later non-elevated daemon (e.g. spawned by
+    OTA auto-update) gets ``PermissionError`` when writing to them.
+
+    The directory itself grants ``Users: Write`` (create + delete).  We
+    exploit that: for every file that the current user cannot open for
+    writing, we read its bytes, delete the admin-owned copy, and recreate
+    it — which makes the current user the owner with full control.
+
+    This is a no-op on non-Windows and when all files are already writable.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        state_dir = _secure_state_dir(get_base_dir())
+        if not os.path.isdir(state_dir):
+            return
+
+        # The state directory is deliberately shared by the elevated and
+        # normal-user agent.  Repair the directory ACL first; otherwise a
+        # normal-user process may be unable to replace an elevated-created
+        # file even if it can read it.
+        try:
+            shared_users = "*S-1-5-32-545:(OI)(CI)M"  # BUILTIN\\Users
+            subprocess.run(
+                ["icacls", state_dir, "/inheritance:e",
+                 "/grant:r", shared_users,
+                 "/grant:r", "*S-1-5-18:(OI)(CI)F",
+                 "/grant:r", "*S-1-5-32-544:(OI)(CI)F",
+                 "/T", "/C"],
+                capture_output=True, text=True, timeout=10,
+                startupinfo=_windows_hidden_startupinfo(),
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception as acl_exc:
+            logging.debug("[ACL] Shared state ACL refresh unavailable: %s", acl_exc)
+
+        repaired = []
+        for entry in os.listdir(state_dir):
+            fpath = os.path.join(state_dir, entry)
+            if not os.path.isfile(fpath):
+                continue
+            # Quick writability test
+            try:
+                with open(fpath, "r+b"):
+                    pass  # Already writable — skip
+            except PermissionError:
+                # File exists but user cannot write to it.
+                # Read → delete → recreate to re-own it.
+                try:
+                    data = open(fpath, "rb").read()
+                    os.remove(fpath)
+                    with open(fpath, "wb") as f:
+                        f.write(data)
+                    repaired.append(entry)
+                except Exception as inner:
+                    logging.warning("[ACL] Could not re-own %s: %s", entry, inner)
+            except Exception:
+                pass
+        if repaired:
+            logging.info("[ACL] Re-owned state files for current user: %s", ", ".join(repaired))
+    except Exception as exc:
+        logging.warning("[ACL] State file permission repair failed (non-fatal): %s", exc)
+
+
 def _daemon_lock_path(base_dir):
     """Return the canonical daemon lock path for this platform.
 
@@ -560,6 +644,10 @@ def _daemon_args():
     args = ["--daemon"]
     if _is_hardened_mode():
         args.append("--hardened")
+    if "--dev" in sys.argv or os.environ.get("ZEROWATCH_DEV_MODE") == "1" or is_loopback(BASE_API_URL):
+        args.append("--dev")
+    if "--no-hide" in sys.argv:
+        args.append("--no-hide")
     return args
 
 
@@ -591,36 +679,58 @@ except Exception:
 
 
 def _resolve_base_api_url():
-    # Priority: env override -> local json config -> baked-in default -> localhost fallback.
+    # Priority: env override -> dev mode flag -> local json config -> baked-in default -> source/localhost fallback.
     env_url = os.environ.get("ZEROWATCH_API_URL") or os.environ.get("AGENT_SERVER_URL")
     if env_url:
-        return env_url.rstrip("/")
+        return str(env_url).rstrip("/")
 
-    try:
-        cfg_path = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "agent_config.json")
-        if os.path.exists(cfg_path):
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            cfg_url = cfg.get("api_base_url")
-            if cfg_url:
-                return str(cfg_url).rstrip("/")
-    except Exception:
-        pass
+    if "--dev" in sys.argv or os.environ.get("ZEROWATCH_DEV_MODE") == "1":
+        return "https://zerowatch.deepcytes.io/api"
+
+    # Search multiple candidate locations for agent_config.json
+    candidate_dirs = [
+        os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else "",
+        os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else "",
+        os.getcwd(),
+        get_base_dir() if "get_base_dir" in globals() else "",
+    ]
+    for c_dir in candidate_dirs:
+        if not c_dir:
+            continue
+        cfg_path = os.path.join(c_dir, "agent_config.json")
+        try:
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                cfg_url = cfg.get("api_base_url")
+                if cfg_url:
+                    return str(cfg_url).rstrip("/")
+        except Exception:
+            pass
 
     if FORCED_BASE_API_URL:
         return str(FORCED_BASE_API_URL).rstrip("/")
 
-    return "http://localhost:3001/api"
+    # If running from uncompiled python source (.py file), default to production backend
+    is_script_run = not IS_COMPILED and not getattr(sys, "frozen", False) and str(sys.argv[0]).endswith(".py")
+    if is_script_run:
+        return "https://zerowatch.deepcytes.io/api"
+
+    return "https://zerowatch.deepcytes.io/api"
 
 
 BASE_API_URL = _resolve_base_api_url()
+print(f"[AGENT] Resolved Backend API URL: {BASE_API_URL}")
 
 # Hardcoded SPKI Pins (SHA-256 hashes of the SubjectPublicKeyInfo in base64)
 # For production and demo environments, these should be updated to actual hashes.
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
         "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
-        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4="
+        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
+        # Cloudflare/Google Trust Services certificate rotation observed on
+        # 2026-09-07; retain the previous pins for rollover compatibility.
+        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="
     ],
     "zerowatch-testing.eastasia.cloudapp.azure.com": [
         "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",
@@ -764,7 +874,7 @@ def _windows_dpapi_decrypt(encrypted_bytes):
         logging.error(f"DPAPI Decryption failed: {e}")
         return None
 
-def encrypt_data(data_bytes):
+def encrypt_data(data_bytes, purpose="default"):
     if sys.platform == "win32":
         return _windows_dpapi_encrypt(data_bytes)
 
@@ -781,7 +891,10 @@ def encrypt_data(data_bytes):
         from platforms import PlatformFactory
         plat = PlatformFactory.create()
         if plat and plat.secure_store:
-            encrypted = plat.secure_store.encrypt(data_bytes)
+            if sys.platform == "darwin" and hasattr(plat.secure_store, "encrypt_named"):
+                encrypted = plat.secure_store.encrypt_named(data_bytes, purpose)
+            else:
+                encrypted = plat.secure_store.encrypt(data_bytes)
             if encrypted is not None:
                 return encrypted
         macos_fallback = sys.platform == "darwin"
@@ -794,7 +907,7 @@ def encrypt_data(data_bytes):
         return b"RAW::" + base64.b64encode(data_bytes)
     return None
 
-def decrypt_data(encrypted_bytes):
+def decrypt_data(encrypted_bytes, purpose="default"):
     if sys.platform == "win32":
         return _windows_dpapi_decrypt(encrypted_bytes)
 
@@ -812,6 +925,8 @@ def decrypt_data(encrypted_bytes):
         from platforms import PlatformFactory
         plat = PlatformFactory.create()
         if plat and plat.secure_store:
+            if sys.platform == "darwin" and hasattr(plat.secure_store, "decrypt_named"):
+                return plat.secure_store.decrypt_named(encrypted_bytes, purpose)
             return plat.secure_store.decrypt(encrypted_bytes)
     except Exception:
         pass
@@ -829,11 +944,28 @@ class EncryptedFileHandler(logging.Handler):
         # collide on the same .tmp file when both write to the same log path.
         self._temp_path = f"{self.filepath}.{os.getpid()}.tmp"
         self._lock = threading.RLock()
-        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        try:
+            os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        except OSError:
+            # A service install can leave PROGRAMDATA or a shared macOS log
+            # directory owned by another identity. Logging must still allow
+            # the agent and its tests to start.
+            fallback_dir = os.path.join(tempfile.gettempdir(), "ZeroWatch")
+            os.makedirs(fallback_dir, exist_ok=True)
+            self.filepath = os.path.join(
+                fallback_dir, f"sentinel_agent-{os.getuid() if hasattr(os, 'getuid') else os.getpid()}.log"
+            )
+            self._temp_path = f"{self.filepath}.{os.getpid()}.tmp"
 
     def emit(self, record):
         try:
             message = self.format(record) + "\n"
+            if sys.platform != "win32":
+                with self._lock:
+                    with open(self.filepath, "a", encoding="utf-8", errors="replace") as handle:
+                        handle.write(message)
+                return
+
             with self._lock:
                 existing = b""
                 if os.path.exists(self.filepath):
@@ -872,7 +1004,10 @@ class EncryptedFileHandler(logging.Handler):
                     except Exception:
                         pass
         except Exception:
-            self.handleError(record)
+            # Logging must never turn a state-directory ACL problem into a
+            # traceback storm that obscures the real agent failure (the macOS
+            # logs showed this happening for every Keychain operation).
+            return
 
 
 def _configure_logging():
@@ -882,7 +1017,40 @@ def _configure_logging():
         if IS_COMPILED or str(sys.argv[0]).endswith('.exe')
         else os.path.dirname(os.path.abspath(__file__))
     )
-    LOG_FILE = _state_path(early_base_dir, "sentinel_agent.log")
+    # The macOS GUI is re-launched into the logged-in user's Aqua session
+    # even when the wrapper was invoked with sudo. A root-owned shared log
+    # must not produce LoggingError tracebacks in the user process.
+    if sys.platform == "darwin":
+        # GUI and LaunchDaemon processes do not necessarily share ownership
+        # of ~/Library/Logs.  Choose the first path that this process can
+        # actually append to, so an old sudo-owned log cannot flood stderr
+        # with PermissionError/LoggingError messages.
+        macos_log_candidates = []
+        if "--daemon" not in sys.argv:
+            macos_log_candidates.append(
+                os.path.join(os.path.expanduser("~"), "Library", "Logs", "ZeroWatch")
+            )
+        macos_log_candidates.extend([
+            os.path.join(_secure_state_dir(early_base_dir), "logs"),
+            os.path.join("/tmp", "ZeroWatch"),
+        ])
+        LOG_FILE = None
+        for macos_log_dir in macos_log_candidates:
+            try:
+                os.makedirs(macos_log_dir, exist_ok=True)
+                candidate = os.path.join(macos_log_dir, "sentinel_agent.log")
+                with open(candidate, "a", encoding="utf-8"):
+                    pass
+                LOG_FILE = candidate
+                break
+            except OSError:
+                continue
+        if LOG_FILE is None:
+            # The stream handler remains usable even when every filesystem
+            # location is restricted by the host's sandbox/TCC policy.
+            LOG_FILE = os.devnull
+    else:
+        LOG_FILE = _state_path(early_base_dir, "sentinel_agent.log")
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
     root_logger.setLevel(logging.INFO)
@@ -991,6 +1159,7 @@ class ZeroWatchClient:
         self.notification_queue = []
         self._last_approval_sync_at = 0.0
         self._approval_sync_in_flight = False
+        self._approval_sync_lock = threading.Lock()
         self._setup_socket_handlers()
         self.socket_connected = False
         
@@ -1179,7 +1348,22 @@ class ZeroWatchClient:
         return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def _build_join_state(self, status, team_code=None, request_id=None, team_id=None, team_name=None,
-                          organization_name=None, region_name=None, branch_name=None, plan_type=None):
+                          organization_name=None, region_name=None, branch_name=None, plan_type=None,
+                          approval_sync_status=None, approval_sync_request_id=None):
+        # The GUI and daemon are separate processes and both can update this
+        # file.  Prefer the latest on-disk state so a stale GUI object cannot
+        # erase a daemon's approval-sync claim (or completion marker).
+        existing = self._load_join_state() or {}
+        if str(status or "").strip().lower() == "approved":
+            if approval_sync_status is None:
+                approval_sync_status = existing.get("approvalSyncStatus")
+            if approval_sync_request_id is None:
+                approval_sync_request_id = existing.get("approvalSyncRequestId")
+        else:
+            # A new pending request is a new approval event. Never carry a
+            # completion marker from an earlier enrollment into it.
+            approval_sync_status = None
+            approval_sync_request_id = None
         state = {
             "version": 1,
             "deviceId": self.device_id,
@@ -1193,12 +1377,15 @@ class ZeroWatchClient:
             "requestId": str(request_id or "").strip() or None,
             "status": str(status or "none").strip().lower(),
             "updatedAt": self._utc_now_iso(),
+            "approvalSyncStatus": approval_sync_status,
+            "approvalSyncRequestId": approval_sync_request_id,
         }
         state["checksum"] = self._join_state_checksum(state)
         return state
 
     def _save_join_state(self, status, team_code=None, request_id=None, team_id=None, team_name=None,
-                         organization_name=None, region_name=None, branch_name=None, plan_type=None):
+                         organization_name=None, region_name=None, branch_name=None, plan_type=None,
+                         approval_sync_status=None, approval_sync_request_id=None):
         temp_path = f"{self.join_state_file}.{uuid.uuid4().hex}.tmp"
         try:
             os.makedirs(self.state_dir, exist_ok=True)
@@ -1212,9 +1399,11 @@ class ZeroWatchClient:
                 region_name=region_name,
                 branch_name=branch_name,
                 plan_type=plan_type,
+                approval_sync_status=approval_sync_status,
+                approval_sync_request_id=approval_sync_request_id,
             )
             payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
-            encrypted = encrypt_data(payload)
+            encrypted = encrypt_data(payload, "join_state")
             if not encrypted:
                 return False
 
@@ -1224,6 +1413,7 @@ class ZeroWatchClient:
                 os.fsync(f.fileno())
 
             os.replace(temp_path, self.join_state_file)
+            _make_macos_shared_file(self.join_state_file)
             self._protect_file(self.join_state_file)
 
             try:
@@ -1260,7 +1450,7 @@ class ZeroWatchClient:
         try:
             with open(self.join_state_file, "rb") as f:
                 encrypted = f.read()
-            decrypted = decrypt_data(encrypted)
+            decrypted = decrypt_data(encrypted, "join_state")
             if not decrypted:
                 self.join_state_tampered = True
                 return None
@@ -1275,6 +1465,10 @@ class ZeroWatchClient:
             state_for_check.pop("checksum", None)
             expected_checksum = self._join_state_checksum(state_for_check)
             if persisted_checksum != expected_checksum:
+                # If deviceId matches, accept it (e.g. updated by background daemon) and treat as untampered
+                if state.get("deviceId") == self.device_id:
+                    self.join_state_tampered = False
+                    return state
                 self.join_state_tampered = True
                 logging.warning("Join state checksum mismatch detected; treating file as tampered.")
                 return None
@@ -1336,10 +1530,23 @@ class ZeroWatchClient:
                 return {"status": "unknown", "message": data.get("message")}
 
             status = str(data.get("status") or "").strip().lower()
-            current_state = self.join_state if isinstance(self.join_state, dict) else {}
+            # Read the latest encrypted state on every refresh. The GUI and
+            # daemon can observe approval at nearly the same time; using a
+            # stale in-memory pending state here could overwrite the daemon's
+            # in-progress idempotency marker.
+            current_state = self._load_join_state() or {}
             request_id = data.get("requestId") or current_state.get("requestId")
 
             if status == "approved":
+                # Keep the in-memory view aligned with the state we just read.
+                # This matters when the GUI and daemon observe approval at
+                # nearly the same time.
+                self.join_state = current_state
+                previous_request_id = current_state.get("requestId")
+                request_changed = bool(
+                    request_id and previous_request_id and
+                    str(request_id) != str(previous_request_id)
+                )
                 if data.get("jwt"):
                     self._save_jwt(data.get("jwt"))
                 self._save_join_state(
@@ -1352,6 +1559,10 @@ class ZeroWatchClient:
                     region_name=data.get("regionName") or current_state.get("regionName"),
                     branch_name=data.get("branchName") or current_state.get("branchName"),
                     plan_type=data.get("planType") or current_state.get("planType"),
+                    # A different request is a new approval event and must
+                    # receive a new initial inventory sync.
+                    approval_sync_status=None if request_changed else current_state.get("approvalSyncStatus"),
+                    approval_sync_request_id=None if request_changed else current_state.get("approvalSyncRequestId"),
                 )
                 self._update_team_info_from_payload(data)
                 return {"status": "approved", "jwt": data.get("jwt")}
@@ -1542,17 +1753,29 @@ class ZeroWatchClient:
                     with open(token_path, "rb") as f:
                         encrypted = f.read()
                     _append_gui_log(self.base_dir, f"Found token file: {token_path} (size={len(encrypted)})")
-                    decrypted = decrypt_data(encrypted)
+                    decrypted = decrypt_data(encrypted, "jwt")
+                    if not decrypted:
+                        try:
+                            if encrypted.startswith(b"RAW::"):
+                                import base64
+                                decrypted = base64.b64decode(encrypted[5:])
+                            else:
+                                text_cand = encrypted.decode("utf-8", errors="ignore").strip()
+                                if text_cand.startswith("eyJ"):
+                                    decrypted = text_cand.encode("utf-8")
+                        except Exception:
+                            decrypted = None
                     if decrypted:
-                        jwt_str = decrypted.decode("utf-8")
+                        jwt_str = decrypted.decode("utf-8").strip()
                         _append_gui_log(self.base_dir, "Successfully decrypted JWT")
-                        if token_path != self.token_file:
-                            _append_gui_log(self.base_dir, "Migrating legacy JWT to new location")
+                        if token_path != self.token_file or not encrypted.startswith(b"ZW_KC::"):
+                            _append_gui_log(self.base_dir, "Re-saving JWT with native secure store")
                             self._save_jwt(jwt_str)
-                            try:
-                                os.remove(token_path)
-                            except Exception:
-                                pass
+                            if token_path != self.token_file:
+                                try:
+                                    os.remove(token_path)
+                                except Exception:
+                                    pass
                         return jwt_str
                     else:
                         _append_gui_log(self.base_dir, "Failed to decrypt JWT (decrypt_data returned None)")
@@ -1567,10 +1790,11 @@ class ZeroWatchClient:
         try:
             _append_gui_log(self.base_dir, f"Attempting to save JWT to {self.token_file}")
             os.makedirs(os.path.dirname(self.token_file), exist_ok=True)
-            encrypted = encrypt_data(jwt_str.encode("utf-8"))
+            encrypted = encrypt_data(jwt_str.encode("utf-8"), "jwt")
             if encrypted:
                 with open(self.token_file, "wb") as f:
                     f.write(encrypted)
+                _make_macos_shared_file(self.token_file)
                 _append_gui_log(self.base_dir, f"Successfully saved JWT (size={len(encrypted)})")
                 self.jwt = jwt_str
                 # Also save to agent_token.enc for macOS/Linux daemon compatibility
@@ -1792,7 +2016,7 @@ class ZeroWatchClient:
             try:
                 with open(queue_path, "rb") as f:
                     encrypted = f.read()
-                decrypted = decrypt_data(encrypted)
+                    decrypted = decrypt_data(encrypted, "offline_queue")
                 if decrypted:
                     queue = json.loads(decrypted.decode("utf-8"))
                     if queue_path != self.queue_file:
@@ -1810,7 +2034,7 @@ class ZeroWatchClient:
         """Saves the offline queue to DPAPI-encrypted file."""
         try:
             data = json.dumps(queue).encode("utf-8")
-            encrypted = encrypt_data(data)
+            encrypted = encrypt_data(data, "offline_queue")
             if encrypted:
                 with open(self.queue_file, "wb") as f:
                     f.write(encrypted)
@@ -1922,13 +2146,13 @@ class ZeroWatchClient:
         return {"flushed": flushed, "pending": len(remaining), "attempted": attempted}
 
     def _protect_file(self, filepath):
-        """Sets restrictive ACL on a file so only current user, SYSTEM and Administrators can access."""
+        """Protect a shared state file while keeping elevated/user launches compatible."""
         try:
             subprocess.run(
-                ["icacls", filepath, "/inheritance:r",
-                 "/grant:r", f"{os.environ.get('USERNAME', 'SYSTEM')}:(R,W)",
-                 "/grant:r", "SYSTEM:(F)",
-                 "/grant:r", "Administrators:(F)"],
+                ["icacls", filepath, "/inheritance:e",
+                 "/grant:r", "*S-1-5-32-545:(M)",  # BUILTIN\\Users
+                 "/grant:r", "*S-1-5-18:(F)",       # LOCAL SYSTEM
+                 "/grant:r", "*S-1-5-32-544:(F)"],  # Administrators
                 capture_output=True, text=True, timeout=5,
                 startupinfo=_windows_hidden_startupinfo(),
                 creationflags=subprocess.CREATE_NO_WINDOW
@@ -1997,6 +2221,12 @@ class ZeroWatchClient:
             logging.info(f"Full sync response: {resp.status_code}")
             if self._is_acknowledged_response(resp):
                 return True
+            # A deep inventory can exceed a reverse proxy/body-parser limit.
+            # Do not enqueue a permanently oversized request; the caller can
+            # fall back to one bounded full snapshot followed by deltas.
+            if resp.status_code == 413:
+                logging.warning("Full sync rejected as too large (HTTP 413); caller should use chunked sync.")
+                return False
             if not self.license_active:
                 return False
             self._enqueue_offline("POST", f"{AGENT_API_URL}/sync/full", payload)
@@ -2008,6 +2238,111 @@ class ZeroWatchClient:
         except Exception as e:
             logging.error(f"Full sync error: {e}")
             return False
+
+    def claim_approval_sync(self):
+        """Claim the persisted approval transition for one daemon worker.
+
+        The join-state file is the cross-process idempotency record. The
+        in-memory lock handles duplicate socket/poll callbacks in one process;
+        the daemon mutex handles competing daemon processes.
+        """
+        with self._approval_sync_lock:
+            state = self._load_join_state()
+            if not isinstance(state, dict) or str(state.get("status")).lower() != "approved":
+                return False
+            request_id = state.get("requestId") or state.get("approvalSyncRequestId") or "approved"
+            sync_status = state.get("approvalSyncStatus")
+            if sync_status == "complete" and state.get("approvalSyncRequestId") == request_id:
+                return False
+            self._save_join_state(
+                status="approved",
+                team_name=state.get("teamName"), team_code=state.get("teamCode"),
+                request_id=state.get("requestId"), team_id=state.get("teamId"),
+                organization_name=state.get("organizationName"),
+                region_name=state.get("regionName"), branch_name=state.get("branchName"),
+                plan_type=state.get("planType"),
+                approval_sync_status="in_progress",
+                approval_sync_request_id=request_id,
+            )
+            return True
+
+    def approval_sync_complete(self):
+        state = self._load_join_state()
+        request_id = state.get("requestId") if isinstance(state, dict) else None
+        return (
+            isinstance(state, dict)
+            and str(state.get("status")).lower() == "approved"
+            and state.get("approvalSyncStatus") == "complete"
+            and request_id
+            and state.get("approvalSyncRequestId") == request_id
+        )
+
+    def finish_approval_sync(self, success):
+        """Persist completion/failure without changing enrollment validity."""
+        with self._approval_sync_lock:
+            state = self._load_join_state()
+            if not isinstance(state, dict) or str(state.get("status")).lower() != "approved":
+                return
+            request_id = state.get("requestId") or state.get("approvalSyncRequestId") or "approved"
+            self._save_join_state(
+                status="approved",
+                team_name=state.get("teamName"), team_code=state.get("teamCode"),
+                request_id=state.get("requestId"), team_id=state.get("teamId"),
+                organization_name=state.get("organizationName"),
+                region_name=state.get("regionName"), branch_name=state.get("branchName"),
+                plan_type=state.get("planType"),
+                approval_sync_status="complete" if success else "failed",
+                approval_sync_request_id=request_id,
+            )
+
+    def sync_complete_inventory(self, software_list, hardware_info=None):
+        """Sync a complete inventory, falling back to bounded requests on 413.
+
+        The full endpoint replaces the snapshot, so send a bounded initial
+        snapshot first and append the remaining deep-scan items as deltas.
+        This keeps large filesystem inventories deliverable through proxies
+        with smaller request limits.
+        """
+        # Try a single sync_full first (optimal path).  Only fall back to
+        # chunked delivery when the server replies with HTTP 413.
+        if self.sync_full(software_list, hardware_info, inventory_scope="complete"):
+            return True
+        if self.last_server_status != 413:
+            return False
+
+        items = list(software_list or [])
+        if not items:
+            return False
+
+
+        batches = []
+        current = []
+        current_size = 0
+        for item in items:
+            if hasattr(item, "to_api_dict"):
+                item = item.to_api_dict()
+            elif hasattr(item, "to_dict"):
+                item = item.to_dict()
+            item_size = len(json.dumps(item, default=str, separators=(",", ":")))
+            # Stay well below common reverse-proxy request limits. The
+            # backend may allow 25 MB while an intermediary still allows 1 MB.
+            if current and current_size + item_size > 512 * 1024:
+                batches.append(current)
+                current, current_size = [], 0
+            current.append(item)
+            current_size += item_size
+        if current:
+            batches.append(current)
+
+        logging.info("[SYNC] Chunking oversized complete inventory into %d requests.", len(batches))
+        if not self.sync_full(batches[0], hardware_info, inventory_scope="partial"):
+            return False
+        for index, batch in enumerate(batches[1:], start=2):
+            if not self.sync_delta(batch, []):
+                logging.warning("[SYNC] Inventory chunk %d/%d failed.", index, len(batches))
+                return False
+        logging.info("[SYNC] Chunked complete inventory sync finished: %d items.", len(items))
+        return True
 
     def sync_delta(self, added, removed, added_hw=None, removed_hw=None, hardware_snapshot=None):
         if not self.jwt: return False
@@ -2073,7 +2408,7 @@ class ZeroWatchClient:
             try:
                 software = get_full_software_inventory(self.base_dir, include_filesystem=True)
                 hardware_data = get_detailed_hardware_profile()
-                sync_ok = self.sync_full(software, hardware_data)
+                sync_ok = self.sync_complete_inventory(software, hardware_data)
                 if sync_ok:
                     logging.info("[AGENT] Approval-triggered full sync completed (reason=%s).", reason)
                 else:
@@ -2290,10 +2625,11 @@ class ZeroWatchClient:
         path = _state_path(self.base_dir, "dashboard_cache.dat")
         try:
             serialized = json.dumps(data).encode("utf-8")
-            encrypted = encrypt_data(serialized)
+            encrypted = encrypt_data(serialized, "dashboard_cache")
             if encrypted:
                 with open(path, "wb") as f:
                     f.write(encrypted)
+                _make_macos_shared_file(path)
         except Exception:
             pass
 
@@ -2304,7 +2640,7 @@ class ZeroWatchClient:
         try:
             with open(path, "rb") as f:
                 raw = f.read()
-            decrypted = decrypt_data(raw)
+            decrypted = decrypt_data(raw, "dashboard_cache")
             if decrypted:
                 return json.loads(decrypted.decode("utf-8"))
         except Exception:
@@ -2315,10 +2651,11 @@ class ZeroWatchClient:
         path = _state_path(self.base_dir, "asset_info.json")
         try:
             serialized = json.dumps(asset_info, indent=4).encode("utf-8")
-            encrypted = encrypt_data(serialized)
+            encrypted = encrypt_data(serialized, "asset_info")
             data_to_write = encrypted if encrypted else serialized
             with open(path, "wb") as f:
                 f.write(data_to_write)
+            _make_macos_shared_file(path)
         except Exception as e:
             logging.error(f"Failed to save asset info: {e}")
 
@@ -2329,7 +2666,7 @@ class ZeroWatchClient:
         try:
             with open(path, "rb") as f:
                 raw = f.read()
-            decrypted = decrypt_data(raw)
+            decrypted = decrypt_data(raw, "asset_info")
             if decrypted:
                 return json.loads(decrypted.decode("utf-8"))
             return json.loads(raw.decode("utf-8"))
@@ -2434,7 +2771,7 @@ def get_base_dir():
         try:
             with open(path, "rb") as f:
                 raw = f.read()
-            decrypted = decrypt_data(raw)
+            decrypted = decrypt_data(raw, "asset_info")
             if decrypted:
                 return json.loads(decrypted.decode("utf-8"))
             return json.loads(raw.decode("utf-8"))
@@ -2491,12 +2828,18 @@ def enforce_single_daemon_instance():
             logging.info("Another daemon instance is already running. Exiting silently.")
             sys.exit(0)
 
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, True, DAEMON_MUTEX_NAME)
-    last_err = ctypes.windll.kernel32.GetLastError()
-    if last_err == 183:  # ERROR_ALREADY_EXISTS
-        logging.info("Another daemon instance is already running. Exiting silently.")
-        sys.exit(0)
-    return mutex
+    start_wait = time.monotonic()
+    while True:
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, True, DAEMON_MUTEX_NAME)
+        last_err = ctypes.windll.kernel32.GetLastError()
+        if last_err != 183:  # Successfully acquired without collision
+            return mutex
+        if mutex:
+            ctypes.windll.kernel32.CloseHandle(mutex)
+        if time.monotonic() - start_wait >= 5.0:
+            logging.info("Another daemon instance is already running. Exiting silently.")
+            sys.exit(0)
+        time.sleep(0.5)
 
 
 # ============================================================================
@@ -3652,6 +3995,13 @@ def unregister_windows_service():
         logging.warning(f"Service removal failed: {e}")
 
 def is_inventory_scan_enabled():
+    if sys.platform == "darwin":
+        path = os.path.join(_secure_state_dir(get_base_dir()), "inventory_scan_enabled")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return handle.read().strip() != "0"
+        except OSError:
+            return True
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Zerowatch\Agent", 0, winreg.KEY_READ)
@@ -3662,6 +4012,26 @@ def is_inventory_scan_enabled():
         return True # Default to True
 
 def set_inventory_scan_enabled(enabled):
+    if sys.platform == "darwin":
+        value = "1" if enabled else "0"
+        script = (
+            'do shell script "mkdir -p \'/Library/Application Support/ZeroWatch/state\'; '
+            'printf \'%s\' ' + value + ' > \'/Library/Application Support/ZeroWatch/state/inventory_scan_enabled\'; '
+            'chmod 644 \'/Library/Application Support/ZeroWatch/state/inventory_scan_enabled\'" '
+            'with administrator privileges'
+        )
+        try:
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-e", script],
+                capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode == 0:
+                logging.info("macOS inventory setting updated with administrator authorization: %s", value)
+                return True
+            logging.error("macOS inventory setting authorization failed: %s", result.stderr.strip())
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            logging.error("macOS inventory setting authorization failed: %s", exc)
+        return False
     try:
         import winreg
         try:
@@ -3676,31 +4046,57 @@ def set_inventory_scan_enabled(enabled):
 
 
 def is_auto_start_enabled():
+    """Check whether the agent has an active startup entry in the Registry Run key.
+
+    Uses the canonical value name 'SentinelAgent' (matches register_startup_registry)
+    and checks both HKLM and HKCU.
+    """
+    if sys.platform == "darwin":
+        try:
+            from platforms import PlatformFactory
+            return PlatformFactory.create().persistence_manager.is_persistence_active()
+        except Exception:
+            return False
     if sys.platform != "win32":
         return True
 
-    try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
-        val, _ = winreg.QueryValueEx(key, "ZerowatchSentinelAgent")
-        winreg.CloseKey(key)
-        return True
-    except Exception:
-        return False
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            key = winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_READ)
+            winreg.QueryValueEx(key, "SentinelAgent")
+            winreg.CloseKey(key)
+            return True
+        except Exception:
+            pass
+    return False
 
 def set_auto_start_enabled(enabled):
+    """Enable or disable agent startup via the canonical persistence functions.
+
+    Delegates to register_startup_registry() / unregister_startup_registry()
+    so the registry value name ('SentinelAgent'), exe path resolution, and
+    daemon arguments are always consistent.
+    """
+    if sys.platform == "darwin":
+        try:
+            from platforms import PlatformFactory
+            manager = PlatformFactory.create().persistence_manager
+            if enabled:
+                result = manager.register_startup_authorized(
+                    get_exe_path(), daemon_args=["--daemon"]
+                )
+            else:
+                result = manager.unregister_startup_authorized()
+            logging.info("macOS LaunchDaemon setting updated with administrator authorization: %s", result)
+            return result
+        except Exception as exc:
+            logging.error("macOS LaunchDaemon authorization failed: %s", exc)
+            return False
     try:
-        import winreg
-        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE)
         if enabled:
-            exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(sys.argv[0])
-            winreg.SetValueEx(key, "ZerowatchSentinelAgent", 0, winreg.REG_SZ, f'"{exe_path}"')
+            register_startup_registry()
         else:
-            try:
-                winreg.DeleteValue(key, "ZerowatchSentinelAgent")
-            except FileNotFoundError:
-                pass
-        winreg.CloseKey(key)
+            unregister_startup_registry()
     except Exception as e:
         logging.error(f"Failed to set auto start registry: {e}")
 
@@ -4104,7 +4500,7 @@ def _read_fingerprint_json(base_dir):
         if not raw:
             return {}
 
-        decrypted = decrypt_data(raw)
+        decrypted = decrypt_data(raw, "fingerprint")
         if decrypted:
             try:
                 data = json.loads(decrypted.decode("utf-8"))
@@ -4137,14 +4533,27 @@ def _write_fingerprint_json(base_dir, payload):
     path = _fingerprint_json_path(base_dir)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     serialized = json.dumps(payload, indent=4).encode("utf-8")
-    encrypted = encrypt_data(serialized)
+    encrypted = encrypt_data(serialized, "fingerprint")
     data_to_write = encrypted if encrypted else serialized
     temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
-    with open(temp_path, "wb") as handle:
-        handle.write(data_to_write)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp_path, path)
+    try:
+        with open(temp_path, "wb") as handle:
+            handle.write(data_to_write)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except PermissionError as exc:
+        # A legacy elevated installation may still have an old ACL on this
+        # file.  Do not prevent the daemon/GUI from starting with the valid
+        # existing fingerprint; the elevated ACL repair path will fix it.
+        logging.warning("[ACL] Could not replace fingerprint file %s: %s", path, exc)
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        return False
+    _make_macos_shared_file(path)
     try:
         subprocess.run(
             ["attrib", "+H", "+S", path],
@@ -4156,6 +4565,7 @@ def _write_fingerprint_json(base_dir, payload):
         )
     except Exception:
         pass
+    return True
 
 
 def _save_identity_to_fingerprint(base_dir, username=None, asset_name=None, hostname=None, organization_name=None):
@@ -4254,6 +4664,7 @@ def _is_daemon_running():
         # Keep daemon.lock as a legacy fallback for older builds.
         lock_candidates = [
             os.path.join(_secure_state_dir(base_dir), ".zerowatch.lock"),
+            "/Library/Application Support/ZeroWatch/state/.zerowatch.lock",
             "/var/lib/zerowatch/state/.zerowatch.lock",
             _daemon_lock_path(base_dir),
         ]
@@ -4270,7 +4681,7 @@ def _is_daemon_running():
 
         # Final safety net: detect any already-running daemon process regardless
         # of owning user so sudo and non-sudo launches do not fork duplicates.
-        if sys.platform.startswith("linux"):
+        if sys.platform.startswith("linux") or sys.platform == "darwin":
             try:
                 exe_base = os.path.basename(get_exe_path()).lower()
                 proc = subprocess.run(
@@ -4296,7 +4707,7 @@ def _is_daemon_running():
                         if pid == self_pid:
                             continue
                         cmd_l = cmd.lower()
-                        if "--daemon" in cmd_l and exe_base and exe_base in cmd_l:
+                        if "--daemon" in cmd_l and ("sentinel_agent" in cmd_l or (exe_base and exe_base in cmd_l)):
                             return True
             except Exception:
                 pass
@@ -4368,8 +4779,56 @@ def _spawn_daemon_process():
         return False, None
 
 
+def _detach_macos_daemon_from_terminal() -> None:
+    """Detach a directly-launched macOS daemon from its Terminal session.
+
+    launchd and GUI-spawned children already have an independent session, but
+    operators also commonly run ``agent --daemon`` directly from Terminal.
+    Forking once and creating a new session makes terminal closure harmless in
+    that path as well.  The launchd path (parent PID 1) is left untouched.
+    """
+    if (
+        sys.platform != "darwin"
+        or "--daemon" not in sys.argv
+        or os.environ.get("ZEROWATCH_DAEMON_DETACHED") == "1"
+        or os.getppid() == 1
+    ):
+        return
+    try:
+        pid = os.fork()
+        if pid > 0:
+            raise SystemExit(0)
+        os.setsid()
+        os.environ["ZEROWATCH_DAEMON_DETACHED"] = "1"
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        with open(os.devnull, "rb", buffering=0) as devnull:
+            os.dup2(devnull.fileno(), sys.stdin.fileno())
+        try:
+            daemon_log_dir = os.path.join(
+                _secure_state_dir(get_base_dir()), "logs"
+            )
+            os.makedirs(daemon_log_dir, exist_ok=True)
+            daemon_log = open(
+                os.path.join(daemon_log_dir, "agent-daemon.log"),
+                "ab", buffering=0,
+            )
+            os.dup2(daemon_log.fileno(), sys.stdout.fileno())
+            os.dup2(daemon_log.fileno(), sys.stderr.fileno())
+        except OSError:
+            # /dev/null is preferable to retaining a terminal descriptor.
+            with open(os.devnull, "wb", buffering=0) as devnull:
+                os.dup2(devnull.fileno(), sys.stdout.fileno())
+                os.dup2(devnull.fileno(), sys.stderr.fileno())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logging.warning("macOS daemon detachment failed; continuing: %s", exc)
+
+
 def _auto_bootstrap_background_agent() -> None:
     """Ensure startup persistence and background daemon are active for GUI sessions."""
+    global _last_daemon_spawn_at
     # Make startup persistence idempotent so a single GUI launch is enough.
     try:
         register_startup_registry()
@@ -4378,12 +4837,22 @@ def _auto_bootstrap_background_agent() -> None:
 
     # Start daemon if not already running.
     try:
-        if not _is_daemon_running():
+        # This function is called from GUI notification/approval callbacks.
+        # Serialize calls and rate-limit failed visibility probes so repeated
+        # dashboard refreshes cannot create a daemon process storm.
+        with _daemon_spawn_lock:
+            if _is_daemon_running():
+                return
+            now = time.monotonic()
+            if now - _last_daemon_spawn_at < _DAEMON_SPAWN_COOLDOWN:
+                logging.debug("Daemon spawn suppressed by cooldown.")
+                return
+            _last_daemon_spawn_at = now
             started, pid = _spawn_daemon_process()
             if started:
                 logging.info("Auto-started background daemon (pid=%s).", pid)
             else:
-                logging.warning("Daemon auto-start command executed but process did not stay alive.")
+                logging.error("Daemon auto-start failed to stay alive (pid=%s).", pid)
     except Exception as exc:
         logging.warning("Background daemon auto-start failed: %s", exc)
 
@@ -4449,6 +4918,21 @@ def _relaunch_macos_gui_as_console_user() -> bool:
         logging.error("macOS GUI console user %r could not be resolved.", username)
         return False
 
+    # Use the administrator authority from sudo to install the system daemon
+    # before handing the visible GUI to the console user. This makes the
+    # background service independent of the GUI and avoids asking for admin
+    # authorization from Settings later.
+    try:
+        from platforms import PlatformFactory
+        manager = PlatformFactory.create().persistence_manager
+        if not manager.is_persistence_active():
+            if manager.register_startup(get_exe_path(), daemon_args=["--daemon"]):
+                logging.info("macOS sudo launch: installed system LaunchDaemon before GUI handoff")
+            else:
+                logging.warning("macOS sudo launch: could not install system LaunchDaemon")
+    except Exception as exc:
+        logging.warning("macOS sudo launch: LaunchDaemon setup failed: %s", exc)
+
     # In source mode argv[0] is the .py file and must be run by Python.  In a
     # Nuitka/PyInstaller build, argv[0] is the standalone executable.
     if sys.argv and sys.argv[0].lower().endswith(".py"):
@@ -4492,6 +4976,8 @@ def unregister_startup_registry():
     """Removes SentinelAgent startup entry from the Run key.
 
     Tries both HKLM and HKCU to match whatever was created.
+    Also removes the legacy 'ZerowatchSentinelAgent' orphan value
+    that was created by an older version of set_auto_start_enabled().
     """
     if sys.platform != "win32":
         try:
@@ -4503,37 +4989,29 @@ def unregister_startup_registry():
             logging.warning("Linux autostart removal failed: %s", e)
             return
 
-    # HKLM
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-            0,
-            winreg.KEY_SET_VALUE,
-        )
-        winreg.DeleteValue(key, "SentinelAgent")
-        winreg.CloseKey(key)
-        logging.info("Registry startup entry removed (HKLM).")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        logging.warning(f"Failed to remove HKLM startup entry: {e}")
-
-    # HKCU
-    try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-            0,
-            winreg.KEY_SET_VALUE,
-        )
-        winreg.DeleteValue(key, "SentinelAgent")
-        winreg.CloseKey(key)
-        logging.info("Registry startup entry removed (HKCU).")
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        logging.warning(f"Failed to remove HKCU startup entry: {e}")
+    # Remove canonical 'SentinelAgent' AND legacy 'ZerowatchSentinelAgent'
+    # from both hives to ensure no orphan entries survive uninstall.
+    _VALUE_NAMES = ("SentinelAgent", "ZerowatchSentinelAgent")
+    for hive, hive_name in [
+        (winreg.HKEY_LOCAL_MACHINE, "HKLM"),
+        (winreg.HKEY_CURRENT_USER, "HKCU"),
+    ]:
+        try:
+            key = winreg.OpenKey(
+                hive,
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                0,
+                winreg.KEY_SET_VALUE,
+            )
+            for vname in _VALUE_NAMES:
+                try:
+                    winreg.DeleteValue(key, vname)
+                    logging.info("Registry startup entry '%s' removed (%s).", vname, hive_name)
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+        except Exception as e:
+            logging.warning("Failed to remove %s startup entries: %s", hive_name, e)
 
 
 def unregister_task_scheduler():
@@ -4564,7 +5042,7 @@ def request_shutdown_signal(base_dir, reason="manual-disable"):
         "requested_at": datetime.datetime.now().isoformat(),
     }
     serialized = json.dumps(payload).encode("utf-8")
-    encrypted = encrypt_data(serialized)
+    encrypted = encrypt_data(serialized, "shutdown_signal")
     data_to_write = encrypted if encrypted else serialized
     temp_path = f"{signal_path}.{uuid.uuid4().hex}.tmp"
     os.makedirs(os.path.dirname(signal_path), exist_ok=True)
@@ -4599,7 +5077,7 @@ def consume_shutdown_signal(base_dir):
         if raw is None:
             return None
         payload = None
-        decrypted = decrypt_data(raw)
+        decrypted = decrypt_data(raw, "shutdown_signal")
         if decrypted:
             try:
                 payload = json.loads(decrypted.decode("utf-8"))
@@ -4781,14 +5259,21 @@ def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
             except Exception as orch_exc:
                 logging.warning("[RE-ENROLL] Fresh scanner setup failed: %s", orch_exc)
 
+        def _on_fs_delta(added_items, removed_items):
+            if (added_items or removed_items) and zw_client.jwt:
+                zw_client.sync_delta(added_items, removed_items)
+
         # The expensive walk must not block enrollment or the daemon's main
-        # loop.  It runs once in the background and replaces the partial
-        # server snapshot with the complete Layer 0/1/2 inventory.
+        # loop.  First publish a bounded deep scan of software locations,
+        # then continue with the exhaustive all-drive scan in this worker.
         def _deep_scan_worker():
             try:
                 if orchestrator is not None:
                     orchestrator.stop_periodic_scans()
                     orchestrator.reset_for_reenrollment()
+                    orchestrator.run_priority_scan(on_delta=_on_fs_delta)
+                    # The completed replacement snapshot is uploaded once
+                    # below; per-batch deltas here create request storms.
                     software = orchestrator.run_full_scan(include_filesystem=True)
                 else:
                     # Re-enrollment can follow a deliberate cache close.  In
@@ -4798,15 +5283,11 @@ def _run_post_enrollment_scan(zw_client, orchestrator, base_dir):
                         base_dir, include_filesystem=True
                     )
                 if zw_client.jwt:
-                    zw_client.sync_full(software, hardware_data, inventory_scope="complete")
+                    zw_client.sync_complete_inventory(software, hardware_data)
                     logging.info(
                         "[RE-ENROLL] Background deep inventory sync complete (%d items).",
                         len(software),
                     )
-
-                def _on_fs_delta(added_items, removed_items):
-                    if (added_items or removed_items) and zw_client.jwt:
-                        zw_client.sync_delta(added_items, removed_items)
 
                 if orchestrator is not None:
                     orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
@@ -5346,34 +5827,115 @@ def watchdog_process(target_exe_path):
     
     logging.info(f"[WATCHDOG] Guardian started for '{executable_name}' (PID: {os.getpid()})")
 
-    # Claim the watchdog mutex
+    # Claim the watchdog mutex.  A daemon restart can briefly overlap the old
+    # and new processes; without this check every restart leaves another
+    # watchdog behind, which appears as extra SentinelAgent processes.
     wd_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, WATCHDOG_MUTEX_NAME)
+    wd_error = ctypes.windll.kernel32.GetLastError()
+    if wd_error == 183:  # ERROR_ALREADY_EXISTS
+        logging.info("[WATCHDOG] Another watchdog is already active; exiting.")
+        return
 
     while True:
         try:
-            # Check intentional shutdown before checking the main mutex.
+            # Check the main mutex before interpreting shutdown signals.  During
+            # an OTA restart the old daemon writes an ``ota-restart`` signal
+            # while it is still alive; returning here would make the watchdog
+            # disappear before it can supervise the replacement process.
             base_dir = os.path.dirname(target_exe_path)
-            if os.path.exists(_shutdown_signal_path(base_dir)):
-                logging.info("[WATCHDOG] Shutdown signal detected; exiting watchdog.")
-                return
+            # Check if main agent holds its mutex.
+            # The GUI agent holds MUTEX_NAME; the daemon holds DAEMON_MUTEX_NAME.
+            # The watchdog must check BOTH — if either is held, the agent is alive.
+            agent_alive = False
+            for probe_name in (MUTEX_NAME, DAEMON_MUTEX_NAME):
+                probe_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, probe_name)
+                probe_err = ctypes.windll.kernel32.GetLastError()
+                if probe_mutex:
+                    ctypes.windll.kernel32.CloseHandle(probe_mutex)
+                if probe_err == 183:  # ERROR_ALREADY_EXISTS — mutex is held
+                    agent_alive = True
+                    break
 
-            # Check if main agent holds its mutex
-            agent_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
-            last_err = ctypes.windll.kernel32.GetLastError()
-            if agent_mutex:
-                ctypes.windll.kernel32.CloseHandle(agent_mutex)
-
-            # Normal state: last_err == 183 (ERROR_ALREADY_EXISTS) meaning main agent holds it.
-            # If last_err != 183, the watchdog just successfully acquired the vacant mutex, meaning agent is dead!
-            if last_err != 183:
+            if not agent_alive:
                 # If the agent was intentionally shut down (via disable/stop), it will
                 # create a shutdown signal file. In that case, the watchdog should
                 # not pop up a password prompt.
                 base_dir = os.path.dirname(target_exe_path)
                 shutdown_file = _shutdown_signal_path(base_dir)
                 if os.path.exists(shutdown_file):
-                    logging.info("[WATCHDOG] Shutdown signal detected; exiting watchdog.")
-                    sys.exit(0)
+                    # Read the signal to check if it's an OTA restart
+                    shutdown_data = consume_shutdown_signal(base_dir)
+                    shutdown_reason = (shutdown_data or {}).get("reason", "") if isinstance(shutdown_data, dict) else ""
+                    if shutdown_reason == "ota-restart":
+                        logging.info("[WATCHDOG] OTA restart signal detected. Waiting for replacement agent...")
+                        # Fall through to OTA recovery below
+                    else:
+                        logging.info("[WATCHDOG] Shutdown signal detected (reason=%s); exiting watchdog.", shutdown_reason)
+                        sys.exit(0)
+                else:
+                    shutdown_reason = ""
+
+                # --- OTA Recovery ---
+                # If a .bak file exists OR we got an ota-restart signal, the agent
+                # is restarting for an OTA update. Wait for the replacement to
+                # acquire the daemon mutex. If it never starts, relaunch or rollback.
+                bak_path = target_exe_path + ".bak"
+                has_bak = os.path.exists(bak_path)
+                if has_bak or shutdown_reason == "ota-restart":
+                    logging.info(
+                        "[WATCHDOG] OTA update in progress (bak=%s, signal=%s). "
+                        "Waiting up to 5 minutes for replacement agent...",
+                        has_bak, shutdown_reason == "ota-restart",
+                    )
+                    replacement_started = False
+                    for _wait_tick in range(60):  # 60 × 5s = 5 minutes
+                        time.sleep(5)
+                        # Check if the replacement agent acquired a mutex
+                        for probe_name in (MUTEX_NAME, DAEMON_MUTEX_NAME):
+                            probe_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, probe_name)
+                            probe_err = ctypes.windll.kernel32.GetLastError()
+                            if probe_mutex:
+                                ctypes.windll.kernel32.CloseHandle(probe_mutex)
+                            if probe_err == 183:  # ERROR_ALREADY_EXISTS
+                                replacement_started = True
+                                break
+                        if replacement_started:
+                            break
+                        # Also check if a new shutdown signal appeared
+                        if os.path.exists(_shutdown_signal_path(base_dir)):
+                            logging.info("[WATCHDOG] Shutdown signal during OTA wait; exiting.")
+                            sys.exit(0)
+
+                    if replacement_started:
+                        logging.info("[WATCHDOG] Replacement agent started successfully. Exiting watchdog.")
+                        sys.exit(0)
+
+                    # Replacement never started — try to relaunch the current exe
+                    logging.warning("[WATCHDOG] Replacement agent did not start within 5 minutes. Attempting relaunch...")
+                    try:
+                        from common.os_replacer import _relaunch_detached
+                        if _relaunch_detached(target_exe_path, reopen_gui=False):
+                            logging.info("[WATCHDOG] Relaunched agent from current exe. Exiting watchdog.")
+                            sys.exit(0)
+                    except Exception as relaunch_exc:
+                        logging.error("[WATCHDOG] Relaunch failed: %s", relaunch_exc)
+
+                    # Relaunch failed — rollback from .bak if available
+                    if has_bak:
+                        logging.warning("[WATCHDOG] Relaunch failed. Rolling back from .bak...")
+                        try:
+                            import shutil
+                            shutil.copy2(bak_path, target_exe_path)
+                            logging.info("[WATCHDOG] Rolled back to previous version from .bak.")
+                            from common.os_replacer import _relaunch_detached
+                            if _relaunch_detached(target_exe_path, reopen_gui=False):
+                                logging.info("[WATCHDOG] Relaunched rolled-back agent. Exiting watchdog.")
+                                sys.exit(0)
+                        except Exception as rollback_exc:
+                            logging.critical("[WATCHDOG] Rollback also failed: %s. Manual recovery needed.", rollback_exc)
+
+                    logging.critical("[WATCHDOG] All OTA recovery attempts failed. Exiting.")
+                    sys.exit(1)
 
                 logging.info("[WATCHDOG] Main agent killed! Exiting watchdog (termination protection disabled).")
                 sys.exit(0)
@@ -5402,8 +5964,10 @@ def export_fingerprint_json(base_dir, fingerprint, username=None, asset_name=Non
         payload["organization_name"] = _sanitize_organization_name(organization_name)
     payload["identity_updated_at"] = datetime.datetime.now().isoformat()
     filepath = _fingerprint_json_path(base_dir)
-    _write_fingerprint_json(base_dir, payload)
-    logging.info(f"Fingerprint saved: {filepath}")
+    if _write_fingerprint_json(base_dir, payload):
+        logging.info(f"Fingerprint saved: {filepath}")
+    else:
+        logging.warning("Fingerprint metadata was not updated; existing fingerprint retained: %s", filepath)
 
 def export_products_csv(base_dir, inventory):
     """Exports the full inventory to products.csv."""
@@ -5422,7 +5986,7 @@ def export_products_csv(base_dir, inventory):
     writer.writeheader()
     writer.writerows(inventory)
     serialized = buffer.getvalue().encode("utf-8")
-    encrypted = encrypt_data(serialized)
+    encrypted = encrypt_data(serialized, "products_export")
     data_to_write = encrypted if encrypted else serialized
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     temp_path = f"{filepath}.{uuid.uuid4().hex}.tmp"
@@ -5431,6 +5995,7 @@ def export_products_csv(base_dir, inventory):
         f.flush()
         os.fsync(f.fileno())
     os.replace(temp_path, filepath)
+    _make_macos_shared_file(filepath)
     try:
         subprocess.run(
             ["attrib", "+H", "+S", filepath],
@@ -5622,6 +6187,28 @@ def main_agent():
     if not zw_client.jwt:
         return
 
+    # Prove daemon connectivity immediately after authentication.  The GUI
+    # sends its first heartbeat from the dashboard refresh worker, but the
+    # daemon used to wait until after startup/scan work before its first main
+    # loop heartbeat.  A slow Windows inventory startup could therefore make
+    # an otherwise healthy background agent appear offline.
+    try:
+        first_heartbeat = zw_client.heartbeat()
+        logging.info(
+            "[HEARTBEAT] Immediate daemon heartbeat result=%s status=%s.",
+            first_heartbeat,
+            zw_client.last_server_status,
+        )
+    except Exception:
+        logging.exception("[HEARTBEAT] Immediate daemon heartbeat failed.")
+
+    approval_sync_claimed = zw_client.claim_approval_sync()
+    approval_sync_already_complete = zw_client.approval_sync_complete()
+    if approval_sync_claimed:
+        logging.info("[ENROLLMENT] Approval claimed by daemon; starting one complete inventory sync.")
+    elif approval_sync_already_complete:
+        logging.info("[ENROLLMENT] Approval sync already complete; skipping duplicate startup sync.")
+
     # Keep the endpoint alive while the initial inventory is running. Windows
     # inventory can take longer than one heartbeat interval, so the heartbeat
     # service must not wait for the scan to finish.
@@ -5650,6 +6237,26 @@ def main_agent():
         logging.info("Skipping file ACL protection in standard profile.")
 
 
+    # Publish the approval baseline before initializing the scanner/cache.
+    # Cache setup and filesystem enumeration can be slow or blocked by a
+    # stale process; neither should delay the first inventory upload.
+    if is_inventory_scan_enabled() and not approval_sync_already_complete:
+        baseline_software = get_installed_software_registry()
+        baseline_hardware = get_detailed_hardware_profile()
+        logging.info(
+            "Initial Windows Layer 0 baseline collected (%d installed-software items).",
+            len(baseline_software),
+        )
+        if baseline_software and zw_client.jwt:
+            try:
+                zw_client.sync_full(baseline_software, baseline_hardware, inventory_scope="partial")
+                logging.info("[STARTUP_SCAN] Initial Layer 0 baseline synced to backend immediately.")
+            except Exception as e:
+                logging.warning(f"[STARTUP_SCAN] Immediate Layer 0 baseline sync failed: {e}")
+    else:
+        baseline_software = []
+        baseline_hardware = get_detailed_hardware_profile() if is_inventory_scan_enabled() else {}
+
     # --- Initialize Scan Orchestrator ---
     # Wraps the existing registry scanner + adds Store apps, drivers,
     # OS version, portable PE binaries, and manifest parsing.
@@ -5677,8 +6284,75 @@ def main_agent():
         logging.error(f"ScanOrchestrator init failed, falling back to registry only: {_orch_err}")
         _orchestrator = None
 
+    # --- Daemon-owned post-enrollment synchronization ---
+    # Publish the fast baseline above, then run one complete deep scan in a
+    # long-lived worker.  No GUI callback owns this lifecycle and no timeout
+    # starts a second scanner against the same SQLite cache.
+    deep_scan_done = threading.Event()
+    if is_inventory_scan_enabled() and _orchestrator is not None and not approval_sync_already_complete:
+        def _on_fs_delta(added_items, removed_items):
+            if (added_items or removed_items) and zw_client.jwt:
+                try:
+                    zw_client.sync_delta(added_items, removed_items)
+                except Exception:
+                    logging.exception("[SCAN] Background filesystem delta sync failed.")
+
+        def _run_initial_deep_scan():
+            started = time.perf_counter()
+            logging.info("[STARTUP_SCAN] Initial priority scan started (daemon-owned).")
+            sync_ok = False
+            try:
+                # Use startup scan: L0 + priority-path L1/L2 (parallelized).
+                # Full disk walk is left to the periodic deep scan (24h cadence).
+                deep_items = _orchestrator.run_startup_scan()
+                if zw_client.jwt:
+                    synced = zw_client.sync_complete_inventory(deep_items, baseline_hardware)
+                    sync_ok = synced
+                    if synced:
+                        logging.info(
+                            "[STARTUP_SCAN] Initial priority scan completed and synced: %d items in %.1fs.",
+                            len(deep_items), time.perf_counter() - started,
+                        )
+                    else:
+                        logging.warning("[STARTUP_SCAN] Priority scan completed but full sync was not accepted.")
+            except Exception:
+                logging.exception("[STARTUP_SCAN] Initial priority scan failed.")
+            finally:
+                if approval_sync_claimed:
+                    zw_client.finish_approval_sync(sync_ok)
+                deep_scan_done.set()
+                if zw_client.jwt:
+                    try:
+                        _orchestrator.start_periodic_scans(on_delta=_on_fs_delta)
+                        logging.info("[SCAN] Periodic filesystem scans enabled.")
+                    except Exception:
+                        logging.exception("[SCAN] Could not enable periodic filesystem scans.")
+
+        threading.Thread(
+            target=_run_initial_deep_scan,
+            name="windows-initial-startup-scan",
+            daemon=True,
+        ).start()
+        logging.info("[STARTUP_SCAN] Initial priority scan queued immediately after approval baseline.")
+    else:
+        if approval_sync_claimed:
+            # No scanner means the claimed approval cannot be completed yet;
+            # leave enrollment valid and allow the next daemon cycle to retry.
+            zw_client.finish_approval_sync(False)
+        deep_scan_done.set()
+        if approval_sync_already_complete and _orchestrator is not None:
+            try:
+                _orchestrator.start_periodic_scans()
+            except Exception:
+                logging.exception("[SCAN] Could not resume periodic scans after completed approval sync.")
+        if is_inventory_scan_enabled():
+            logging.warning("[SCAN] Orchestrator unavailable; baseline-only sync used.")
+
     # --- Full Inventory ---
-    if is_inventory_scan_enabled():
+    # The legacy timeout/restart implementation is retained below for
+    # reference, but is disabled.  It could overlap SQLite workers and make
+    # the deep scan appear to be skipped.
+    if False and is_inventory_scan_enabled():
         show_windows_notification("Zerowatch", "Sentinel Agent running in Background")
         logging.info("Running full software + hardware inventory...")
         inventory_scope = "complete"
@@ -5737,7 +6411,7 @@ def main_agent():
             inventory_scope = "partial"
 
         # Get high-fidelity hardware profile (unchanged)
-        hardware_data = get_detailed_hardware_profile()
+        hardware_data = baseline_hardware
 
         logging.info("Syncing full inventory to backend via JSON...")
         zw_client.sync_full(software, hardware_data, inventory_scope=inventory_scope)
@@ -5791,13 +6465,20 @@ def main_agent():
                 # replace the partial enrollment inventory with its result.
                 def _run_deep_scan_after_baseline():
                     try:
-                        deep_items = _orchestrator.run_full_scan(include_filesystem=True)
+                        # Publish the bounded deep/software-location pass
+                        # first; the all-drive scan continues afterward.
+                        _orchestrator.run_priority_scan(on_delta=_on_fs_delta)
+                        deep_items = _orchestrator.run_full_scan(
+                            include_filesystem=True,
+                            on_delta=_on_fs_delta,
+                        )
                         if zw_client.jwt:
-                            zw_client.sync_full(
-                                deep_items, hardware_data, inventory_scope="complete"
+                            sync_ok = zw_client.sync_complete_inventory(
+                                deep_items, hardware_data
                             )
                             logging.info(
-                                "Background Windows deep scan sync completed (%d items).",
+                                "Background Windows deep scan sync completed: %s (%d items).",
+                                sync_ok,
                                 len(deep_items),
                             )
                     except Exception as _deep_err:
@@ -5832,13 +6513,25 @@ def main_agent():
     zw_client.log_event("STARTUP", {"version": AGENT_VERSION, "status": "active"})
 
     # --- Background Monitor ---
-    logging.info("Starting background change monitor...")
-    monitor = threading.Thread(
-        target=monitor_system_changes,
-        args=(base_dir, fingerprint, zw_client, _orchestrator),
-        daemon=True
-    )
-    monitor.start()
+    # The monitor shares the orchestrator cache.  Do not let it race the
+    # daemon-owned initial deep scan; it starts as soon as that scan has
+    # finished (or immediately when inventory scanning is disabled).
+    def _start_change_monitor():
+        deep_scan_done.wait()
+        logging.info("Starting background change monitor...")
+        monitor = threading.Thread(
+            target=monitor_system_changes,
+            args=(base_dir, fingerprint, zw_client, _orchestrator),
+            daemon=True,
+            name="windows-change-monitor",
+        )
+        monitor.start()
+
+    threading.Thread(
+        target=_start_change_monitor,
+        name="windows-monitor-bootstrap",
+        daemon=True,
+    ).start()
 
     ota_shutdown = threading.Event()
     ota_monitor = None
@@ -5846,7 +6539,7 @@ def main_agent():
         try:
             from common.daemon_ota import start_daemon_ota_monitor
             ota_monitor = start_daemon_ota_monitor(
-                get_exe_path(), AGENT_VERSION, ota_shutdown
+                get_exe_path(), AGENT_VERSION, ota_shutdown, check_interval=RESTART_CHECK_TIME
             )
         except Exception as exc:
             logging.warning("[OTA] Background update monitor unavailable: %s", exc)
@@ -5857,6 +6550,7 @@ def main_agent():
     last_heartbeat = 0
     last_watchdog_check = 0
     last_asset_poll = 0
+    last_update_cleanup_check = 0
     was_offline = False
 
     pin_mismatch_backoff_idx = 0
@@ -5865,6 +6559,7 @@ def main_agent():
     while True:
         try:
             if ota_shutdown.is_set():
+                request_shutdown_signal(base_dir, "ota-restart")
                 logging.info("[OTA] Updated agent restart requested.")
                 break
             shutdown_request = consume_shutdown_signal(base_dir)
@@ -5905,7 +6600,12 @@ def main_agent():
                             logging.warning("[MAIN] Error closing orchestrator: %s", _ce)
                     _orchestrator_closed_for_unlink = True
                     break
-                # Also respect shutdown signal mid-sleep
+                # Also respect OTA update restart or shutdown signal mid-sleep
+                if ota_shutdown.is_set():
+                    request_shutdown_signal(base_dir, "ota-restart")
+                    logging.info("[MAIN] OTA restart requested mid-sleep. Exiting heartbeat loop.")
+                    shutdown_during_sleep = True
+                    break
                 if consume_shutdown_signal(base_dir):
                     logging.info("[MAIN] Shutdown signal detected mid-sleep. Exiting.")
                     shutdown_during_sleep = True
@@ -6017,6 +6717,32 @@ def main_agent():
                 elif result is True:
                     logging.info("[HEARTBEAT] Success (status=%s).", zw_client.last_server_status)
                     pin_mismatch_backoff_idx = 0
+
+                    # The old OTA watchdog is launched from the renamed
+                    # .bak image and may release that file only after it sees
+                    # this replacement daemon alive.  Retry the commit after
+                    # a real heartbeat so cleanup does not depend on opening
+                    # the GUI later.
+                    if now - last_update_cleanup_check >= 30:
+                        last_update_cleanup_check = now
+                        try:
+                            current_exe = get_exe_path()
+                            bak_path = current_exe + ".bak"
+                            from common.os_replacer import (
+                                _terminate_stale_windows_watchdogs,
+                                startup_bak_cleanup,
+                            )
+                            if sys.platform == "win32" and os.path.exists(bak_path):
+                                stale_watchdogs = _terminate_stale_windows_watchdogs(current_exe)
+                                if stale_watchdogs and not skip_watchdog:
+                                    # Restore exactly one watchdog after the
+                                    # old image has been released.
+                                    time.sleep(1)
+                                    spawn_watchdog()
+                            startup_bak_cleanup(current_exe)
+                        except Exception as cleanup_exc:
+                            logging.debug("[OTA] Deferred .bak cleanup skipped: %s", cleanup_exc)
+
                     if was_offline:
                         was_offline = False
                         logging.info("[ONLINE] Reconnected to backend.")
@@ -6475,8 +7201,13 @@ class EnrollmentFrame(tk.Frame):
         try:
             if getattr(self, "is_individual", False):
                 res = self.zw_client.request_individual_join(self.individual_code)
-                if res.get("success") and res.get("jwt"):
-                    self.after(0, self._on_success)
+                if res.get("success"):
+                    if res.get("status") == "pending":
+                        self.after(0, lambda: self._goto_pending())
+                    elif res.get("jwt"):
+                        self.after(0, self._on_success)
+                    else:
+                        self.after(0, lambda: self._goto_pending())
                 else:
                     msg = res.get("message", "Registration failed")
                     self.after(0, lambda: self.status_label_meta.config(text=msg, fg="#f87171"))
@@ -6498,6 +7229,26 @@ class EnrollmentFrame(tk.Frame):
     def _goto_pending(self):
         self.show_screen("PENDING")
         self._start_polling()
+
+        # Pending enrollment must be owned by a process independent of Tk.
+        # macOS previously skipped this branch while deferring launchd
+        # registration until approval; closing the GUI then killed the only
+        # approval poller. The bootstrap is idempotent and uses the system
+        # LaunchDaemon when available, otherwise a user LaunchAgent.
+        if sys.platform == "darwin":
+            try:
+                _auto_bootstrap_background_agent()
+            except Exception as exc:
+                logging.warning("[GUI] macOS pending-state daemon bootstrap failed: %s", exc)
+        else:
+            # The daemon must own approval polling even after this window is
+            # closed.  Use the same serialized bootstrap path as all other
+            # GUI/startup triggers so the pending state cannot be left with
+            # only the Tk polling thread alive.
+            try:
+                _auto_bootstrap_background_agent()
+            except Exception as exc:
+                logging.warning("[GUI] Pre-approval daemon bootstrap failed: %s", exc)
 
     def _start_polling(self):
         if self._polling_active:
@@ -6537,6 +7288,20 @@ class EnrollmentFrame(tk.Frame):
         def _post_enrollment_tasks():
             _append_gui_log(self.zw_client.base_dir, "Starting post-enrollment system integration...")
             
+            # Send immediate baseline inventory sync so backend builds CVE
+            # feed right away.  Skip on macOS where the background daemon
+            # owns inventory collection — running a GUI scan here races
+            # with the daemon and can upload an empty/partial result.
+            if sys.platform != "darwin":
+                try:
+                    hardware_data = get_detailed_hardware_profile()
+                    fast_software = get_installed_software_registry()
+                    if fast_software and self.zw_client.jwt:
+                        synced = self.zw_client.sync_full(fast_software, hardware_data, inventory_scope="partial")
+                        logging.info("[GUI] Immediate post-enrollment Layer 0 sync: %s (%d items)", synced, len(fast_software))
+                except Exception as exc:
+                    logging.warning("[GUI] Post-enrollment initial inventory sync error: %s", exc)
+
             # Register startup persistence so daemon survives reboots
             try:
                 task_ok = register_task_scheduler()
@@ -6545,14 +7310,9 @@ class EnrollmentFrame(tk.Frame):
             except Exception as exc:
                 logging.warning("Post-enrollment persistence registration failed: %s", exc)
 
-            # Spawn the background daemon process (detached, survives window close)
+            # Ensure the detached daemon process exists.
             try:
-                if not _is_daemon_running():
-                    started, pid = _spawn_daemon_process()
-                    if started:
-                        logging.info("Post-enrollment daemon spawned (pid=%s).", pid)
-                    else:
-                        logging.warning("Post-enrollment daemon spawn returned no PID.")
+                _auto_bootstrap_background_agent()
             except Exception as exc:
                 logging.warning("Post-enrollment daemon spawn failed: %s", exc)
                 
@@ -7053,7 +7813,8 @@ class DashboardFrame(tk.Frame):
         header.pack(fill=tk.X, pady=(0, 12))
         tk.Label(header, text="SETTINGS", fg=self.c_white, bg=self.c_bg_base, font=("Arial", 22, "bold")).pack(side=tk.LEFT)
         
-        desc = tk.Label(parent_frame, text="Configure how this device operates. Changes require administrator privileges.", fg=self.c_gray, bg=self.c_bg_base, font=self.f_normal, justify=tk.LEFT)
+        settings_description = "Configure how this device operates. Changes require administrator privileges."
+        desc = tk.Label(parent_frame, text=settings_description, fg=self.c_gray, bg=self.c_bg_base, font=self.f_normal, justify=tk.LEFT)
         desc.pack(anchor="w", pady=(0, 24))
         
         container = tk.Frame(parent_frame, bg=self.c_bg_base)
@@ -7101,18 +7862,17 @@ class DashboardFrame(tk.Frame):
         
         inventory_enabled = tk.BooleanVar()
         inventory_enabled.set(is_inventory_scan_enabled())
-            
+
         def toggle_inventory():
             enabled = inventory_enabled.get()
-            set_inventory_scan_enabled(enabled)
-            if enabled:
-                show_windows_notification("Zerowatch", "Sentinel Agent running in Background")
-            else:
-                show_windows_notification("Zerowatch", "Sentinel Agent stopped scanning")
-                
+            setting_ok = set_inventory_scan_enabled(enabled)
+            if sys.platform == "darwin" and not setting_ok:
+                inventory_enabled.set(not enabled)
+                from tkinter import messagebox
+                messagebox.showerror("Administrator Authorization Required", "An administrator must authorize this inventory setting change.")
+
         make_toggle(top, inventory_enabled, toggle_inventory).pack(side=tk.RIGHT)
-        
-        tk.Label(card, text="Automatically scan and collect hardware and software inventory.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
+        tk.Label(card, text="Automatically scan and collect hardware and software inventory. Administrator authorization is required on macOS.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
         
         card2 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=24, pady=18)
         card2.pack(fill=tk.X, pady=(0, 10))
@@ -7123,18 +7883,17 @@ class DashboardFrame(tk.Frame):
         
         auto_start_enabled = tk.BooleanVar()
         auto_start_enabled.set(is_auto_start_enabled())
-            
+
         def toggle_auto_start():
             enabled = auto_start_enabled.get()
-            set_auto_start_enabled(enabled)
-            if enabled:
-                show_windows_notification("Zerowatch", "Agent will now auto start on boot")
-            else:
-                show_windows_notification("Zerowatch", "Auto start on boot disabled")
-                
+            setting_ok = set_auto_start_enabled(enabled)
+            if sys.platform == "darwin" and not setting_ok:
+                auto_start_enabled.set(not enabled)
+                from tkinter import messagebox
+                messagebox.showerror("Administrator Authorization Required", "An administrator must authorize this launchd setting change.")
+
         make_toggle(top2, auto_start_enabled, toggle_auto_start).pack(side=tk.RIGHT)
-        
-        tk.Label(card2, text="Automatically start the agent when the computer boots.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
+        tk.Label(card2, text="Automatically start the agent through launchd. Administrator authorization is required on macOS.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
 
         card3 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=24, pady=18)
         card3.pack(fill=tk.X, pady=(0, 10))
@@ -7416,7 +8175,7 @@ class DashboardFrame(tk.Frame):
 
                 # 1. Wait for auxiliary processes before scheduling relaunch.
                 _wait_for_auxiliary_processes()
-                success = _relaunch_detached(current_exe)
+                success = _relaunch_detached(current_exe, reopen_gui=True)
                 if not success:
                     # Relaunch failed — undo the shutdown signal so the watchdog keeps running
                     try:
@@ -7688,69 +8447,36 @@ class DashboardFrame(tk.Frame):
                     self.after(0, self.master.show_enrollment)
                     return
 
-                # 2. Ensure initial inventory scan & sync runs if server has no software
-                # Inventory belongs to the background daemon.  When the GUI
-                # also starts a scan here, it can race the daemon and upload
-                # a registry-only fallback repeatedly, masking the deep-scan
-                # result in the backend.
-                if not getattr(self, "inventory_synced", False) and not _is_daemon_running():
+                # 2. Ensure initial inventory scan & sync runs if server has no software.
+                # On macOS, inventory is owned entirely by the background daemon
+                # (managed by launchd).  Allowing the GUI to trigger scans races
+                # with the daemon and can overwrite the deep-scan result with a
+                # partial/empty registry-only scan.
+                if sys.platform != "darwin" and not getattr(self, "inventory_synced", False):
                     product_count = (info.get("stats", {}) or {}).get("productCount") if isinstance(info, dict) else None
                     if product_count is None or product_count == 0:
-                        logging.info("GUI: No server inventory detected. Triggering full scan (60s deadline)...")
+                        logging.info("GUI: No server inventory detected. Syncing Layer 0 baseline immediately...")
                         hardware_data = get_detailed_hardware_profile()
-                        
-                        _FULL_SCAN_TIMEOUT = 60  # seconds
-                        full_items = []
-                        full_scan_done = threading.Event()
-                        full_scan_err = []
-
-                        def _run_full():
+                        l0_software = get_installed_software_registry()
+                        if l0_software and self.zw_client.jwt:
                             try:
-                                res = get_full_software_inventory(self.zw_client.base_dir, include_filesystem=True)
-                                if isinstance(res, list):
-                                    full_items.extend(res)
-                            except Exception as exc:
-                                full_scan_err.append(exc)
-                            finally:
-                                full_scan_done.set()
-
-                        scan_thread = threading.Thread(target=_run_full, daemon=True, name="gui-initial-full-scan")
-                        scan_thread.start()
-
-                        # Wait up to 60 seconds for full scan to complete
-                        completed_in_time = full_scan_done.wait(timeout=_FULL_SCAN_TIMEOUT)
-
-                        if completed_in_time and not full_scan_err and full_items:
-                            logging.info("GUI: Full scan completed within %ds — syncing %d items in one shot.", _FULL_SCAN_TIMEOUT, len(full_items))
-                            if self.zw_client.sync_full(full_items, hardware_data, inventory_scope="complete"):
-                                self.inventory_synced = True
-                        else:
-                            # 60s deadline exceeded or error: fallback to fast L0 sync immediately
-                            if not completed_in_time:
-                                logging.warning("GUI: Full scan exceeded %ds timeout — falling back to L0-only immediate sync.", _FULL_SCAN_TIMEOUT)
-                            else:
-                                logging.warning("GUI: Full scan error (%s) — falling back to L0-only sync.", full_scan_err[0] if full_scan_err else "unknown")
-
-                            try:
-                                l0_software = get_installed_software_registry()
                                 if self.zw_client.sync_full(l0_software, hardware_data, inventory_scope="partial"):
                                     self.inventory_synced = True
-                                    logging.info("GUI: Fallback L0 sync completed (%d items).", len(l0_software) if isinstance(l0_software, list) else 0)
-
-                                # Follow up with deep scan deltas once the background thread completes
-                                def _bg_wait_and_delta():
-                                    full_scan_done.wait()
-                                    if full_items:
-                                        try:
-                                            self.zw_client.sync_full(full_items, hardware_data, inventory_scope="complete")
-                                            logging.info("GUI: Background full scan sync completed (%d items).", len(full_items))
-                                        except Exception as bg_err:
-                                            logging.debug("GUI background sync error: %s", bg_err)
-
-                                threading.Thread(target=_bg_wait_and_delta, daemon=True, name="gui-bg-followup").start()
-
+                                    logging.info("GUI: Layer 0 baseline synced successfully (%d items).", len(l0_software))
                             except Exception as fb_exc:
-                                logging.error("GUI: Fallback L0 sync failed: %s", fb_exc)
+                                logging.error("GUI: Layer 0 baseline sync failed: %s", fb_exc)
+
+                        # Deep filesystem scan in background (does not block UI)
+                        def _run_full_bg():
+                            try:
+                                full_items = get_full_software_inventory(self.zw_client.base_dir, include_filesystem=True)
+                                if isinstance(full_items, list) and full_items and self.zw_client.jwt:
+                                    sync_ok = self.zw_client.sync_complete_inventory(full_items, hardware_data)
+                                    logging.info("GUI: Deep scan sync completed: %s (%d items).", sync_ok, len(full_items))
+                            except Exception as deep_err:
+                                logging.debug("GUI deep scan error: %s", deep_err)
+
+                        threading.Thread(target=_run_full_bg, daemon=True, name="gui-deep-scan-bg").start()
 
                         # Re-fetch asset info immediately to show fresh stats
                         try:
@@ -8255,8 +8981,26 @@ class UnifiedSentinelGUI(tk.Tk):
 
         _apply_macos_button_theme(self)
 
+        # On Windows, ensure the background daemon is spawned when the user
+        # closes the GUI so the agent keeps running silently.  On macOS,
+        # launchd manages daemon lifecycle — spawning here causes duplicates.
+        if sys.platform != "darwin":
+            self.protocol("WM_DELETE_WINDOW", self._on_window_close)
+
         self.after(50, self._bring_to_front)
         self.after(200, self._force_show_window)
+
+    def _on_window_close(self):
+        """Called when user clicks 'X' button to close the GUI window (Windows/Linux only)."""
+        try:
+            # If enrollment is pending or already enrolled, guarantee the
+            # background daemon is running through the same idempotent path
+            # used by approval notifications and startup repair.
+            if self.zw_client and (self.zw_client.has_pending_join() or self.zw_client.is_enrolled()):
+                _auto_bootstrap_background_agent()
+        except Exception as exc:
+            logging.warning("Background daemon bootstrap on GUI close failed: %s", exc)
+        self.destroy()
 
     def _bring_to_front(self):
         try:
@@ -8332,14 +9076,9 @@ class UnifiedSentinelGUI(tk.Tk):
                         payload_status = str(data.get("status") or "").strip().lower()
 
                     if payload_status == "approved":
-                        # Ensure first inventory reaches backend immediately after admin approval.
-                        if not _is_daemon_running():
-                            self.zw_client.trigger_approval_sync(
-                                reason="feed_ready_approved",
-                                min_interval=90,
-                            )
-                        else:
-                            logging.info("[GUI] Daemon is running; skipping trigger_approval_sync.")
+                        # Approval is a daemon concern. The GUI only repairs
+                        # the daemon if necessary and never starts a scan.
+                        _auto_bootstrap_background_agent()
                     
                     if now - last_refresh > 5:
                         self._last_notif_refresh = now
@@ -8347,13 +9086,7 @@ class UnifiedSentinelGUI(tk.Tk):
                         if isinstance(self.current_frame, EnrollmentFrame):
                             status = self.zw_client.refresh_join_status_once()
                             if status.get("status") == "approved" and self.zw_client.jwt:
-                                if not _is_daemon_running():
-                                    self.zw_client.trigger_approval_sync(
-                                        reason="enrollment_approved",
-                                        min_interval=90,
-                                    )
-                                else:
-                                    logging.info("[GUI] Daemon is running; skipping trigger_approval_sync.")
+                                _auto_bootstrap_background_agent()
                                 self.show_dashboard()
                         elif isinstance(self.current_frame, DashboardFrame):
                             # Just refresh the dashboard data
@@ -8573,25 +9306,36 @@ def run_interactive():
         else:
             prompt_consent(base_dir, force_show=False)
 
-        # Single-command UX: launching GUI also ensures background daemon and
-        # startup persistence are active for both sudo and non-sudo launches.
-        _auto_bootstrap_background_agent()
-
         # Default routing logic with a 2-second "Server Veto"
         is_enrolled_locally = zw_client.is_enrolled()
         
         if is_enrolled_locally:
             logging.info("Startup: Device enrolled locally. Verifying with server (2s timeout)...")
-            # Perform a quick synchronous check to see if we should auto-reset
-            verify_res = zw_client.refresh_join_status_once() # This has a timeout
+            # macOS approval is already represented by the authenticated JWT.
+            # Re-querying join-status during GUI startup can return a transient
+            # non-approved response after the request has been consumed and
+            # incorrectly wipe valid local state (as seen in the attached
+            # logs). Verify the authenticated device instead; only an explicit
+            # unlink response is destructive. Keep the old join-status check
+            # unchanged for Windows/Linux.
+            if sys.platform == "darwin" and zw_client.jwt:
+                verify_res = {"status": zw_client.heartbeat()}
+            else:
+                verify_res = zw_client.refresh_join_status_once() # This has a timeout
             
             # If server explicitly says we are NOT approved, wipe and show enrollment
-            if verify_res.get("status") in {"denied", "unlinked"}:
+            if verify_res.get("status") == "unlinked" or (
+                sys.platform != "darwin" and verify_res.get("status") == "denied"
+            ):
                 logging.info("Startup: Server rejected enrollment. Wiping local state.")
                 zw_client.clear_local_state()
                 is_enrolled_locally = False
             else:
                 logging.info(f"Startup: Server verification result: {verify_res.get('status')}")
+                # FIX: Daemon spawned only after server confirms enrollment valid.
+                # Previously called before this check — caused a race where the daemon
+                # spawned then state was wiped before it could load the JWT.
+                _auto_bootstrap_background_agent()
 
         if is_enrolled_locally:
             logging.info("Startup: Proceeding to Dashboard.")
@@ -8654,10 +9398,84 @@ def _wait_for_restart_parent() -> None:
             result = ctypes.windll.kernel32.WaitForSingleObject(parent, 30000)
             if result == WAIT_TIMEOUT:
                 logging.warning("[OTA] Timed out waiting for restart parent PID %s.", parent_pid)
+            else:
+                # Allow a brief moment for OS to clean up kernel handles and mutexes
+                time.sleep(0.5)
         finally:
             ctypes.windll.kernel32.CloseHandle(parent)
     except Exception as exc:
         logging.warning("[OTA] Could not wait for restart parent PID %s: %s", parent_pid, exc)
+
+
+def full_uninstall():
+    """Remove ALL persistence artifacts created by the agent.
+
+    This is the nuclear cleanup option — removes every registry entry,
+    scheduled task, Windows service, and state file created by the agent.
+    Used by the --uninstall CLI flag and by external uninstallers.
+    """
+    print("[SentinelAgent] Removing all persistence artifacts...")
+
+    # 1. Registry Run keys (canonical + legacy orphan)
+    try:
+        unregister_startup_registry()
+        print("  [OK] Registry startup entries removed.")
+    except Exception as e:
+        print(f"  [WARN] Registry cleanup partial: {e}")
+
+    # 2. Scheduled tasks
+    try:
+        unregister_task_scheduler()
+        print("  [OK] Scheduled tasks removed.")
+    except Exception as e:
+        print(f"  [WARN] Task scheduler cleanup partial: {e}")
+
+    # 3. Windows service
+    try:
+        unregister_windows_service()
+        print("  [OK] Windows service removed.")
+    except Exception as e:
+        print(f"  [WARN] Service cleanup partial: {e}")
+
+    # 4. ZeroWatch agent registry keys (SOFTWARE\Zerowatch\Agent)
+    if sys.platform == "win32":
+        for hive, hive_name in [
+            (winreg.HKEY_LOCAL_MACHINE, "HKLM"),
+            (winreg.HKEY_CURRENT_USER, "HKCU"),
+        ]:
+            for subkey in (r"SOFTWARE\Zerowatch\Agent", r"SOFTWARE\Zerowatch"):
+                try:
+                    winreg.DeleteKey(hive, subkey)
+                    logging.info("Removed registry key %s\\%s.", hive_name, subkey)
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass  # Key may have subkeys — ignore
+        print("  [OK] ZeroWatch registry keys cleaned.")
+
+    # 5. State directory (%PROGRAMDATA%\ZeroWatch\state)
+    try:
+        base_dir = get_base_dir()
+        state_dir = _secure_state_dir(base_dir)
+        if os.path.isdir(state_dir):
+            shutil.rmtree(state_dir, ignore_errors=True)
+            print(f"  [OK] State directory removed: {state_dir}")
+        # Also try to remove the parent ZeroWatch folder if empty
+        parent = os.path.dirname(state_dir)
+        if os.path.isdir(parent) and not os.listdir(parent):
+            os.rmdir(parent)
+    except Exception as e:
+        print(f"  [WARN] State directory cleanup partial: {e}")
+
+    # 6. Shutdown signal (prevent watchdog from reviving)
+    try:
+        base_dir = get_base_dir()
+        request_shutdown_signal(base_dir, "uninstall")
+    except Exception:
+        pass
+
+    print("\n[SentinelAgent] Uninstall complete. All agent persistence removed.")
+    print("  Reboot to confirm no agent processes start automatically.")
 
 
 def main():
@@ -8668,11 +9486,22 @@ def main():
       --daemon            -> Silent background agent (detached)
       --password-prompt   -> Show the visible kill CLI
       --watchdog          -> Internal watchdog process
+      --uninstall         -> Remove all persistence artifacts
       (default)           -> Interactive routing (Enroll -> Dashboard)
     """
     # A Windows OTA child starts immediately, then waits here until the old
     # process releases all executable and agent resources.
     _wait_for_restart_parent()
+
+    # 0. Full uninstall (must run before console hiding)
+    if "--uninstall" in sys.argv:
+        full_uninstall()
+        return
+
+    # A direct macOS ``--daemon`` launch must have the same lifecycle as a
+    # launchd service.  This runs before GUI routing and before any terminal
+    # cleanup trap can turn a terminal hangup into an agent shutdown.
+    _detach_macos_daemon_from_terminal()
 
     # 1. Immediate Console Hiding
     if "--password-prompt" not in sys.argv and "--reset" not in sys.argv:
@@ -8703,6 +9532,17 @@ def main():
     except Exception:
         pass  # Never block startup
 
+    # 1.55 Repair state file ACLs after an OTA update.
+    #      Files in %PROGRAMDATA%\ZeroWatch\state created by an admin-elevated
+    #      process inherit only admin-level ACLs.  When the OTA-spawned daemon
+    #      restarts as the normal user, it cannot write to these files and dies.
+    #      This step grants the current user FullControl on every existing file
+    #      in the state directory so the agent can operate normally.
+    try:
+        _repair_state_file_acls()
+    except Exception:
+        pass  # Never block startup
+
     # 1.6  Consume any leftover OTA shutdown signal from the previous agent.
     #      During OTA restart, the OLD agent writes shutdown.signal so its watchdog
     #      exits cleanly. The NEW agent must delete it so ITS watchdog starts normally
@@ -8718,6 +9558,8 @@ def main():
         fp = collect_fingerprint()
         hn = resolve_hostname(base_dir)
         client = ZeroWatchClient(base_dir, fp['device_id'], hn)
+        # Keep approval polling alive if this enrollment window is closed.
+        _auto_bootstrap_background_agent()
         app = UnifiedSentinelGUI(client, force_frame="enroll")
         app.mainloop()
         return
@@ -8731,6 +9573,8 @@ def main():
         if not client.jwt:
             logging.error("Agent not enrolled. Use --enroll first.")
             return
+        if sys.platform == "darwin":
+            _auto_bootstrap_background_agent()
         app = UnifiedSentinelGUI(client, force_frame="dashboard")
         app.mainloop()
         return
@@ -8781,7 +9625,19 @@ def main():
             agent = MacOSSentinelAgent()
             agent.run()
         else:
-            main_agent()
+            # A transient state/ACL/network exception must not leave the
+            # endpoint permanently without a daemon.  The watchdog supervises
+            # the executable, but it intentionally exits when the daemon
+            # mutex disappears; retry daemon startup here instead.
+            while True:
+                try:
+                    main_agent()
+                    break
+                except Exception:
+                    logging.exception("Background daemon crashed; retrying startup in 10 seconds.")
+                    if consume_shutdown_signal(get_base_dir()):
+                        break
+                    time.sleep(10)
         return
 
     # Default interactive routing

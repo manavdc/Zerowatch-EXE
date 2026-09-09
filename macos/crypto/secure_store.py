@@ -116,6 +116,7 @@ logger = logging.getLogger("macos.crypto.secure_store")
 
 KEYCHAIN_SERVICE = "io.deepcytes.zerowatch.agent"
 KEYCHAIN_ACCOUNT_PREFIX = "agent-credential"
+KEYCHAIN_NAMED_ACCOUNT_PREFIX = "agent-state"
 
 # Reference token tag written to disk (persisted, never contains the secret)
 _TOKEN_TAG = b"ZW_KC::"
@@ -147,6 +148,24 @@ def _derive_slot_id(data: bytes) -> str:
 def _account_for_slot(slot_id: str) -> str:
     """Produce the Keychain account string for a given slot ID."""
     return f"{KEYCHAIN_ACCOUNT_PREFIX}:{slot_id}"
+
+
+def _slot_id_for_name(name: str) -> str:
+    """Return a stable Keychain slot for one logical agent secret.
+
+    The original implementation derived the account from the plaintext.  That
+    made every update to a cache or join-state file create a new Keychain item.
+    Besides leaking stale records, macOS can ask for authorization again when
+    a new item is accessed.  Logical records must therefore keep the same
+    account while their value changes.
+    """
+    normalized = str(name or "default").strip().lower()
+    digest = hashlib.sha256(f"zerowatch-state:{normalized}".encode("utf-8")).hexdigest()
+    return digest[:_SLOT_ID_HEX_LEN]
+
+
+def _account_for_name(name: str) -> str:
+    return f"{KEYCHAIN_NAMED_ACCOUNT_PREFIX}:{str(name or 'default').strip().lower()}"
 
 
 def _make_reference_token(slot_id: str) -> bytes:
@@ -300,6 +319,24 @@ class MacOSSecureStore(SecureStore):
         )
         return token
 
+    def encrypt_named(self, data: bytes, name: str) -> Optional[bytes]:
+        """Store a logical secret in one stable Keychain record.
+
+        This is an additive API used by the agent's persistent state files.
+        ``encrypt`` remains available for callers using the legacy
+        content-addressed reference format.
+        """
+        if data is None or not isinstance(data, bytes):
+            return None
+        if not self._backend.available():
+            return None
+
+        slot_id = _slot_id_for_name(name)
+        account = _account_for_name(name)
+        if not self._backend.store(KEYCHAIN_SERVICE, account, data):
+            return None
+        return _make_reference_token(slot_id)
+
     def decrypt(self, encrypted_bytes: bytes) -> Optional[bytes]:
         """
         Retrieve data from the Keychain using a reference token.
@@ -357,6 +394,25 @@ class MacOSSecureStore(SecureStore):
 
         logger.info("decrypt: secret retrieved from Keychain [slot=%s, len=%d]", slot_id, len(data))
         return data
+
+    def decrypt_named(self, encrypted_bytes: bytes, name: str) -> Optional[bytes]:
+        """Retrieve a named secret, with a fallback for legacy references."""
+        if not isinstance(encrypted_bytes, bytes) or not self._backend.available():
+            return None
+
+        # New references always use the stable logical account.  If the file
+        # was written by an older build, fall back to its content-derived
+        # account so upgrades do not force re-enrollment.
+        data = self._backend.retrieve(
+            KEYCHAIN_SERVICE, _account_for_name(name)
+        )
+        if data is not None:
+            return data
+
+        slot_id = _parse_reference_token(encrypted_bytes)
+        if slot_id is None:
+            return None
+        return self._backend.retrieve(KEYCHAIN_SERVICE, _account_for_slot(slot_id))
 
     def delete_by_reference(self, reference_token: bytes) -> bool:
         """

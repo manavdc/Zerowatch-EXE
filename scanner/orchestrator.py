@@ -35,10 +35,10 @@ CONCURRENCY MODEL
   immediately for the initial sync.
 
 • Layer 1 (PE binaries) and Layer 2 (manifests) run in a
-  ThreadPoolExecutor with max_workers=4.
+  ThreadPoolExecutor with max_workers=6 (configurable).
   - Filesystem I/O releases the GIL, so Python threads are genuinely
     parallel for these workloads.
-  - 4 workers saturates a typical SSD without over-committing CPU.
+  - 6 workers saturates a typical SSD without over-committing CPU.
 
 • The orchestrator yields a batch of API-ready dicts as each layer
   completes rather than waiting for the entire scan.  This means the
@@ -82,7 +82,7 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .fs_walker import (
@@ -177,10 +177,15 @@ class ScanOrchestrator:
         Used to invalidate the cache when the agent is updated.
 
     max_workers
-        Thread pool size for Layer 1/2 I/O workers. Default 4.
+        Thread pool size for Layer 1/2 I/O workers. Default 6.
 
     extra_scan_dirs
         Optional additional directories to include in every filesystem scan.
+
+    priority_scan_dirs
+        Optional override list for priority scan directories.
+        If provided, these paths replace the platform defaults from
+        get_priority_scan_dirs() during startup and priority scans.
 
     fs_scan_interval_hours
         How often the priority-path incremental scan runs. Default 4 hours.
@@ -203,8 +208,9 @@ class ScanOrchestrator:
         base_dir: str,
         existing_registry_fn: Optional[Callable[[], List[dict]]] = None,  # TODO: Remove after Windows migration completes.
         agent_version: str = "unknown",
-        max_workers: int = 4,
+        max_workers: int = 6,
         extra_scan_dirs: Optional[List[str]] = None,
+        priority_scan_dirs: Optional[List[str]] = None,
         fs_scan_interval_hours: float = 4.0,
         deep_scan_interval_hours: float = 24.0,
         software_collector: Optional[SoftwareCollector] = None,
@@ -216,6 +222,7 @@ class ScanOrchestrator:
         self._agent_version = agent_version
         self._max_workers = max_workers
         self._extra_dirs = extra_scan_dirs or []
+        self._priority_scan_dirs = priority_scan_dirs  # None = use platform defaults
 
         # Fallback adapter resolution for legacy constructor invocations
         if software_collector is None or binary_inspector is None or filesystem_walker is None:
@@ -413,6 +420,7 @@ class ScanOrchestrator:
         self,
         include_filesystem: bool = True,
         stop_event: Optional[threading.Event] = None,
+        on_delta: Optional[Callable[[List[dict], List[dict]], None]] = None,
     ) -> List[dict]:
         """
         Run all layers and return the unified inventory as a list of dicts
@@ -445,7 +453,14 @@ class ScanOrchestrator:
 
         # ── Layers 1 + 2 (filesystem, threaded) ───────────────────────────
         if include_filesystem:
-            fs_new, _fs_removed = self._run_full_drive_scan(stop_event=stop_event)
+            fs_new, _fs_removed = self._run_full_drive_scan(
+                stop_event=stop_event,
+                on_batch=(
+                    lambda batch, removed: self._emit_fs_delta(
+                        batch, removed, on_delta
+                    )
+                ) if on_delta else None,
+            )
             items.extend(fs_new)
             # Mark filesystem scan as completed in cache
             if not (stop_event and stop_event.is_set()):
@@ -756,6 +771,97 @@ class ScanOrchestrator:
         if (added_dicts or removed_dicts) and on_delta:
             on_delta(added_dicts, removed_dicts)
 
+    def _get_priority_dirs(self) -> List[str]:
+        """Return the priority scan directory list, respecting config overrides."""
+        if self._priority_scan_dirs is not None:
+            return list(self._priority_scan_dirs)
+        return get_priority_scan_dirs()
+
+    def run_priority_scan(
+        self,
+        on_delta: Optional[Callable[[List[dict], List[dict]], None]] = None,
+    ) -> Tuple[List[dict], List[dict]]:
+        """Scan only high-value software locations and publish the result."""
+        new_items, removed_items = self._run_incremental_scan(
+            self._get_priority_dirs(), label="initial-priority"
+        )
+        self._emit_fs_delta(new_items, removed_items, on_delta)
+        return (
+            [item.to_api_dict() for item in new_items],
+            [item.to_api_dict() for item in removed_items],
+        )
+
+    def run_startup_scan(
+        self,
+        stop_event: Optional[threading.Event] = None,
+    ) -> List[dict]:
+        """
+        Startup-optimized scan: L0 (registry/package managers) + L1/L2
+        (filesystem) restricted to priority paths only.
+
+        Designed to produce a complete-enough inventory within 60 seconds
+        of agent startup. The full-disk exhaustive walk is left to the
+        periodic deep scan (24h cadence).
+
+        Returns
+        ───────
+        List of dicts ready for sync_full(), combining L0 + priority L1/L2.
+        """
+        t0 = time.perf_counter()
+
+        # ── Layer 0 (always synchronous, <1s) ──────────────────────────────
+        l0_items = self._run_layer0()
+
+        # ── Priority L1/L2 (parallelized, priority paths only) ─────────────
+        priority_dirs = self._get_priority_dirs()
+        logger.info(
+            "[STARTUP_SCAN] Starting priority L1/L2 scan (%d dirs, %d workers).",
+            len(priority_dirs), self._max_workers,
+        )
+        fs_new, fs_removed = self._run_incremental_scan(
+            priority_dirs,
+            stop_event=stop_event,
+            label="startup-priority",
+        )
+
+        # ── Combine and deduplicate ────────────────────────────────────────
+        all_items = l0_items + fs_new
+
+        # On warm start, merge cached filesystem items from paths OUTSIDE
+        # the priority set so the full sync payload doesn't wipe them.
+        cached_items = self._cache.all_cached_items()
+        all_items.extend(cached_items)
+
+        unique = self._deduplicate(all_items)
+
+        elapsed = time.perf_counter() - t0
+        within_budget = elapsed < 60.0
+        logger.info(
+            "[STARTUP_SCAN] Complete: %d unique items in %.1f s "
+            "(%s 60s budget). L0=%d, L1/L2=%d, cached=%d.",
+            len(unique), elapsed,
+            "WITHIN" if within_budget else "EXCEEDED",
+            len(l0_items), len(fs_new), len(cached_items),
+        )
+        if not within_budget:
+            logger.warning(
+                "[STARTUP_SCAN] Priority scan exceeded 60s budget (%.1fs). "
+                "Consider reducing priority_scan_dirs or increasing max_workers.",
+                elapsed,
+            )
+
+        # ── Update snapshot for delta computation ──────────────────────────
+        with self._snapshot_lock:
+            self._last_snapshot = {item.dedup_key(): item for item in unique}
+
+        # ── Update cache meta ──────────────────────────────────────────────
+        try:
+            self._cache.set_meta("last_full_scan_at", self._utc_now_iso())
+        except Exception as exc:
+            logger.debug("Non-fatal meta update error: %s", exc)
+
+        return [item.to_api_dict() for item in unique]
+
     def start_periodic_scans(
         self,
         on_delta: Optional[Callable[[List[dict], List[dict]], None]] = None,
@@ -820,16 +926,20 @@ class ScanOrchestrator:
             while not self._bg_stop.is_set():
                 now = time.time()
 
+                # A new enrollment must get useful filesystem results before
+                # the expensive all-drive walk.  Keep the cold-start flag set
+                # until that all-drive walk completes; otherwise the priority
+                # pass would incorrectly postpone the deep scan for 24 hours.
+                run_priority = now - last_priority_scan >= self._fs_scan_interval
                 run_deep = (
-                    is_cold_start
-                    or (
-                        self._deep_scan_interval > 0
-                        and now - last_deep_scan >= self._deep_scan_interval
+                    not run_priority
+                    and (
+                        is_cold_start
+                        or (
+                            self._deep_scan_interval > 0
+                            and now - last_deep_scan >= self._deep_scan_interval
+                        )
                     )
-                )
-                run_priority = (
-                    not run_deep
-                    and now - last_priority_scan >= self._fs_scan_interval
                 )
 
                 if run_deep:
@@ -837,7 +947,8 @@ class ScanOrchestrator:
                         logger.info("Starting deep scan (all fixed drives).")
                         # Deep scan uses walk_drives() instead of walk_specified_dirs()
                         new_items, removed_items = self._run_full_drive_scan(
-                            stop_event=self._bg_stop
+                            stop_event=self._bg_stop,
+                            on_batch=None,
                         )
                         self._emit_fs_delta(new_items, removed_items, on_delta)
                         self._cache.set_meta("last_fs_scan_at", self._utc_now_iso())
@@ -857,12 +968,12 @@ class ScanOrchestrator:
                         self._emit_fs_delta(new_items, removed_items, on_delta)
                         last_priority_scan = time.time()
                         if is_cold_start:
-                            # The fast first pass initializes the cache. Do
-                            # not force a full-drive scan on every restart or
-                            # re-enrollment; keep the normal deep-scan cadence.
-                            self._cache.set_meta("last_fs_scan_at", self._utc_now_iso())
-                            last_deep_scan = last_priority_scan
-                            is_cold_start = False
+                            # This is only the fast first pass.  The cold
+                            # state remains active so the all-drive deep scan
+                            # runs on the next worker iteration.
+                            logger.info(
+                                "Initial priority scan complete; full-drive deep scan is next."
+                            )
                     except Exception as exc:
                         logger.error("Priority scan error: %s", exc, exc_info=True)
 
@@ -902,6 +1013,7 @@ class ScanOrchestrator:
     def _run_full_drive_scan(
         self,
         stop_event: Optional[threading.Event] = None,
+        on_batch: Optional[Callable[[List[SoftwareItem], List[SoftwareItem]], None]] = None,
     ) -> Tuple[List[SoftwareItem], List[SoftwareItem]]:
         """
         Deep scan variant: uses walk_drives() to traverse all fixed drives
@@ -915,6 +1027,25 @@ class ScanOrchestrator:
         binary_batch:   List[str] = []
         manifest_batch: List[str] = []
         futures = []
+        pending_futures = set()
+
+        def _collect_completed(block: bool = False) -> None:
+            if not pending_futures:
+                return
+            done, _ = wait(
+                pending_futures,
+                timeout=None if block else 0,
+                return_when=FIRST_COMPLETED,
+            )
+            for future in done:
+                pending_futures.discard(future)
+                try:
+                    batch_items = future.result()
+                    new_items.extend(batch_items)
+                    if batch_items and on_batch:
+                        on_batch(batch_items, [])
+                except Exception as exc:
+                    logger.warning("Deep scan worker error: %s", exc)
 
         with ThreadPoolExecutor(
             max_workers=self._max_workers, thread_name_prefix="scanner"
@@ -924,22 +1055,30 @@ class ScanOrchestrator:
                 if binary_batch:
                     batch = list(binary_batch)
                     binary_batch.clear()
-                    futures.append(
-                        pool.submit(_process_binary_batch, batch, self._cache, self._binary_inspector)
+                    future = pool.submit(
+                        _process_binary_batch, batch, self._cache, self._binary_inspector
                     )
+                    futures.append(future)
+                    pending_futures.add(future)
 
             def _flush_manifests() -> None:
                 if manifest_batch:
                     batch = list(manifest_batch)
                     manifest_batch.clear()
-                    futures.append(
-                        pool.submit(_process_manifest_batch, batch, self._cache)
-                    )
+                    future = pool.submit(_process_manifest_batch, batch, self._cache)
+                    futures.append(future)
+                    pending_futures.add(future)
 
             for path, kind in self._filesystem_walker.walk_filesystem(extra_dirs=self._extra_dirs):
                 if stop_event and stop_event.is_set():
                     break
+                _collect_completed()
                 seen_paths.add(path)
+                if len(seen_paths) % 1000 == 0:
+                    logger.info(
+                        "Deep scan progress: %d filesystem paths visited, %d items discovered",
+                        len(seen_paths), len(new_items),
+                    )
                 cached = cached_stats.get(path)
                 if cached is not None:
                     try:
@@ -961,11 +1100,8 @@ class ScanOrchestrator:
 
             _flush_binaries()
             _flush_manifests()
-            for future in as_completed(futures):
-                try:
-                    new_items.extend(future.result())
-                except Exception as exc:
-                    logger.warning("Deep scan worker error: %s", exc)
+            while pending_futures:
+                _collect_completed(block=True)
 
         # Deletion detection (all cached paths not seen during walk)
         removed_items: List[SoftwareItem] = []

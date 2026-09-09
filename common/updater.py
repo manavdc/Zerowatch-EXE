@@ -77,11 +77,12 @@ MANIFEST_SIG_URL = f"{_RELEASES_BASE}/release-manifest.json.sig"
 # TUF-inspired Timestamp: refuse to trust manifests older than this
 MANIFEST_MAX_AGE_DAYS: int = 3
 
-# Background poll: 4 hours (14400 seconds) for local OTA verification
-UPDATE_CHECK_INTERVAL_SECS: int = 4 * 60 * 60
+# Background poll: 4 hours (14400 seconds) for local OTA verification & restart check
+RESTART_CHECK_TIME: int = 180
+UPDATE_CHECK_INTERVAL_SECS: int = RESTART_CHECK_TIME
 
 # Download streaming chunk size
-_CHUNK_SIZE: int = 8 * 1024  # 8 KiB
+_CHUNK_SIZE: int = 128 * 1024  # 128 KiB
 
 # HTTP timeout for CDN requests
 _HTTP_TIMEOUT: int = 30  # seconds
@@ -498,8 +499,9 @@ class UpdateChecker:
         info = checker.check_for_update()  # returns UpdateInfo or None
     """
 
-    def __init__(self, current_version: str) -> None:
+    def __init__(self, current_version: str, check_interval_secs: Optional[int] = None) -> None:
         self._current_version   = current_version
+        self.check_interval_secs = check_interval_secs or UPDATE_CHECK_INTERVAL_SECS
         self._lock              = threading.Lock()
         self._last_check_time   = 0.0     # monotonic timestamp of last successful check
         self._cached_result: Optional[UpdateInfo] = None
@@ -530,7 +532,7 @@ class UpdateChecker:
         version is available and fully verified.
 
         Args:
-            force: If True, bypasses the 4-hour cooldown cache.
+            force: If True, bypasses the cooldown cache.
 
         Returns:
             UpdateInfo if a verified newer version is available.
@@ -541,8 +543,8 @@ class UpdateChecker:
         """
         with self._lock:
             now = time.monotonic()
-            if not force and (now - self._last_check_time) < UPDATE_CHECK_INTERVAL_SECS:
-                logger.debug("OTA check skipped (within 4-hour cooldown window).")
+            if not force and (now - self._last_check_time) < self.check_interval_secs:
+                logger.debug("OTA check skipped (within cooldown window).")
                 return self._cached_result
 
             try:
@@ -722,32 +724,56 @@ class BinaryDownloader:
         bytes_done = 0
         total = target.size
 
+        retries = 0
+        max_retries = 5
+
         try:
-            resp = self._session.get(
-                target.url,
-                stream=True,
-                timeout=(_HTTP_TIMEOUT, 300),  # (connect, read) timeout
-            )
-            resp.raise_for_status()
-
             with open(tmp_path, "wb") as fh:
-                for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
-                    if chunk:
-                        fh.write(chunk)
-                        sha256.update(chunk)
-                        bytes_done += len(chunk)
-                        if progress_cb:
-                            try:
-                                progress_cb(bytes_done, total)
-                            except Exception:
-                                pass
+                while bytes_done < total and retries <= max_retries:
+                    headers = {}
+                    if bytes_done > 0:
+                        headers["Range"] = f"bytes={bytes_done}-"
 
-        except requests.HTTPError as exc:
+                    try:
+                        resp = self._session.get(
+                            target.url,
+                            headers=headers,
+                            stream=True,
+                            timeout=(_HTTP_TIMEOUT, 300),
+                        )
+                        resp.raise_for_status()
+
+                        for chunk in resp.iter_content(chunk_size=_CHUNK_SIZE):
+                            if chunk:
+                                fh.write(chunk)
+                                sha256.update(chunk)
+                                bytes_done += len(chunk)
+                                if progress_cb:
+                                    try:
+                                        progress_cb(bytes_done, total)
+                                    except Exception:
+                                        pass
+                        
+                        # Break if we finished successfully
+                        if bytes_done >= total:
+                            break
+                            
+                    except requests.RequestException as exc:
+                        retries += 1
+                        if retries > max_retries:
+                            raise OTAError(f"Network error downloading binary after {max_retries} retries: {exc}") from exc
+                        logger.warning("Download interrupted at %s/%s (retry %d/%d): %s", bytes_done, total, retries, max_retries, exc)
+                        import time
+                        time.sleep(2)
+
+            if bytes_done < total:
+                raise OTAError(f"Incomplete download: {bytes_done}/{total} bytes")
+
+        except Exception as exc:
             self._cleanup(tmp_path)
-            raise OTAError(f"HTTP error downloading binary: {exc}") from exc
-        except requests.RequestException as exc:
-            self._cleanup(tmp_path)
-            raise OTAError(f"Network error downloading binary: {exc}") from exc
+            if isinstance(exc, OTAError):
+                raise
+            raise OTAError(f"Failed to download binary: {exc}") from exc
 
         # SHA-256 integrity check
         computed_hash = sha256.hexdigest()
@@ -820,8 +846,10 @@ class BackgroundUpdateMonitor:
         self,
         current_version: str,
         on_update_available: Callable[[UpdateInfo], None],
+        check_interval_secs: Optional[int] = None,
     ) -> None:
-        self._checker  = UpdateChecker(current_version)
+        self.check_interval_secs = check_interval_secs or UPDATE_CHECK_INTERVAL_SECS
+        self._checker  = UpdateChecker(current_version, check_interval_secs=self.check_interval_secs)
         self._callback = on_update_available
         self._stop     = threading.Event()
         self._thread   = threading.Thread(
@@ -834,7 +862,7 @@ class BackgroundUpdateMonitor:
         """Start the background monitoring thread."""
         logger.info(
             "[OTA] Background update monitor started (interval: %dmin).",
-            UPDATE_CHECK_INTERVAL_SECS // 60,
+            self.check_interval_secs // 60,
         )
         self._thread.start()
 
@@ -844,7 +872,7 @@ class BackgroundUpdateMonitor:
 
     def check_now(self) -> Optional[UpdateInfo]:
         """
-        Trigger an immediate (forced) check, bypassing the 4-hour cooldown.
+        Trigger an immediate (forced) check, bypassing the cooldown.
         Used by the 'Check for Updates' button.
         """
         return self._checker.check_for_update(force=True)
@@ -854,7 +882,7 @@ class BackgroundUpdateMonitor:
         Main poll loop.
 
         Runs an immediate check on startup, then sleeps in 60-second increments
-        (waking to test the stop event) until UPDATE_CHECK_INTERVAL_SECS elapses.
+        (waking to test the stop event) until check_interval_secs elapses.
         """
         # Initial check shortly after agent startup (30s grace)
         self._stop.wait(timeout=30)
@@ -862,12 +890,12 @@ class BackgroundUpdateMonitor:
             return
         self._do_check()
 
-        # Periodic 4-hour check
+        # Periodic check
         elapsed = 0
         while not self._stop.is_set():
             self._stop.wait(timeout=60)
             elapsed += 60
-            if elapsed >= UPDATE_CHECK_INTERVAL_SECS:
+            if elapsed >= self.check_interval_secs:
                 elapsed = 0
                 self._do_check()
 

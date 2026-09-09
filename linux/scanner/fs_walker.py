@@ -46,6 +46,9 @@ SKIP_FS_TYPES: FrozenSet[str] = frozenset({
     "mqueue", "debugfs", "securityfs", "pstore", "bpf", "tracefs",
     "hugetlbfs", "fusectl", "autofs", "rpc_pipefs", "efivarfs",
     "configfs", "ramfs", "squashfs",
+    # WSL Windows-mounted drives are not native Linux software roots. Scanning
+    # /mnt/* can take hours and causes package-owner probes for Windows files.
+    "9p", "drvfs",
 })
 
 # Network filesystems skipped by default (no local persistence to scan).

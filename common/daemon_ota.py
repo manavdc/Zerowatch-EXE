@@ -16,12 +16,14 @@ logger = logging.getLogger("ota.daemon")
 
 class DaemonOTAMonitor:
     def __init__(self, current_exe: str, current_version: str,
-                 shutdown_event: Optional[threading.Event] = None) -> None:
+                 shutdown_event: Optional[threading.Event] = None,
+                 check_interval: Optional[int] = None) -> None:
         self.current_exe = os.path.abspath(current_exe)
         self.shutdown_event = shutdown_event or threading.Event()
         self._monitor = updater.BackgroundUpdateMonitor(
             current_version=current_version,
             on_update_available=self._apply_update,
+            check_interval_secs=check_interval,
         )
 
     def start(self) -> None:
@@ -39,9 +41,35 @@ class DaemonOTAMonitor:
             from common.os_replacer import perform_update
             if perform_update(dest, self.current_exe):
                 if os.name == "nt":
-                    from common.os_replacer import _relaunch_detached
-                    if not _relaunch_detached(self.current_exe):
-                        raise RuntimeError("Windows replacement process could not be launched")
+                    from common.os_replacer import (
+                        _relaunch_detached,
+                        _trigger_windows_daemon_task,
+                    )
+                    relaunched = _relaunch_detached(self.current_exe, reopen_gui=False)
+                    if not relaunched:
+                        # The old daemon must still exit after a successful
+                        # swap.  This leaves the watchdog responsible for the
+                        # retry/rollback path instead of leaving the new exe
+                        # stranded beside a permanent .bak file.
+                        logger.error(
+                            "[OTA] Windows replacement could not be launched; "
+                            "requesting watchdog recovery."
+                        )
+                        # Do not start the scheduled task in parallel with a
+                        # successful direct launch.  Two onefile launches at
+                        # the same time can create duplicate daemon/watchdog
+                        # trees and race state-file initialization.  Use the
+                        # registered task only when CreateProcess itself
+                        # failed; the existing watchdog handles a child that
+                        # later crashes during bootstrap.
+                        task_triggered = _trigger_windows_daemon_task()
+                    else:
+                        task_triggered = True
+                    if not task_triggered:
+                        logger.warning(
+                            "[OTA] Scheduled daemon fallback was unavailable; "
+                            "watchdog remains responsible for recovery."
+                        )
                 logger.info("[OTA] Update applied; supervisor restart requested.")
                 self.shutdown_event.set()
         except Exception as exc:
@@ -51,7 +79,8 @@ class DaemonOTAMonitor:
 
 
 def start_daemon_ota_monitor(current_exe: str, current_version: str,
-                             shutdown_event: threading.Event) -> DaemonOTAMonitor:
-    monitor = DaemonOTAMonitor(current_exe, current_version, shutdown_event)
+                             shutdown_event: threading.Event,
+                             check_interval: Optional[int] = None) -> DaemonOTAMonitor:
+    monitor = DaemonOTAMonitor(current_exe, current_version, shutdown_event, check_interval=check_interval)
     monitor.start()
     return monitor

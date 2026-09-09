@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import base64
+import ctypes
 import os
 import shutil
 import stat
@@ -53,12 +54,21 @@ _LINUX_SERVICE_NAME = "zerowatch-agent.service"
 # macOS: launchd label (macos/persistence/startup_manager.py line 66)
 _MACOS_LAUNCHD_LABEL = "io.deepcytes.zerowatch.agent"
 _MACOS_PLIST_PATH    = f"/Library/LaunchDaemons/{_MACOS_LAUNCHD_LABEL}.plist"
+_MACOS_LAUNCHAGENT_LABEL = "io.deepcytes.zerowatch.agent.user"
+_MACOS_LAUNCHAGENT_PLIST = os.path.expanduser(
+    "~/Library/LaunchAgents/io.deepcytes.zerowatch.agent.user.plist"
+)
 
 # Watchdog: window within which the updated agent must prove liveness
 WATCHDOG_TIMEOUT_SECS: int = 120
 
 # Heartbeat validation poll interval inside watchdog
 _WATCHDOG_POLL_SECS: int = 10
+
+# Prevent repeated heartbeat checks from creating multiple cleanup workers
+# while Windows still has the old executable image open.
+_BACKUP_CLEANUP_LOCK = threading.Lock()
+_BACKUP_CLEANUP_ACTIVE = False
 
 
 # ---------------------------------------------------------------------------
@@ -177,18 +187,73 @@ def _swap_windows(new_binary: str, current_exe: str, zw_client=None) -> bool:
     return True
 
 
-def _relaunch_detached(current_exe: str) -> bool:
-    """Launch the replacement agent after the current Windows process exits."""
+def _is_gui_window_open() -> bool:
+    """Check if any SentinelAgent GUI window is currently open and visible on Windows."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        found = False
+
+        def enum_windows_callback(hwnd, _extra):
+            nonlocal found
+            if ctypes.windll.user32.IsWindowVisible(hwnd):
+                length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    ctypes.windll.user32.GetWindowTextW(hwnd, buff, length + 1)
+                    title = buff.value.upper()
+                    if "ZEROWATCH SENTINEL AGENT" in title or "ZEROWATCH AGENT" in title:
+                        found = True
+                        return False
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        ctypes.windll.user32.EnumWindows(WNDENUMPROC(enum_windows_callback), 0)
+        return found
+    except Exception:
+        return False
+
+
+def _clean_env():
+    """Remove Nuitka/PyInstaller-specific environment variables for safe subprocess launching."""
+    env = os.environ.copy()
+    for key in list(env.keys()):
+        if key.startswith("NUITKA_") or key.startswith("_MEIPASS") or key in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"]:
+            env.pop(key, None)
+    return env
+
+def _relaunch_detached(current_exe: str, reopen_gui: Optional[bool] = None) -> bool:
+    """Launch the replacement agent after the current Windows process exits.
+
+    Args:
+        current_exe: Absolute path to the executable to launch.
+        reopen_gui: If True, force GUI restart (visible window).
+                    If False, force headless daemon restart (--daemon).
+                    If None, auto-detect: restart GUI only if a GUI window is currently open.
+    """
+    if reopen_gui is None:
+        if "--daemon" in sys.argv[1:]:
+            reopen_gui = False
+        else:
+            reopen_gui = _is_gui_window_open()
+
     if sys.platform != "win32":
         try:
+            launch_cmd = [current_exe]
+            if not reopen_gui and "--daemon" not in launch_cmd:
+                launch_cmd.append("--daemon")
             subprocess.Popen(
-                [current_exe],
+                launch_cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
                 close_fds=True,
+                env=_clean_env(),
             )
-            logger.info("[POSIX SWAP] Relaunched updated binary: %s", current_exe)
+            logger.info("[POSIX SWAP] Relaunched updated binary: %s (gui=%s)", current_exe, reopen_gui)
             return True
         except Exception as exc:
             logger.warning("[POSIX SWAP] Failed to relaunch updated binary: %s", exc)
@@ -208,34 +273,127 @@ def _relaunch_detached(current_exe: str) -> bool:
             target = current_exe
             launch_args = []
 
-        # A GUI restart must not inherit stale internal or installer flags.
-        # Preserve daemon mode because headless service restarts must remain
-        # headless; interactive restarts intentionally use normal routing.
-        if "--daemon" in sys.argv[1:]:
-            launch_args.append("--daemon")
+        if reopen_gui:
+            # Interactive GUI restart: show window normally without --daemon
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 1  # SW_SHOWNORMAL
+            creation_flags = detached | new_group
+        else:
+            # Headless daemon restart: enforce --daemon and keep hidden
+            if "--daemon" not in launch_args:
+                launch_args.append("--daemon")
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0  # SW_HIDE
+            creation_flags = detached | new_group | subprocess.CREATE_NO_WINDOW
 
         # Start the replacement directly instead of through PowerShell/cmd.
         # Its entry point waits on this PID before doing any agent work, so it
         # cannot race the old GUI, daemon, or watchdog shutdown.
         launch_args.extend(["--restart-wait-pid", str(os.getpid())])
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = 0
+
         child = subprocess.Popen(
             [target, *launch_args],
-            creationflags=detached | new_group | subprocess.CREATE_NO_WINDOW,
+            creationflags=creation_flags,
             startupinfo=si,
             close_fds=True,
             cwd=os.path.dirname(os.path.abspath(current_exe)) or None,
+            env=_clean_env(),
         )
         logger.info(
-            "[WIN SWAP] Started replacement PID %s; waiting for parent PID %s.",
-            child.pid, os.getpid(),
+            "[WIN SWAP] Started replacement PID %s (gui=%s); waiting for parent PID %s.",
+            child.pid, reopen_gui, os.getpid(),
         )
         return True
     except Exception as exc:
         logger.warning("[WIN SWAP] Failed to re-launch new binary: %s", exc)
         return False
+
+
+def _trigger_windows_daemon_task() -> bool:
+    """Ask the registered Windows supervisor to start the daemon.
+
+    A successful ``CreateProcess`` only means that Windows accepted the child;
+    it does not mean the child survived startup.  The scheduled task is an
+    independent launch path and is therefore used as a daemon-only fallback.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        result = subprocess.run(
+            ["schtasks", "/run", "/tn", "SentinelAgent"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            startupinfo=subprocess.STARTUPINFO(),
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode == 0:
+            logger.info("[WIN SWAP] Scheduled daemon task triggered.")
+            return True
+        logger.warning("[WIN SWAP] Scheduled daemon task failed: %s", result.stderr.strip())
+    except Exception as exc:
+        logger.warning("[WIN SWAP] Could not trigger scheduled daemon task: %s", exc)
+    return False
+
+
+def _terminate_stale_windows_watchdogs(current_exe: str) -> int:
+    """Stop stale SentinelAgent watchdogs holding a previous .bak image.
+
+    The watchdog is intentionally launched as a separate copy of the onefile
+    executable.  After an OTA rename, that copy can continue running from the
+    old image and keep ``.bak`` open.  Only processes whose command line
+    contains both our executable path and ``--watchdog`` are targeted; the
+    daemon and GUI are never selected.
+    """
+    if sys.platform != "win32":
+        return 0
+    try:
+        powershell = os.path.join(
+            os.environ.get("SystemRoot", r"C:\Windows"),
+            "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+        )
+        if not os.path.isfile(powershell):
+            powershell = "powershell.exe"
+        target = os.path.abspath(current_exe).replace("'", "''")
+        script = f"""
+$target = '{target}'
+$targetBak = $target + '.bak'
+$agentPid = {os.getpid()}
+$matches = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {{
+    $_.ProcessId -ne $agentPid -and
+    $_.CommandLine -and
+    $_.CommandLine -match '(?i)--watchdog' -and
+    ($_.CommandLine -like ('*' + $target + '*') -or $_.CommandLine -like ('*' + $targetBak + '*'))
+}})
+foreach ($process in $matches) {{
+    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
+}}
+Write-Output $matches.Count
+"""
+        encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+             "-EncodedCommand", encoded],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        if result.returncode != 0:
+            logger.warning("[OTA] Stale watchdog cleanup failed: %s", result.stderr.strip())
+            return 0
+        try:
+            count = int((result.stdout or "0").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            count = 0
+        if count:
+            logger.warning("[OTA] Terminated %d stale watchdog process(es) holding the old image.", count)
+        return count
+    except Exception as exc:
+        logger.warning("[OTA] Could not inspect stale watchdog processes: %s", exc)
+        return 0
 
 
 def _swap_linux(new_binary: str, current_exe: str, zw_client=None) -> bool:
@@ -408,10 +566,80 @@ def _swap_macos(new_binary: str, current_exe: str, zw_client=None) -> bool:
             return True
         raise SwapError(f"os.replace failed: {exc}") from exc
 
+    # Keep the backup until the replacement has authenticated and sent a
+    # heartbeat.  The new process commits it after that health check.
+    pending_path = current_exe + ".ota-pending"
+    try:
+        with open(pending_path, "w", encoding="utf-8") as marker:
+            marker.write(str(time.time()))
+        os.chmod(pending_path, 0o644)
+    except OSError as exc:
+        logger.error("[MACOS SWAP] Could not create OTA health marker: %s", exc)
+        _restore_macos_backup(current_exe, bak_path)
+        raise SwapError(f"Could not create OTA health marker: {exc}") from exc
+
     # 6. Kick launchd — the new agent will call startup_bak_cleanup()
-    _launchctl_kickstart()
+    if not _launchctl_kickstart():
+        _restore_macos_backup(current_exe, bak_path)
+        raise SwapError("macOS launchd restart failed after binary replacement")
 
     return True
+
+
+def _restore_macos_backup(current_exe: str, bak_path: str) -> bool:
+    """Restore a failed macOS update and remove its health marker."""
+    try:
+        if os.path.exists(bak_path):
+            os.replace(bak_path, current_exe)
+        try:
+            os.remove(current_exe + ".ota-pending")
+        except FileNotFoundError:
+            pass
+        logger.warning("[MACOS OTA] Previous binary restored: %s", current_exe)
+        return True
+    except OSError as exc:
+        logger.critical("[MACOS OTA] Rollback failed: %s", exc)
+        return False
+
+
+def recover_macos_update(current_exe: str, timeout_seconds: int = WATCHDOG_TIMEOUT_SECS) -> bool:
+    """Rollback an update whose replacement never became healthy.
+
+    Called before normal macOS startup.  A marker younger than the health
+    window is left in place while launchd retries the replacement process.
+    Once the window expires, the previous binary is restored and launchd can
+    start it on the next cycle.
+    """
+    if sys.platform != "darwin":
+        return False
+    marker = current_exe + ".ota-pending"
+    backup = current_exe + ".bak"
+    if not (os.path.exists(marker) and os.path.exists(backup)):
+        return False
+    try:
+        age = max(0.0, time.time() - os.path.getmtime(marker))
+    except OSError:
+        return False
+    if age < timeout_seconds:
+        return False
+    return _restore_macos_backup(current_exe, backup)
+
+
+def commit_macos_update(current_exe: str) -> bool:
+    """Commit a macOS update after authenticated heartbeat succeeds."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        for path in (current_exe + ".bak", current_exe + ".ota-pending"):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        logger.info("[MACOS OTA] Health check passed; update committed.")
+        return True
+    except OSError as exc:
+        logger.warning("[MACOS OTA] Could not commit update: %s", exc)
+        return False
 
 
 def _authorized_replace_macos(new_binary: str, current_exe: str, bak_path: str) -> bool:
@@ -422,7 +650,8 @@ def _authorized_replace_macos(new_binary: str, current_exe: str, bak_path: str) 
         f"/bin/cp {shlex.quote(current_exe)} {shlex.quote(bak_path)}; "
         f"/bin/cp {shlex.quote(new_binary)} {shlex.quote(current_exe)}; "
         f"/bin/chmod 755 {shlex.quote(current_exe)}; "
-        f"/bin/rm -f {shlex.quote(new_binary)} {shlex.quote(bak_path)}"
+        # Keep the backup until the replacement heartbeat commits it.
+        f"/bin/rm -f {shlex.quote(new_binary)}"
     )
     encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
     script = ('do shell script "echo ' + encoded +
@@ -486,38 +715,81 @@ def _launchctl_kickstart() -> bool:
     if shutil.which("launchctl") is None:
         logger.warning("[MACOS SWAP] launchctl not found.")
         return False
-    try:
-        result = subprocess.run(
-            ["launchctl", "kickstart", "-k",
-             f"system/{_MACOS_LAUNCHD_LABEL}"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            logger.info("[MACOS SWAP] launchctl kickstart succeeded.")
-            return True
-        logger.warning(
-            "[MACOS SWAP] launchctl kickstart returned rc=%d: %s",
-            result.returncode, result.stderr.strip()
-        )
-        return False
-    except Exception as exc:
-        logger.warning("[MACOS SWAP] launchctl error: %s", exc)
-        return False
-
-
+    if os.path.isfile(_MACOS_PLIST_PATH):
+        domains = [f"system/{_MACOS_LAUNCHD_LABEL}"]
+    else:
+        uid = os.getuid()
+        domains = [
+            f"gui/{uid}/{_MACOS_LAUNCHAGENT_LABEL}",
+            f"user/{uid}/{_MACOS_LAUNCHAGENT_LABEL}",
+        ]
+    for service in domains:
+        try:
+            result = subprocess.run(
+                ["launchctl", "kickstart", "-k", service],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                logger.info("[MACOS SWAP] launchctl kickstart succeeded: %s", service)
+                return True
+            logger.warning(
+                "[MACOS SWAP] launchctl kickstart returned rc=%d for %s: %s",
+                result.returncode, service, result.stderr.strip()
+            )
+        except Exception as exc:
+            logger.warning("[MACOS SWAP] launchctl error for %s: %s", service, exc)
+    return False
 # ---------------------------------------------------------------------------
 # Startup: post-update .bak cleanup (called by the newly started agent)
 # ---------------------------------------------------------------------------
 
 
-def _commit_update(bak_path: str) -> None:
-    """Remove the .bak file to commit the successful update."""
+def _commit_update(bak_path: str) -> bool:
+    """Remove the .bak file to commit the successful update.
+
+    Windows can briefly keep the renamed image open while the old onefile
+    process is shutting down.  Treat that as a retryable condition rather
+    than losing the cleanup opportunity forever.
+    """
+    if not os.path.exists(bak_path):
+        return True
     try:
-        if os.path.exists(bak_path):
-            os.remove(bak_path)
-            logger.info("[OTA] .bak removed: %s — update committed.", bak_path)
+        if sys.platform == "win32":
+            # A stale read-only/hidden/system attribute must not prevent the
+            # daemon from committing an otherwise successful update.
+            try:
+                ctypes.windll.kernel32.SetFileAttributesW(bak_path, 0x80)  # NORMAL
+            except Exception:
+                pass
+        os.remove(bak_path)
+        logger.info("[OTA] .bak removed: %s — update committed.", bak_path)
+        return True
     except OSError as exc:
         logger.warning("[OTA] Failed to remove .bak: %s", exc)
+        return False
+
+
+def _retry_commit_updates(backup_paths: list[str], attempts: int = 24,
+                          interval_seconds: float = 5.0) -> None:
+    """Retry backup cleanup without delaying daemon startup."""
+    global _BACKUP_CLEANUP_ACTIVE
+    pending = list(backup_paths)
+    try:
+        for attempt in range(attempts):
+            pending = [path for path in pending if not _commit_update(path)]
+            if not pending:
+                logger.info("[OTA] Post-update backup cleanup complete.")
+                return
+            if attempt + 1 < attempts:
+                time.sleep(interval_seconds)
+        logger.error(
+            "[OTA] Could not remove post-update backup(s) after %.0f seconds: %s",
+            max(0, attempts - 1) * interval_seconds,
+            ", ".join(pending),
+        )
+    finally:
+        with _BACKUP_CLEANUP_LOCK:
+            _BACKUP_CLEANUP_ACTIVE = False
 
 
 def startup_bak_cleanup(current_exe: str) -> None:
@@ -537,16 +809,26 @@ def startup_bak_cleanup(current_exe: str) -> None:
 
     This function runs entirely INSIDE the new agent's own process:
       1. Check if <current_exe>.bak exists (signals a pending update commit)
-      2. Start a daemon thread that waits 30 seconds (startup stability window)
-      3. If the agent is still running after 30 s → remove .bak safely
+      2. Remove the backup after the replacement process reaches Python
+         startup, which is the commit point for the swap.
 
-    No subprocess spawning. No extraction conflicts. No ghost processes.
-    If the agent crashes within 30 s, the daemon thread dies with the process
-    and .bak is preserved for manual recovery.
+    No subprocess spawning and no extra onefile extraction process is created.
+    If the replacement cannot reach Python startup, the .bak remains for the
+    watchdog rollback path.
 
     Args:
         current_exe: Absolute path to the running executable (from get_exe_path()).
     """
+    if sys.platform == "darwin":
+        # macOS commits only after the replacement has authenticated and sent
+        # a heartbeat.  Do not delete the backup merely because Python
+        # started; a replacement can still fail during daemon initialization.
+        if recover_macos_update(current_exe):
+            # Let launchd restart the restored binary instead of continuing
+            # execution from the failed replacement image.
+            raise SystemExit(0)
+        return
+
     bak_path = current_exe + ".bak"
     backup_paths = [bak_path]
     if sys.platform == "win32":
@@ -570,11 +852,24 @@ def startup_bak_cleanup(current_exe: str) -> None:
         ", ".join(backup_paths),
     )
 
-    # Reaching this function means the replacement process has started. Remove
-    # the backup now so successful updates never leave a .bak artifact behind.
-    for backup_path in backup_paths:
-        _commit_update(backup_path)
-    logger.info("[OTA] Post-update cleanup complete.")
+    # Preserve the original behavior: make an immediate cleanup attempt when
+    # the replacement reaches Python startup.  If Windows is still releasing
+    # the old executable image, continue retrying in the running daemon so a
+    # GUI launch is never required as a second cleanup trigger.
+    pending_paths = [path for path in backup_paths if not _commit_update(path)]
+    if pending_paths:
+        global _BACKUP_CLEANUP_ACTIVE
+        with _BACKUP_CLEANUP_LOCK:
+            if not _BACKUP_CLEANUP_ACTIVE:
+                _BACKUP_CLEANUP_ACTIVE = True
+                threading.Thread(
+                    target=_retry_commit_updates,
+                    args=(pending_paths,),
+                    name="post-update-backup-cleanup",
+                    daemon=True,
+                ).start()
+    else:
+        logger.info("[OTA] Post-update backup cleanup complete.")
 
 
 def _rollback(
