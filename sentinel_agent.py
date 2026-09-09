@@ -6187,6 +6187,21 @@ def main_agent():
     if not zw_client.jwt:
         return
 
+    # Prove daemon connectivity immediately after authentication.  The GUI
+    # sends its first heartbeat from the dashboard refresh worker, but the
+    # daemon used to wait until after startup/scan work before its first main
+    # loop heartbeat.  A slow Windows inventory startup could therefore make
+    # an otherwise healthy background agent appear offline.
+    try:
+        first_heartbeat = zw_client.heartbeat()
+        logging.info(
+            "[HEARTBEAT] Immediate daemon heartbeat result=%s status=%s.",
+            first_heartbeat,
+            zw_client.last_server_status,
+        )
+    except Exception:
+        logging.exception("[HEARTBEAT] Immediate daemon heartbeat failed.")
+
     approval_sync_claimed = zw_client.claim_approval_sync()
     approval_sync_already_complete = zw_client.approval_sync_complete()
     if approval_sync_claimed:
