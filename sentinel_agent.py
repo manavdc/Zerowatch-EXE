@@ -19,6 +19,7 @@ import socket
 import socketio
 import shutil
 import glob
+import tempfile
 from urllib.parse import urlparse
 import cert_pinning
 
@@ -873,7 +874,7 @@ def _windows_dpapi_decrypt(encrypted_bytes):
         logging.error(f"DPAPI Decryption failed: {e}")
         return None
 
-def encrypt_data(data_bytes):
+def encrypt_data(data_bytes, purpose="default"):
     if sys.platform == "win32":
         return _windows_dpapi_encrypt(data_bytes)
 
@@ -890,7 +891,10 @@ def encrypt_data(data_bytes):
         from platforms import PlatformFactory
         plat = PlatformFactory.create()
         if plat and plat.secure_store:
-            encrypted = plat.secure_store.encrypt(data_bytes)
+            if sys.platform == "darwin" and hasattr(plat.secure_store, "encrypt_named"):
+                encrypted = plat.secure_store.encrypt_named(data_bytes, purpose)
+            else:
+                encrypted = plat.secure_store.encrypt(data_bytes)
             if encrypted is not None:
                 return encrypted
         macos_fallback = sys.platform == "darwin"
@@ -903,7 +907,7 @@ def encrypt_data(data_bytes):
         return b"RAW::" + base64.b64encode(data_bytes)
     return None
 
-def decrypt_data(encrypted_bytes):
+def decrypt_data(encrypted_bytes, purpose="default"):
     if sys.platform == "win32":
         return _windows_dpapi_decrypt(encrypted_bytes)
 
@@ -921,6 +925,8 @@ def decrypt_data(encrypted_bytes):
         from platforms import PlatformFactory
         plat = PlatformFactory.create()
         if plat and plat.secure_store:
+            if sys.platform == "darwin" and hasattr(plat.secure_store, "decrypt_named"):
+                return plat.secure_store.decrypt_named(encrypted_bytes, purpose)
             return plat.secure_store.decrypt(encrypted_bytes)
     except Exception:
         pass
@@ -938,7 +944,18 @@ class EncryptedFileHandler(logging.Handler):
         # collide on the same .tmp file when both write to the same log path.
         self._temp_path = f"{self.filepath}.{os.getpid()}.tmp"
         self._lock = threading.RLock()
-        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        try:
+            os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        except OSError:
+            # A service install can leave PROGRAMDATA or a shared macOS log
+            # directory owned by another identity. Logging must still allow
+            # the agent and its tests to start.
+            fallback_dir = os.path.join(tempfile.gettempdir(), "ZeroWatch")
+            os.makedirs(fallback_dir, exist_ok=True)
+            self.filepath = os.path.join(
+                fallback_dir, f"sentinel_agent-{os.getuid() if hasattr(os, 'getuid') else os.getpid()}.log"
+            )
+            self._temp_path = f"{self.filepath}.{os.getpid()}.tmp"
 
     def emit(self, record):
         try:
@@ -987,7 +1004,10 @@ class EncryptedFileHandler(logging.Handler):
                     except Exception:
                         pass
         except Exception:
-            self.handleError(record)
+            # Logging must never turn a state-directory ACL problem into a
+            # traceback storm that obscures the real agent failure (the macOS
+            # logs showed this happening for every Keychain operation).
+            return
 
 
 def _configure_logging():
@@ -1001,12 +1021,34 @@ def _configure_logging():
     # even when the wrapper was invoked with sudo. A root-owned shared log
     # must not produce LoggingError tracebacks in the user process.
     if sys.platform == "darwin":
-        macos_log_dir = os.path.expanduser("~/Library/Logs/ZeroWatch")
-        try:
-            os.makedirs(macos_log_dir, exist_ok=True)
-            LOG_FILE = os.path.join(macos_log_dir, "sentinel_agent.log")
-        except OSError:
-            LOG_FILE = os.path.join("/tmp", "ZeroWatch", "sentinel_agent.log")
+        # GUI and LaunchDaemon processes do not necessarily share ownership
+        # of ~/Library/Logs.  Choose the first path that this process can
+        # actually append to, so an old sudo-owned log cannot flood stderr
+        # with PermissionError/LoggingError messages.
+        macos_log_candidates = []
+        if "--daemon" not in sys.argv:
+            macos_log_candidates.append(
+                os.path.join(os.path.expanduser("~"), "Library", "Logs", "ZeroWatch")
+            )
+        macos_log_candidates.extend([
+            os.path.join(_secure_state_dir(early_base_dir), "logs"),
+            os.path.join("/tmp", "ZeroWatch"),
+        ])
+        LOG_FILE = None
+        for macos_log_dir in macos_log_candidates:
+            try:
+                os.makedirs(macos_log_dir, exist_ok=True)
+                candidate = os.path.join(macos_log_dir, "sentinel_agent.log")
+                with open(candidate, "a", encoding="utf-8"):
+                    pass
+                LOG_FILE = candidate
+                break
+            except OSError:
+                continue
+        if LOG_FILE is None:
+            # The stream handler remains usable even when every filesystem
+            # location is restricted by the host's sandbox/TCC policy.
+            LOG_FILE = os.devnull
     else:
         LOG_FILE = _state_path(early_base_dir, "sentinel_agent.log")
     root_logger = logging.getLogger()
@@ -1361,7 +1403,7 @@ class ZeroWatchClient:
                 approval_sync_request_id=approval_sync_request_id,
             )
             payload = json.dumps(state, separators=(",", ":")).encode("utf-8")
-            encrypted = encrypt_data(payload)
+            encrypted = encrypt_data(payload, "join_state")
             if not encrypted:
                 return False
 
@@ -1408,7 +1450,7 @@ class ZeroWatchClient:
         try:
             with open(self.join_state_file, "rb") as f:
                 encrypted = f.read()
-            decrypted = decrypt_data(encrypted)
+            decrypted = decrypt_data(encrypted, "join_state")
             if not decrypted:
                 self.join_state_tampered = True
                 return None
@@ -1711,7 +1753,7 @@ class ZeroWatchClient:
                     with open(token_path, "rb") as f:
                         encrypted = f.read()
                     _append_gui_log(self.base_dir, f"Found token file: {token_path} (size={len(encrypted)})")
-                    decrypted = decrypt_data(encrypted)
+                    decrypted = decrypt_data(encrypted, "jwt")
                     if not decrypted:
                         try:
                             if encrypted.startswith(b"RAW::"):
@@ -1748,7 +1790,7 @@ class ZeroWatchClient:
         try:
             _append_gui_log(self.base_dir, f"Attempting to save JWT to {self.token_file}")
             os.makedirs(os.path.dirname(self.token_file), exist_ok=True)
-            encrypted = encrypt_data(jwt_str.encode("utf-8"))
+            encrypted = encrypt_data(jwt_str.encode("utf-8"), "jwt")
             if encrypted:
                 with open(self.token_file, "wb") as f:
                     f.write(encrypted)
@@ -1974,7 +2016,7 @@ class ZeroWatchClient:
             try:
                 with open(queue_path, "rb") as f:
                     encrypted = f.read()
-                decrypted = decrypt_data(encrypted)
+                    decrypted = decrypt_data(encrypted, "offline_queue")
                 if decrypted:
                     queue = json.loads(decrypted.decode("utf-8"))
                     if queue_path != self.queue_file:
@@ -1992,7 +2034,7 @@ class ZeroWatchClient:
         """Saves the offline queue to DPAPI-encrypted file."""
         try:
             data = json.dumps(queue).encode("utf-8")
-            encrypted = encrypt_data(data)
+            encrypted = encrypt_data(data, "offline_queue")
             if encrypted:
                 with open(self.queue_file, "wb") as f:
                     f.write(encrypted)
@@ -2583,7 +2625,7 @@ class ZeroWatchClient:
         path = _state_path(self.base_dir, "dashboard_cache.dat")
         try:
             serialized = json.dumps(data).encode("utf-8")
-            encrypted = encrypt_data(serialized)
+            encrypted = encrypt_data(serialized, "dashboard_cache")
             if encrypted:
                 with open(path, "wb") as f:
                     f.write(encrypted)
@@ -2598,7 +2640,7 @@ class ZeroWatchClient:
         try:
             with open(path, "rb") as f:
                 raw = f.read()
-            decrypted = decrypt_data(raw)
+            decrypted = decrypt_data(raw, "dashboard_cache")
             if decrypted:
                 return json.loads(decrypted.decode("utf-8"))
         except Exception:
@@ -2609,7 +2651,7 @@ class ZeroWatchClient:
         path = _state_path(self.base_dir, "asset_info.json")
         try:
             serialized = json.dumps(asset_info, indent=4).encode("utf-8")
-            encrypted = encrypt_data(serialized)
+            encrypted = encrypt_data(serialized, "asset_info")
             data_to_write = encrypted if encrypted else serialized
             with open(path, "wb") as f:
                 f.write(data_to_write)
@@ -2624,7 +2666,7 @@ class ZeroWatchClient:
         try:
             with open(path, "rb") as f:
                 raw = f.read()
-            decrypted = decrypt_data(raw)
+            decrypted = decrypt_data(raw, "asset_info")
             if decrypted:
                 return json.loads(decrypted.decode("utf-8"))
             return json.loads(raw.decode("utf-8"))
@@ -2729,7 +2771,7 @@ def get_base_dir():
         try:
             with open(path, "rb") as f:
                 raw = f.read()
-            decrypted = decrypt_data(raw)
+            decrypted = decrypt_data(raw, "asset_info")
             if decrypted:
                 return json.loads(decrypted.decode("utf-8"))
             return json.loads(raw.decode("utf-8"))
@@ -4458,7 +4500,7 @@ def _read_fingerprint_json(base_dir):
         if not raw:
             return {}
 
-        decrypted = decrypt_data(raw)
+        decrypted = decrypt_data(raw, "fingerprint")
         if decrypted:
             try:
                 data = json.loads(decrypted.decode("utf-8"))
@@ -4491,7 +4533,7 @@ def _write_fingerprint_json(base_dir, payload):
     path = _fingerprint_json_path(base_dir)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     serialized = json.dumps(payload, indent=4).encode("utf-8")
-    encrypted = encrypt_data(serialized)
+    encrypted = encrypt_data(serialized, "fingerprint")
     data_to_write = encrypted if encrypted else serialized
     temp_path = f"{path}.{uuid.uuid4().hex}.tmp"
     try:
@@ -4737,6 +4779,53 @@ def _spawn_daemon_process():
         return False, None
 
 
+def _detach_macos_daemon_from_terminal() -> None:
+    """Detach a directly-launched macOS daemon from its Terminal session.
+
+    launchd and GUI-spawned children already have an independent session, but
+    operators also commonly run ``agent --daemon`` directly from Terminal.
+    Forking once and creating a new session makes terminal closure harmless in
+    that path as well.  The launchd path (parent PID 1) is left untouched.
+    """
+    if (
+        sys.platform != "darwin"
+        or "--daemon" not in sys.argv
+        or os.environ.get("ZEROWATCH_DAEMON_DETACHED") == "1"
+        or os.getppid() == 1
+    ):
+        return
+    try:
+        pid = os.fork()
+        if pid > 0:
+            raise SystemExit(0)
+        os.setsid()
+        os.environ["ZEROWATCH_DAEMON_DETACHED"] = "1"
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        with open(os.devnull, "rb", buffering=0) as devnull:
+            os.dup2(devnull.fileno(), sys.stdin.fileno())
+        try:
+            daemon_log_dir = os.path.join(
+                _secure_state_dir(get_base_dir()), "logs"
+            )
+            os.makedirs(daemon_log_dir, exist_ok=True)
+            daemon_log = open(
+                os.path.join(daemon_log_dir, "agent-daemon.log"),
+                "ab", buffering=0,
+            )
+            os.dup2(daemon_log.fileno(), sys.stdout.fileno())
+            os.dup2(daemon_log.fileno(), sys.stderr.fileno())
+        except OSError:
+            # /dev/null is preferable to retaining a terminal descriptor.
+            with open(os.devnull, "wb", buffering=0) as devnull:
+                os.dup2(devnull.fileno(), sys.stdout.fileno())
+                os.dup2(devnull.fileno(), sys.stderr.fileno())
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logging.warning("macOS daemon detachment failed; continuing: %s", exc)
+
+
 def _auto_bootstrap_background_agent() -> None:
     """Ensure startup persistence and background daemon are active for GUI sessions."""
     global _last_daemon_spawn_at
@@ -4953,7 +5042,7 @@ def request_shutdown_signal(base_dir, reason="manual-disable"):
         "requested_at": datetime.datetime.now().isoformat(),
     }
     serialized = json.dumps(payload).encode("utf-8")
-    encrypted = encrypt_data(serialized)
+    encrypted = encrypt_data(serialized, "shutdown_signal")
     data_to_write = encrypted if encrypted else serialized
     temp_path = f"{signal_path}.{uuid.uuid4().hex}.tmp"
     os.makedirs(os.path.dirname(signal_path), exist_ok=True)
@@ -4988,7 +5077,7 @@ def consume_shutdown_signal(base_dir):
         if raw is None:
             return None
         payload = None
-        decrypted = decrypt_data(raw)
+        decrypted = decrypt_data(raw, "shutdown_signal")
         if decrypted:
             try:
                 payload = json.loads(decrypted.decode("utf-8"))
@@ -5897,7 +5986,7 @@ def export_products_csv(base_dir, inventory):
     writer.writeheader()
     writer.writerows(inventory)
     serialized = buffer.getvalue().encode("utf-8")
-    encrypted = encrypt_data(serialized)
+    encrypted = encrypt_data(serialized, "products_export")
     data_to_write = encrypted if encrypted else serialized
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     temp_path = f"{filepath}.{uuid.uuid4().hex}.tmp"
@@ -7137,24 +7226,14 @@ class EnrollmentFrame(tk.Frame):
             except Exception as exc:
                 logging.warning("[GUI] macOS pending-state daemon bootstrap failed: %s", exc)
         else:
+            # The daemon must own approval polling even after this window is
+            # closed.  Use the same serialized bootstrap path as all other
+            # GUI/startup triggers so the pending state cannot be left with
+            # only the Tk polling thread alive.
             try:
-                with _daemon_spawn_lock:
-                    if not _is_daemon_running():
-                        started, pid = _spawn_daemon_process()
-                        logging.info("[GUI] Background daemon spawned on entering PENDING (started=%s, pid=%s).", started, pid)
+                _auto_bootstrap_background_agent()
             except Exception as exc:
-                logging.warning("[GUI] Pre-approval daemon immediate spawn failed: %s", exc)
-
-            # Register startup persistence in a non-daemon thread so closing the
-            # GUI does not abruptly kill the registration process.
-            def _pre_approval_persistence():
-                try:
-                    task_ok = register_task_scheduler()
-                    if not task_ok:
-                        register_startup_registry()
-                except Exception as exc:
-                    logging.warning("Pre-approval persistence registration failed: %s", exc)
-            threading.Thread(target=_pre_approval_persistence, daemon=False).start()
+                logging.warning("[GUI] Pre-approval daemon bootstrap failed: %s", exc)
 
     def _start_polling(self):
         if self._polling_active:
@@ -9404,6 +9483,11 @@ def main():
         full_uninstall()
         return
 
+    # A direct macOS ``--daemon`` launch must have the same lifecycle as a
+    # launchd service.  This runs before GUI routing and before any terminal
+    # cleanup trap can turn a terminal hangup into an agent shutdown.
+    _detach_macos_daemon_from_terminal()
+
     # 1. Immediate Console Hiding
     if "--password-prompt" not in sys.argv and "--reset" not in sys.argv:
         hide_console()
@@ -9474,6 +9558,8 @@ def main():
         if not client.jwt:
             logging.error("Agent not enrolled. Use --enroll first.")
             return
+        if sys.platform == "darwin":
+            _auto_bootstrap_background_agent()
         app = UnifiedSentinelGUI(client, force_frame="dashboard")
         app.mainloop()
         return
@@ -9524,7 +9610,19 @@ def main():
             agent = MacOSSentinelAgent()
             agent.run()
         else:
-            main_agent()
+            # A transient state/ACL/network exception must not leave the
+            # endpoint permanently without a daemon.  The watchdog supervises
+            # the executable, but it intentionally exits when the daemon
+            # mutex disappears; retry daemon startup here instead.
+            while True:
+                try:
+                    main_agent()
+                    break
+                except Exception:
+                    logging.exception("Background daemon crashed; retrying startup in 10 seconds.")
+                    if consume_shutdown_signal(get_base_dir()):
+                        break
+                    time.sleep(10)
         return
 
     # Default interactive routing

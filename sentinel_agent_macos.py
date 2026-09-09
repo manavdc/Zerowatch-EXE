@@ -125,7 +125,7 @@ logger = logging.getLogger("macos.agent")
 
 def _daemonize_if_needed() -> None:
     """Detach the macOS agent from the terminal when launched in daemon mode."""
-    if "--daemon" not in sys.argv:
+    if "--daemon" not in sys.argv or os.environ.get("ZEROWATCH_DAEMON_DETACHED") == "1":
         return
     try:
         if os.getppid() == 1:
@@ -412,7 +412,7 @@ class MacOSAgentSession:
 
     # ── Secure store wrappers ─────────────────────────────────────────────────
 
-    def _encrypt(self, data: bytes) -> bytes | None:
+    def _encrypt(self, data: bytes, purpose: str = "default") -> bytes | None:
         """
         Encrypt via MacOSSecureStore (Keychain tagged-reference).
         Falls back to None if Keychain is unavailable (e.g. not on macOS,
@@ -422,7 +422,12 @@ class MacOSAgentSession:
         corrupt non-token bytes to disk which would cause decrypt failures later.
         """
         try:
-            result = self._platform.secure_store.encrypt(data)
+            named_encrypt = getattr(self._platform.secure_store, "encrypt_named", None)
+            result = (
+                named_encrypt(data, purpose)
+                if callable(named_encrypt)
+                else self._platform.secure_store.encrypt(data)
+            )
             if result is not None:
                 # Validate the token is a proper ZW_KC reference or RAW fallback
                 if not (result.startswith(b"ZW_KC::") or result.startswith(b"RAW::")):
@@ -452,7 +457,7 @@ class MacOSAgentSession:
             import base64
             return b"RAW::" + base64.b64encode(data)
 
-    def _decrypt(self, data: bytes) -> bytes | None:
+    def _decrypt(self, data: bytes, purpose: str = "default") -> bytes | None:
         """
         Decrypt via MacOSSecureStore, or handle the RAW:: fallback token.
         """
@@ -460,7 +465,12 @@ class MacOSAgentSession:
             if data.startswith(b"RAW::"):
                 import base64
                 return base64.b64decode(data[5:])
-            return self._platform.secure_store.decrypt(data)
+            named_decrypt = getattr(self._platform.secure_store, "decrypt_named", None)
+            return (
+                named_decrypt(data, purpose)
+                if callable(named_decrypt)
+                else self._platform.secure_store.decrypt(data)
+            )
         except Exception as exc:
             logger.warning("SecureStore decrypt failed: %s", exc)
             return None
@@ -479,7 +489,7 @@ class MacOSAgentSession:
             try:
                 with open(path, "rb") as fh:
                     enc = fh.read()
-                raw = self._decrypt(enc)
+                raw = self._decrypt(enc, "jwt")
                 if raw:
                     self._jwt = raw.decode("utf-8").strip()
                     if self._jwt:
@@ -494,7 +504,7 @@ class MacOSAgentSession:
     def save_jwt(self, token: str) -> None:
         """Encrypt and save JWT to disk."""
         self._jwt = token
-        enc = self._encrypt(token.encode("utf-8"))
+        enc = self._encrypt(token.encode("utf-8"), "jwt")
         if enc:
             for path in (self._jwt_path, os.path.join(self._state_dir, "zerowatch_token.dat")):
                 try:
@@ -521,7 +531,7 @@ class MacOSAgentSession:
             try:
                 with open(path, "rb") as fh:
                     raw = fh.read()
-                decoded = self._decrypt(raw) or raw
+                decoded = self._decrypt(raw, "join_state") or raw
                 state = json.loads(decoded.decode("utf-8"))
                 if isinstance(state, dict):
                     return state
@@ -543,7 +553,7 @@ class MacOSAgentSession:
             merged["checksum"] = hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
 
             data = json.dumps(merged).encode("utf-8")
-            enc  = self._encrypt(data)
+            enc  = self._encrypt(data, "join_state")
             payload = enc if enc else data
             for path in (self._join_path, os.path.join(self._state_dir, "zw_team_join_state.dat")):
                 try:
@@ -656,6 +666,13 @@ class MacOSAgent:
         # The persisted approvalSyncStatus in join_state.json is the cross-restart
         # guard; this threading.Lock() prevents duplicate callbacks within one run.
         self._approval_sync_lock: threading.Lock = threading.Lock()
+        # Full uploads and delta uploads share the same backend inventory. A
+        # single lock prevents a fast L0 delta from interleaving with a full
+        # replacement upload and re-introducing stale/duplicate records.
+        self._inventory_sync_lock = threading.RLock()
+        self._pending_full_inventory = None
+        self._pending_full_lock = threading.Lock()
+        self._pending_full_approval = False
         self._initial_scan_done: threading.Event = threading.Event()
 
         # Warm the scan cache from previous session so first delta is minimal
@@ -962,16 +979,21 @@ class MacOSAgent:
     # ── Sync helpers ───────────────────────────────────────────────────────────
 
     def _sync_full(self, software: list, hardware: dict,
-                   inventory_scope: str = "complete") -> int:
+                   inventory_scope: str = "complete", inventory_revision: str | None = None,
+                   batch_index: int | None = None, batch_count: int | None = None) -> int:
         """Push full software + hardware inventory to backend. Returns HTTP status code."""
         payload = {
             "deviceId":  self._device_id,
             "software":  software,
             "hardware":  hardware,
             "inventoryScope": inventory_scope,
-            "inventoryRevision": time.time_ns(),
+            "inventoryRevision": inventory_revision or f"{self._device_id}:{time.time_ns()}",
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
+        if batch_index is not None:
+            payload["inventoryBatchIndex"] = batch_index
+        if batch_count is not None:
+            payload["inventoryBatchCount"] = batch_count
         try:
             resp = self._session.post("/agent/sync/full", payload, timeout=60)
             if resp.status_code in (200, 201, 204):
@@ -983,15 +1005,40 @@ class MacOSAgent:
             logger.warning("Full sync error: %s", exc)
             return 0
 
-    def _sync_complete_inventory(self, software_list: list, hardware: dict) -> bool:
+    def _sync_complete_inventory(self, software_list: list, hardware: dict,
+                                 inventory_scope: str = "complete") -> bool:
         """Sync complete inventory, falling back to chunked delta batches on HTTP 413 (Payload Too Large)."""
-        status_code = self._sync_full(software_list, hardware, inventory_scope="complete")
+        # The scanner normally deduplicates this list. Keep the network layer
+        # defensive because cached and package-manager results can converge on
+        # the same record across restarts.
+        unique_items = []
+        seen = set()
+        for item in software_list or []:
+            try:
+                marker = json.dumps(
+                    {key: item.get(key) for key in ("name", "version", "source", "path")}
+                    if isinstance(item, dict) else item,
+                    sort_keys=True,
+                    default=str,
+                    separators=(",", ":"),
+                )
+            except Exception:
+                marker = repr(item)
+            if marker not in seen:
+                seen.add(marker)
+                unique_items.append(item)
+
+        revision = f"{self._device_id}:{time.time_ns()}"
+        status_code = self._sync_full(
+            unique_items, hardware, inventory_scope=inventory_scope,
+            inventory_revision=revision,
+        )
         if status_code in (200, 201, 204):
             return True
         if status_code != 413:
             return False
 
-        items = list(software_list or [])
+        items = unique_items
         if not items:
             return False
 
@@ -1009,12 +1056,20 @@ class MacOSAgent:
             batches.append(current)
 
         logger.info("[SYNC] Chunking oversized inventory (%d items) into %d requests (HTTP 413 fallback).", len(items), len(batches))
-        first_status = self._sync_full(batches[0], hardware, inventory_scope="complete")
+        batch_count = len(batches)
+        first_status = self._sync_full(
+            batches[0], hardware, inventory_scope=inventory_scope,
+            inventory_revision=revision, batch_index=1, batch_count=batch_count,
+        )
         if first_status not in (200, 201, 204):
             return False
 
         for index, batch in enumerate(batches[1:], start=2):
-            if not self._sync_delta(batch, []):
+            if not self._sync_delta(
+                batch, [], inventory_revision=revision,
+                inventory_scope=inventory_scope, batch_index=index,
+                batch_count=batch_count,
+            ):
                 logger.warning("[SYNC] Inventory chunk %d/%d failed.", index, len(batches))
                 return False
         logger.info("[SYNC] Chunked inventory sync finished: %d items delivered.", len(items))
@@ -1026,14 +1081,24 @@ class MacOSAgent:
         for attempt in range(3):
             if self._shutdown_event.is_set():
                 return False
-            if self._sync_complete_inventory(software, hardware):
+            sync_lock = getattr(self, "_inventory_sync_lock", None)
+            if sync_lock is None:
+                success = self._sync_complete_inventory(software, hardware, inventory_scope)
+            else:
+                with sync_lock:
+                    success = self._sync_complete_inventory(software, hardware, inventory_scope)
+            if success:
                 return True
             logger.warning("Full sync attempt %d/3 failed. Retrying in 15s...", attempt + 1)
             self._shutdown_event.wait(timeout=15)
         logger.error("Full sync failed after 3 attempts — will retry on next delta.")
         return False
 
-    def _sync_delta(self, added: list, removed: list) -> bool:
+    def _sync_delta(self, added: list, removed: list,
+                    inventory_revision: str | None = None,
+                    inventory_scope: str | None = None,
+                    batch_index: int | None = None,
+                    batch_count: int | None = None) -> bool:
         """Push incremental delta to backend."""
         if not added and not removed:
             return True
@@ -1043,8 +1108,21 @@ class MacOSAgent:
             "removed":   removed,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
+        if inventory_revision is not None:
+            payload["inventoryRevision"] = inventory_revision
+        if inventory_scope is not None:
+            payload["inventoryScope"] = inventory_scope
+        if batch_index is not None:
+            payload["inventoryBatchIndex"] = batch_index
+        if batch_count is not None:
+            payload["inventoryBatchCount"] = batch_count
         try:
-            resp = self._session.post("/agent/sync/delta", payload, timeout=60)
+            sync_lock = getattr(self, "_inventory_sync_lock", None)
+            if sync_lock is None:
+                resp = self._session.post("/agent/sync/delta", payload, timeout=60)
+            else:
+                with sync_lock:
+                    resp = self._session.post("/agent/sync/delta", payload, timeout=60)
             if resp.status_code in (200, 201, 204):
                 logger.info("Delta sync: +%d -%d items", len(added), len(removed))
                 return True
@@ -1083,18 +1161,16 @@ class MacOSAgent:
     # ── Scan phases ────────────────────────────────────────────────
 
     def _initial_scan_and_sync(self, approval_sync_claimed: bool = False) -> None:
-        """
-        Startup-optimized L0 + priority-path L1/L2 scan.
+        """Collect and publish one complete inventory from the daemon.
 
-        Strategy:
-          1. run_startup_scan(): L0 synchronous (<1s) + priority L1/L2
-             parallelized with 6 workers.
-          2. 90-second safety timeout as a defensive backstop.
-          3. If exceeded or errored, fall back to L0-only sync.
-
-        The full-disk exhaustive walk is NOT run at startup.
-        It runs on the existing 24h cadence via start_periodic_scans().
+        Inventory ownership deliberately lives here, in the long-lived
+        background process.  The GUI never scans or uploads inventory.  A
+        complete filesystem scan is allowed to finish instead of being
+        abandoned after a short UI-oriented timeout; heartbeat and lifecycle
+        work continue in their own threads while it runs.
         """
+        if not hasattr(self, "_initial_scan_done"):
+            self._initial_scan_done = threading.Event()
         if not _inventory_scan_enabled():
             logger.info("Inventory scan disabled by administrator; skipping initial inventory upload.")
             if approval_sync_claimed:
@@ -1102,17 +1178,38 @@ class MacOSAgent:
             self._initial_scan_done.set()
             return
 
-        _SAFETY_TIMEOUT = 90
         startup_items = []
         scan_done = threading.Event()
         scan_error = []
 
         def _run_startup():
             try:
+                # run_full_scan is the authoritative complete-inventory API.
+                # Keep a compatibility fallback for older orchestrator builds
+                # and lightweight test doubles that do not expose it.
+                full_scan = getattr(self._orchestrator, "run_full_scan", None)
+                if callable(full_scan):
+                    result = full_scan(
+                        include_filesystem=True,
+                        stop_event=self._shutdown_event,
+                    )
+                    if isinstance(result, list):
+                        startup_items.extend(result)
+                        return
+
                 result = self._orchestrator.run_startup_scan(
                     stop_event=self._shutdown_event,
                 )
-                startup_items.extend(result)
+                if isinstance(result, list):
+                    startup_items.extend(result)
+                else:
+                    # Preserve the old minimal fallback only when the
+                    # complete scanner is unavailable, never as a successful
+                    # "complete" upload.
+                    layer0 = self._orchestrator._run_layer0()
+                    startup_items.extend(
+                        _items_to_dicts(self._orchestrator._deduplicate(layer0))
+                    )
             except Exception as exc:
                 scan_error.append(exc)
             finally:
@@ -1137,41 +1234,55 @@ class MacOSAgent:
         ).start()
 
         logger.info(
-            "[STARTUP_SCAN_STARTED] macOS initial scan started "
-            "(timeout=%ds, device_id=%s, approval_claimed=%s).",
-            _SAFETY_TIMEOUT, self._device_id, approval_sync_claimed,
+            "[STARTUP_SCAN_STARTED] macOS complete inventory scan started "
+            "(device_id=%s, approval_claimed=%s).",
+            getattr(self, "_device_id", "unknown"), approval_sync_claimed,
         )
         threading.Thread(
             target=_run_startup, daemon=True, name="initial-startup-scan",
         ).start()
         try:
-            completed = scan_done.wait(timeout=_SAFETY_TIMEOUT)
+            # This is a background daemon thread, so completion—not a GUI
+            # timeout—defines when the complete inventory may be uploaded.
+            completed = scan_done.wait()
             if not hardware_done.wait(timeout=30):
                 logger.warning("Hardware profile timed out; syncing inventory without hardware details.")
             hw = hardware
             if completed and not scan_error:
                 logger.info(
-                    "[STARTUP_SCAN] Completed within %ds: "
+                    "[STARTUP_SCAN] Complete inventory collected: "
                     "%d software items (device_id=%s).",
-                    _SAFETY_TIMEOUT, len(startup_items), self._device_id,
+                    len(startup_items), getattr(self, "_device_id", "unknown"),
                 )
-                logger.info("[INVENTORY_UPLOAD_STARTED] device_id=%s items=%d", self._device_id, len(startup_items))
-                ok = self._sync_full_with_retry(startup_items, hw, "complete")
-                logger.info("[INVENTORY_UPLOAD_COMPLETED] device_id=%s success=%s", self._device_id, ok)
+                logger.info("[INVENTORY_UPLOAD_STARTED] device_id=%s items=%d", getattr(self, "_device_id", "unknown"), len(startup_items))
+                ok = self._sync_full_with_retry(startup_items, hw)
+                logger.info("[INVENTORY_UPLOAD_COMPLETED] device_id=%s success=%s", getattr(self, "_device_id", "unknown"), ok)
+                if ok:
+                    with getattr(self, "_pending_full_lock", threading.Lock()):
+                        self._pending_full_inventory = None
+                        self._pending_full_approval = False
+                else:
+                    # Keep the complete result in memory for the monitor to
+                    # retry even when the server was unavailable for all
+                    # immediate attempts. A quiet machine must not lose its
+                    # initial inventory merely because no delta occurs later.
+                    with getattr(self, "_pending_full_lock", threading.Lock()):
+                        self._pending_full_inventory = (list(startup_items), dict(hw))
+                        self._pending_full_approval = approval_sync_claimed
                 if approval_sync_claimed:
                     self._finish_approval_sync(ok)
-                    logger.info("[FULL_SYNC_COMPLETED] device_id=%s", self._device_id)
+                    logger.info("[FULL_SYNC_COMPLETED] device_id=%s", getattr(self, "_device_id", "unknown"))
             else:
                 logger.warning(
-                    "[STARTUP_SCAN] Priority scan exceeded %ds or failed; "
-                    "syncing L0-only now (device_id=%s).",
-                    _SAFETY_TIMEOUT, self._device_id,
+                    "[STARTUP_SCAN] Complete scan failed; syncing L0 fallback "
+                    "as partial inventory (device_id=%s).",
+                    getattr(self, "_device_id", "unknown"),
                 )
                 layer0 = self._orchestrator._run_layer0()
                 layer0_dicts = _items_to_dicts(self._orchestrator._deduplicate(layer0))
                 logger.info(
                     "[INVENTORY_UPLOAD_STARTED] L0 fallback device_id=%s items=%d",
-                    self._device_id, len(layer0_dicts),
+                    getattr(self, "_device_id", "unknown"), len(layer0_dicts),
                 )
                 self._sync_full_with_retry(layer0_dicts, hw, "partial")
                 if approval_sync_claimed:
@@ -1200,11 +1311,32 @@ class MacOSAgent:
         """
         last_heartbeat  = time.monotonic()
         last_l0_delta   = time.monotonic()
+        last_full_retry = 0.0
         L0_INTERVAL     = 60   # seconds between L0 app-bundle delta checks
         logger.info("macOS heartbeat monitor started (interval=%ds).", HEARTBEAT_INTERVAL)
 
         while not self._shutdown_event.is_set() and not self._stop_event.is_set():
             now = time.monotonic()
+
+            # Retry a complete startup upload until it is acknowledged. This
+            # is independent of GUI activity and also covers a server outage
+            # that begins during the initial three-attempt retry window.
+            pending_lock = getattr(self, "_pending_full_lock", None)
+            if pending_lock is None:
+                pending = getattr(self, "_pending_full_inventory", None)
+            else:
+                with pending_lock:
+                    pending = self._pending_full_inventory
+            if pending and now - last_full_retry >= 15:
+                last_full_retry = now
+                items, hardware = pending
+                if self._sync_full_with_retry(items, hardware):
+                    with pending_lock or threading.Lock():
+                        self._pending_full_inventory = None
+                        pending_approval = getattr(self, "_pending_full_approval", False)
+                        self._pending_full_approval = False
+                    if pending_approval:
+                        self._finish_approval_sync(True)
 
             # ── Heartbeat ──────────────────────────────────────────────────
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
@@ -1233,6 +1365,14 @@ class MacOSAgent:
 
     def run(self) -> int:
         """Main blocking run loop. Returns process exit code."""
+        # Keep the lifecycle helpers usable with lightweight test doubles and
+        # with older stateful instances restored by an OTA update.
+        if not hasattr(self, "_approval_sync_lock"):
+            self._approval_sync_lock = threading.Lock()
+        if not hasattr(self, "_inventory_sync_lock"):
+            self._inventory_sync_lock = threading.RLock()
+        if not hasattr(self, "_initial_scan_done"):
+            self._initial_scan_done = threading.Event()
         # Authenticate / enroll (with retry backoff)
         attempt = 0
         while not self._shutdown_event.is_set():
@@ -1269,11 +1409,18 @@ class MacOSAgent:
             logger.info(
                 "[ENROLLMENT] Approval claimed by macOS daemon; "
                 "starting complete inventory sync (device_id=%s).",
-                self._device_id,
+                getattr(self, "_device_id", "unknown"),
             )
 
-        # Initial startup scan (L0 + priority L1/L2 within 60s)
+        # Initial complete inventory scan is owned by the daemon and runs
+        # independently of any GUI process.
         self._initial_scan_and_sync(approval_sync_claimed=approval_sync_claimed)
+
+        # The production method sets this in its finally block.  Keep the
+        # guard tolerant of an injected/legacy implementation that performs
+        # the scan synchronously but has no event bookkeeping.
+        if not self._initial_scan_done.is_set():
+            self._initial_scan_done.set()
 
         # Keep the periodic scanner off the shared cache until the initial
         # deep scan and its follow-up upload have completed.

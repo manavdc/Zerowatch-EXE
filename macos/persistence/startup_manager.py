@@ -84,6 +84,11 @@ _LAUNCHCTL_TIMEOUT = 30   # seconds
 _SYSTEM_DOMAIN = "system"
 
 
+def _current_uid() -> int:
+    """Return the current uid on macOS, with a CI-friendly fallback."""
+    return int(getattr(os, "getuid", lambda: os.geteuid())())
+
+
 # ── plist construction ────────────────────────────────────────────────────────
 
 def _build_plist(
@@ -259,7 +264,7 @@ def _bootstrap(plist_path: str) -> bool:
 
 def _bootstrap_user(plist_path: str) -> bool:
     """Bootstrap a LaunchAgent for the current user session."""
-    uid = os.getuid()
+    uid = _current_uid()
     domain_targets = [f"gui/{uid}", f"user/{uid}"]
     for domain in domain_targets:
         ok, stdout, stderr = _launchctl("bootstrap", domain, plist_path)
@@ -302,7 +307,7 @@ def _bootout(plist_path: str) -> bool:
 
 def _bootout_user(plist_path: str) -> bool:
     """Remove a user LaunchAgent from common user launchd domains."""
-    uid = os.getuid()
+    uid = _current_uid()
     domain_targets = [f"gui/{uid}", f"user/{uid}"]
     any_success = False
     for domain in domain_targets:

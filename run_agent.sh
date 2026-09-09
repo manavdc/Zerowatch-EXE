@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# run_agent.sh — ZeroWatch Linux Agent Launcher
+# run_agent.sh — ZeroWatch Linux/macOS Agent Launcher
 #
 # Usage:
 #   chmod +x run_agent.sh
@@ -106,6 +106,11 @@ if [[ "${RAW_SERVER_URL}" != */api ]]; then
 else
     BASE_API_URL="${RAW_SERVER_URL}"
 fi
+
+# launchd does not inherit the shell that performed enrollment.  Export the
+# selected endpoint so the persisted macOS service reconnects to the same
+# server after Terminal/GUI closure, reboot, or a launchd restart.
+export ZEROWATCH_API_URL="${BASE_API_URL}"
 
 echo "════════════════════════════════════════════════════════════"
 echo " ZeroWatch ${AGENT_PLATFORM} Agent — Launcher"
@@ -220,7 +225,7 @@ if [[ "${DAEMON_MODE}" == true ]]; then
     echo "[Daemon] PID file:   ${SCRIPT_DIR}/state/agent.pid"
     echo ""
 
-    nohup "${PYTHON}" -u "${AGENT_SCRIPT}" --daemon \
+    ZEROWATCH_DAEMON_DETACHED=1 nohup "${PYTHON}" -u "${AGENT_SCRIPT}" --daemon \
         >> "${LOG_FILE}" 2>&1 &
 
     AGENT_PID=$!
