@@ -807,6 +807,10 @@ class MacOSAgent:
                         status = str(data.get("status") or "").lower()
                         if status == "approved" and data.get("jwt"):
                             self._session.save_jwt(data["jwt"])
+                            self._session.save_join_state({
+                                "status": "approved",
+                                **({"requestId": data["requestId"]} if data.get("requestId") else {}),
+                            })
                             logger.info(
                                 "[APPROVAL_DETECTED] Persisted enrollment approved; "
                                 "daemon authenticated (device_id=%s).",
@@ -882,6 +886,10 @@ class MacOSAgent:
                     status = data.get("status")
                     if status == "approved" and data.get("jwt"):
                         self._session.save_jwt(data.get("jwt"))
+                        self._session.save_join_state({
+                            "status": "approved",
+                            **({"requestId": data["requestId"]} if data.get("requestId") else {}),
+                        })
                         logger.info("Agent joined and approved immediately.")
                         return True
 
@@ -903,6 +911,10 @@ class MacOSAgent:
                                     token = status_data.get("jwt")
                                     if token:
                                         self._session.save_jwt(token)
+                                        self._session.save_join_state({
+                                            "status": "approved",
+                                            **({"requestId": status_data["requestId"]} if status_data.get("requestId") else {}),
+                                        })
                                         logger.info(
                                             "[APPROVAL_DETECTED] Device approved! "
                                             "Enrollment complete (device_id=%s).",
@@ -963,6 +975,10 @@ class MacOSAgent:
                     token = data.get("jwt")
                     if token:
                         self._session.save_jwt(token)
+                        self._session.save_join_state({
+                            "status": "approved",
+                            **({"requestId": data["requestId"]} if data.get("requestId") else {}),
+                        })
                         logger.info("Agent enrolled and linked.")
                         return True
                     logger.error("Individual enrollment succeeded but no token returned.")
@@ -1181,12 +1197,23 @@ class MacOSAgent:
         startup_items = []
         scan_done = threading.Event()
         scan_error = []
+        deep_scan_required = [True]
 
         def _run_startup():
             try:
-                # run_full_scan is the authoritative complete-inventory API.
-                # Keep a compatibility fallback for older orchestrator builds
-                # and lightweight test doubles that do not expose it.
+                # Publish the bounded startup inventory first.  The daemon
+                # must not make the server wait for an exhaustive all-drive
+                # walk before it sends its first inventory.
+                startup_scan = getattr(self._orchestrator, "run_startup_scan", None)
+                if callable(startup_scan):
+                    result = startup_scan(stop_event=self._shutdown_event)
+                    if isinstance(result, list):
+                        startup_items.extend(result)
+                        return
+
+                # Older orchestrator builds may not expose the bounded
+                # startup scan. Their full scan is already exhaustive, so use
+                # it as the one baseline upload and do not repeat it below.
                 full_scan = getattr(self._orchestrator, "run_full_scan", None)
                 if callable(full_scan):
                     result = full_scan(
@@ -1195,21 +1222,17 @@ class MacOSAgent:
                     )
                     if isinstance(result, list):
                         startup_items.extend(result)
+                        deep_scan_required[0] = False
                         return
 
-                result = self._orchestrator.run_startup_scan(
-                    stop_event=self._shutdown_event,
+                # Compatibility fallback for older orchestrator builds and
+                # lightweight test doubles that do not expose startup_scan.
+                # Keep this bounded: the exhaustive run_full_scan belongs to
+                # the deep worker below and must not be executed twice.
+                layer0 = self._orchestrator._run_layer0()
+                startup_items.extend(
+                    _items_to_dicts(self._orchestrator._deduplicate(layer0))
                 )
-                if isinstance(result, list):
-                    startup_items.extend(result)
-                else:
-                    # Preserve the old minimal fallback only when the
-                    # complete scanner is unavailable, never as a successful
-                    # "complete" upload.
-                    layer0 = self._orchestrator._run_layer0()
-                    startup_items.extend(
-                        _items_to_dicts(self._orchestrator._deduplicate(layer0))
-                    )
             except Exception as exc:
                 scan_error.append(exc)
             finally:
@@ -1234,7 +1257,7 @@ class MacOSAgent:
         ).start()
 
         logger.info(
-            "[STARTUP_SCAN_STARTED] macOS complete inventory scan started "
+            "[STARTUP_SCAN_STARTED] macOS baseline inventory scan started "
             "(device_id=%s, approval_claimed=%s).",
             getattr(self, "_device_id", "unknown"), approval_sync_claimed,
         )
@@ -1242,15 +1265,16 @@ class MacOSAgent:
             target=_run_startup, daemon=True, name="initial-startup-scan",
         ).start()
         try:
-            # This is a background daemon thread, so completion—not a GUI
-            # timeout—defines when the complete inventory may be uploaded.
+            # This bounded scan is intentionally uploaded before the deep
+            # filesystem walk. It gives the backend an immediate inventory
+            # while the daemon continues collecting the complete result.
             completed = scan_done.wait()
             if not hardware_done.wait(timeout=30):
                 logger.warning("Hardware profile timed out; syncing inventory without hardware details.")
             hw = hardware
             if completed and not scan_error:
                 logger.info(
-                    "[STARTUP_SCAN] Complete inventory collected: "
+                    "[STARTUP_SCAN] Baseline inventory collected: "
                     "%d software items (device_id=%s).",
                     len(startup_items), getattr(self, "_device_id", "unknown"),
                 )
@@ -1269,12 +1293,9 @@ class MacOSAgent:
                     with getattr(self, "_pending_full_lock", threading.Lock()):
                         self._pending_full_inventory = (list(startup_items), dict(hw))
                         self._pending_full_approval = approval_sync_claimed
-                if approval_sync_claimed:
-                    self._finish_approval_sync(ok)
-                    logger.info("[FULL_SYNC_COMPLETED] device_id=%s", getattr(self, "_device_id", "unknown"))
             else:
                 logger.warning(
-                    "[STARTUP_SCAN] Complete scan failed; syncing L0 fallback "
+                    "[STARTUP_SCAN] Baseline scan failed; syncing L0 fallback "
                     "as partial inventory (device_id=%s).",
                     getattr(self, "_device_id", "unknown"),
                 )
@@ -1285,8 +1306,66 @@ class MacOSAgent:
                     getattr(self, "_device_id", "unknown"), len(layer0_dicts),
                 )
                 self._sync_full_with_retry(layer0_dicts, hw, "partial")
-                if approval_sync_claimed:
-                    self._finish_approval_sync(False)
+
+            # The exhaustive scan is separate from the first upload for the
+            # current orchestrator. Do not start periodic cache scans until
+            # this worker has finished, so the SQLite snapshot cannot be
+            # modified concurrently.
+            self._deep_scan_done = threading.Event()
+
+            if not deep_scan_required[0]:
+                self._deep_scan_done.set()
+                logger.info("[DEEP_SCAN] Baseline was already exhaustive; no second scan required.")
+                if approval_sync_claimed and ok:
+                    self._finish_approval_sync(True)
+                return
+
+            def _run_deep_inventory():
+                deep_ok = False
+                try:
+                    full_scan = getattr(self._orchestrator, "run_full_scan", None)
+                    if not callable(full_scan):
+                        logger.warning("[DEEP_SCAN] Complete scanner is unavailable.")
+                        return
+                    logger.info("[DEEP_SCAN] Exhaustive macOS inventory scan started.")
+                    complete_items = full_scan(
+                        include_filesystem=True,
+                        stop_event=self._shutdown_event,
+                    )
+                    if not isinstance(complete_items, list):
+                        logger.warning("[DEEP_SCAN] Scanner returned no inventory list.")
+                        return
+                    logger.info(
+                        "[DEEP_SCAN] Complete inventory collected: %d items.",
+                        len(complete_items),
+                    )
+                    deep_ok = self._sync_full_with_retry(complete_items, hw)
+                    logger.info(
+                        "[FULL_SYNC_COMPLETED] device_id=%s success=%s items=%d",
+                        getattr(self, "_device_id", "unknown"), deep_ok,
+                        len(complete_items),
+                    )
+                    if deep_ok:
+                        with getattr(self, "_pending_full_lock", threading.Lock()):
+                            self._pending_full_inventory = None
+                            self._pending_full_approval = False
+                        if approval_sync_claimed:
+                            self._finish_approval_sync(True)
+                    else:
+                        with getattr(self, "_pending_full_lock", threading.Lock()):
+                            self._pending_full_inventory = (list(complete_items), dict(hw))
+                            self._pending_full_approval = approval_sync_claimed
+                except Exception as exc:
+                    logger.error("[DEEP_SCAN] Complete inventory failed: %s", exc, exc_info=True)
+                finally:
+                    self._deep_scan_done.set()
+
+            threading.Thread(
+                target=_run_deep_inventory,
+                daemon=True,
+                name="macos-deep-inventory-sync",
+            ).start()
+            logger.info("[DEEP_SCAN] Complete inventory worker queued in background.")
         except Exception as exc:
             logger.error("Initial scan failed: %s", exc, exc_info=True)
         finally:
@@ -1425,6 +1504,9 @@ class MacOSAgent:
         # Keep the periodic scanner off the shared cache until the initial
         # deep scan and its follow-up upload have completed.
         self._initial_scan_done.wait()
+        deep_scan_done = getattr(self, "_deep_scan_done", None)
+        if deep_scan_done is not None:
+            deep_scan_done.wait()
 
         # Start periodic filesystem scans (priority + deep) so macOS does a
         # true folder/file deep scan instead of only hardware/software inventory.
