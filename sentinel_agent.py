@@ -1198,8 +1198,8 @@ class ZeroWatchClient:
         team_code = state.get("teamCode")
         device_id = state.get("deviceId")
         
-        # Stricter check: Must have status, team, and match current device identity
-        is_ok = (status == "approved" and team_code and device_id == self.device_id)
+        # Check: Must have status approved and match current device identity
+        is_ok = (status == "approved" and device_id == self.device_id)
         logging.info(f"Enrollment check: status='{status}', team='{team_code}', match={device_id == self.device_id} => {is_ok}")
         return is_ok
 
@@ -1969,8 +1969,26 @@ class ZeroWatchClient:
                 timeout=10,
             )
             data = resp.json() if resp.content else {"success": False}
-            if data.get("success") and data.get("jwt"):
-                self._save_jwt(data.get("jwt"))
+            if data.get("success"):
+                result_status = str(data.get("status") or "pending").strip().lower()
+                if result_status == "approved":
+                    if data.get("jwt"):
+                        self._save_jwt(data.get("jwt"))
+                    self._save_join_state(
+                        status="approved",
+                        team_name="Personal Device",
+                        team_code="000000",
+                        request_id=data.get("requestId"),
+                        team_id="6a0000000000000000000000",
+                    )
+                else:
+                    self._save_join_state(
+                        status="pending",
+                        team_name="Personal Device",
+                        team_code="000000",
+                        request_id=data.get("requestId"),
+                        team_id="6a0000000000000000000000",
+                    )
             return data
         except Exception as e:
             logging.warning(f"Individual registration failed: {e}")
