@@ -1566,6 +1566,12 @@ class ZeroWatchClient:
                 )
                 if data.get("jwt"):
                     self._save_jwt(data.get("jwt"))
+                else:
+                    # Some backend approval responses intentionally omit the
+                    # token because it was issued during the original join.
+                    # Reload the shared token before reporting approval to the
+                    # daemon; otherwise main_agent() exits before heartbeat.
+                    self.jwt = self._load_jwt()
                 self._save_join_state(
                     status="approved",
                     team_name=data.get("teamName") or current_state.get("teamName"),
@@ -1582,7 +1588,7 @@ class ZeroWatchClient:
                     approval_sync_request_id=None if request_changed else current_state.get("approvalSyncRequestId"),
                 )
                 self._update_team_info_from_payload(data)
-                return {"status": "approved", "jwt": data.get("jwt")}
+                return {"status": "approved", "jwt": self.jwt or data.get("jwt")}
 
             if status == "denied":
                 self._save_join_state(
@@ -1991,6 +1997,12 @@ class ZeroWatchClient:
                 if result_status == "approved":
                     if data.get("jwt"):
                         self._save_jwt(data.get("jwt"))
+                    else:
+                        # Premium Individual approvals can be acknowledged by
+                        # the API before the token is included in the response.
+                        # Reload the shared credential so an already-approved
+                        # response cannot leave the daemon unauthenticated.
+                        self.jwt = self._load_jwt()
                     self._save_join_state(
                         status="approved",
                         team_name="Personal Device",
@@ -5188,6 +5200,12 @@ def _wait_for_enrollment(zw_client, base_dir):
     if zw_client.has_pending_join() or zw_client.join_state_tampered:
         refresh = zw_client.refresh_join_status_once()
         if refresh.get("status") == "approved":
+            if not zw_client.jwt:
+                logging.warning(
+                    "Pending join approved but no shared JWT is available yet; "
+                    "keeping daemon alive and retrying enrollment."
+                )
+                return False
             logging.info("Pending join request approved after refresh; enrollment completed.")
             join_state_needs_verification = False
         elif refresh.get("status") == "denied":
@@ -5216,8 +5234,13 @@ def _wait_for_enrollment(zw_client, base_dir):
             if zw_client.has_pending_join() or zw_client.join_state_tampered:
                 refresh = zw_client.refresh_join_status_once()
                 if refresh.get("status") == "approved":
-                    logging.info("Pending join approved while waiting; enrollment completed.")
-                    join_state_needs_verification = False
+                    if zw_client.jwt:
+                        logging.info("Pending join approved while waiting; enrollment completed.")
+                        join_state_needs_verification = False
+                    else:
+                        logging.warning(
+                            "Pending join approved but JWT is not readable; retrying shared-state load."
+                        )
                 elif refresh.get("status") == "denied":
                     logging.info("Pending join denied while waiting; cleared pending state.")
                     zw_client.clear_join_state()
@@ -6234,20 +6257,24 @@ def main_agent():
     if not zw_client.jwt:
         return
 
-    # Prove daemon connectivity immediately after authentication.  The GUI
-    # sends its first heartbeat from the dashboard refresh worker, but the
-    # daemon used to wait until after startup/scan work before its first main
-    # loop heartbeat.  A slow Windows inventory startup could therefore make
-    # an otherwise healthy background agent appear offline.
-    try:
-        first_heartbeat = zw_client.heartbeat()
-        logging.info(
-            "[HEARTBEAT] Immediate daemon heartbeat result=%s status=%s.",
-            first_heartbeat,
-            zw_client.last_server_status,
-        )
-    except Exception:
-        logging.exception("[HEARTBEAT] Immediate daemon heartbeat failed.")
+    def _send_immediate_daemon_heartbeat(reason):
+        """Send a heartbeat before any potentially slow Windows work."""
+        try:
+            result = zw_client.heartbeat()
+            logging.info(
+                "[HEARTBEAT] Immediate daemon heartbeat (%s) result=%s status=%s.",
+                reason,
+                result,
+                zw_client.last_server_status,
+            )
+            return result
+        except Exception:
+            logging.exception("[HEARTBEAT] Immediate daemon heartbeat failed (%s).", reason)
+            return None
+
+    # The GUI sends its first heartbeat from the dashboard refresh worker, but
+    # the daemon must prove liveness before startup inventory/cache work.
+    _send_immediate_daemon_heartbeat("authenticated")
 
     approval_sync_claimed = zw_client.claim_approval_sync()
     approval_sync_already_complete = zw_client.approval_sync_complete()
@@ -6691,6 +6718,7 @@ def main_agent():
                 zw_client.jwt = zw_client._load_jwt()
                 if zw_client.jwt:
                     logging.info("[MAIN] Token dynamically re-loaded from disk. Re-enrolling agent.")
+                    _send_immediate_daemon_heartbeat("re-enrolled")
                     _run_post_enrollment_scan(zw_client, _orchestrator, base_dir)
                     last_heartbeat = 0
                     was_offline = False
@@ -6799,6 +6827,7 @@ def main_agent():
                     zw_client.clear_local_state()
                     if not _wait_for_enrollment(zw_client, base_dir):
                         break
+                    _send_immediate_daemon_heartbeat("unlinked-and-relinked")
                     _run_post_enrollment_scan(zw_client, _orchestrator, base_dir)
                     zw_client.log_event("REENROLLED", {"status": "active"})
                     last_heartbeat = 0
@@ -6822,6 +6851,7 @@ def main_agent():
                             break
                         # Reset state after successful re-enrollment
                         zw_client.auth_failure_count = 0
+                        _send_immediate_daemon_heartbeat("auth-relinked")
                         _run_post_enrollment_scan(zw_client, _orchestrator, base_dir)
                         zw_client.log_event("REENROLLED", {"status": "active"})
                         last_heartbeat = 0
@@ -7073,7 +7103,7 @@ class EnrollmentFrame(tk.Frame):
         def on_click(e): self._validate_team_code()
         btn_frame.bind("<Button-1>", on_click)
         btn_label.bind("<Button-1>", on_click)
-        
+
         return frame
 
     def _create_metadata_screen(self):
@@ -7109,7 +7139,23 @@ class EnrollmentFrame(tk.Frame):
         def on_click(e): self._submit_enrollment()
         btn_frame.bind("<Button-1>", on_click)
         btn_label.bind("<Button-1>", on_click)
-        
+
+        back_label = tk.Label(
+            frame,
+            text="Back to registration options",
+            fg=self.c_cyan,
+            bg=self.c_card_bg,
+            font=("Arial", 10, "underline"),
+            cursor="hand2",
+        )
+        back_label.pack(pady=(15, 0))
+
+        def go_to_start(_event):
+            self.is_individual = False
+            self.show_screen("START")
+
+        back_label.bind("<Button-1>", go_to_start)
+
         return frame
 
     def _create_pending_screen(self):
