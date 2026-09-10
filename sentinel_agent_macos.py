@@ -1264,7 +1264,13 @@ class MacOSAgent:
         except Exception as exc:
             logger.warning("[L0_SYNC] Fast macOS baseline failed: %s", exc)
 
+        # Never let a macOS collector prevent the initial upload forever.
+        # The known-good Kratimacos implementation used a bounded startup
+        # phase and an L0 fallback; retain that behavior here.
+        startup_safety_timeout = 55
         startup_items = []
+        layer0_items = []
+        ok = False
         scan_done = threading.Event()
         scan_error = []
         deep_scan_required = [True]
@@ -1338,7 +1344,12 @@ class MacOSAgent:
             # This bounded scan is intentionally uploaded before the deep
             # filesystem walk. It gives the backend an immediate inventory
             # while the daemon continues collecting the complete result.
-            completed = scan_done.wait()
+            completed = scan_done.wait(timeout=startup_safety_timeout)
+            if not completed:
+                logger.warning(
+                    "[STARTUP_SCAN] Priority scan exceeded %ds; using L0 fallback.",
+                    startup_safety_timeout,
+                )
             if not hardware_done.wait(timeout=30):
                 logger.warning("Hardware profile timed out; syncing inventory without hardware details.")
             hw = hardware
@@ -1364,13 +1375,13 @@ class MacOSAgent:
                         self._pending_full_inventory = (list(startup_items), dict(hw))
                         self._pending_full_approval = approval_sync_claimed
             else:
+                deep_scan_required[0] = False
                 logger.warning(
                     "[STARTUP_SCAN] Baseline scan failed; syncing L0 fallback "
                     "as partial inventory (device_id=%s).",
                     getattr(self, "_device_id", "unknown"),
                 )
-                layer0 = self._orchestrator._run_layer0()
-                layer0_dicts = _items_to_dicts(self._orchestrator._deduplicate(layer0))
+                layer0_dicts = list(layer0_items)
                 logger.info(
                     "[INVENTORY_UPLOAD_STARTED] L0 fallback device_id=%s items=%d",
                     getattr(self, "_device_id", "unknown"), len(layer0_dicts),
