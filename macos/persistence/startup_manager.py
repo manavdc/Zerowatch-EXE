@@ -57,6 +57,7 @@ import plistlib
 import re
 import shutil
 import subprocess
+import time
 from typing import List, Optional, Tuple
 
 from common.persistence.interfaces import PersistenceManager
@@ -84,6 +85,8 @@ _LAUNCHCTL_TIMEOUT = 30   # seconds
 # System domain target for launchd bootstrap (system LaunchDaemons)
 _SYSTEM_DOMAIN = "system"
 _SYSTEM_SERVICE_TARGET = f"{_SYSTEM_DOMAIN}/{LAUNCHD_LABEL}"
+_HEALTH_MARKER_PATH = "/Library/Application Support/ZeroWatch/state/agent_heartbeat"
+_HEALTH_MAX_AGE = 90
 
 
 def _current_uid() -> int:
@@ -289,10 +292,15 @@ def _service_running() -> bool:
     if not ok:
         return False
     output = stdout.lower()
-    return bool(
+    if bool(
         re.search(r"\bpid\s*=\s*[1-9][0-9]*\b", output)
         or re.search(r"\bstate\s*=\s*running\b", output)
-    )
+    ):
+        return True
+    try:
+        return time.time() - os.path.getmtime(_HEALTH_MARKER_PATH) <= _HEALTH_MAX_AGE
+    except OSError:
+        return False
 
 
 def _kickstart() -> bool:
@@ -497,12 +505,11 @@ class MacOSPersistenceManager(PersistenceManager):
             if _service_running():
                 return True
             if _service_loaded():
-                # KeepAlive is launchd's responsibility.  A GUI refresh must
-                # not repeatedly kickstart -k a job that is already loaded:
-                # doing so terminates an in-progress inventory scan and can
-                # leave only heartbeat traffic visible on the backend.
-                logger.info("System LaunchDaemon is loaded; leaving lifecycle under launchd supervision.")
-                return True
+                # Only recover a loaded job when its own liveness marker is
+                # stale.  A fresh marker means an inventory scan may be in
+                # progress; kickstart -k would terminate that scan.
+                logger.info("System LaunchDaemon is loaded but not reporting a live process; requesting launchd kickstart.")
+                return _kickstart()
             if os.geteuid() == 0:
                 return _bootstrap(PLIST_PATH) and (_service_running() or _kickstart())
             # launchctl bootstrap of the system domain requires authorization;

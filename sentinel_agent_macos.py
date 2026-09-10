@@ -80,6 +80,7 @@ HEARTBEAT_INTERVAL = 30    # seconds between heartbeats
 MONITOR_INTERVAL   = 120   # seconds between delta scan checks
 RESTART_CHECK_TIME = 180  # 4 hours in seconds (OTA update & restart check interval)
 RECONNECT_DELAY    = 10    # seconds before reconnect attempt
+HEALTH_MARKER      = "/Library/Application Support/ZeroWatch/state/agent_heartbeat"
 
 # Build-time server URL injection (written by run_agent.sh)
 _BUILD_CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_build_config.py")
@@ -282,6 +283,20 @@ def _inventory_scan_enabled() -> bool:
             return handle.read().strip() != "0"
     except OSError:
         return True
+
+
+def _touch_health_marker() -> None:
+    """Publish daemon liveness for launchd activation checks."""
+    try:
+        os.makedirs(os.path.dirname(HEALTH_MARKER), mode=0o777, exist_ok=True)
+        with open(HEALTH_MARKER, "a", encoding="utf-8"):
+            os.utime(HEALTH_MARKER, None)
+        try:
+            os.chmod(HEALTH_MARKER, 0o666)
+        except OSError:
+            pass
+    except OSError as exc:
+        logger.debug("Unable to update daemon health marker: %s", exc)
 
 
 # ── Single-instance lock ───────────────────────────────────────────────
@@ -646,6 +661,7 @@ class MacOSAgent:
         # ── Single-instance guard ─────────────────────────────────────────────
         if not _acquire_single_instance_lock():
             sys.exit(1)
+        _touch_health_marker()
 
         logger.info("ZeroWatch macOS Agent %s starting", AGENT_VERSION)
         logger.info("API URL:   %s", BASE_API_URL)
@@ -812,6 +828,7 @@ class MacOSAgent:
             )
             consecutive_errors = 0
             while not self._shutdown_event.is_set():
+                _touch_health_marker()
                 try:
                     response = self._session.get(
                         f"/agent/join-status?deviceId={self._device_id}"
@@ -868,6 +885,7 @@ class MacOSAgent:
             )
             logger.info("Waiting for enrollment code to be set in environment (Ctrl+C to abort)...")
             while not self._shutdown_event.is_set():
+                _touch_health_marker()
                 self._shutdown_event.wait(timeout=30)
                 team_code = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
                 individual_code = os.environ.get("INDIVIDUAL_CODE") or os.environ.get("ZEROWATCH_INDIVIDUAL_CODE")
@@ -915,6 +933,7 @@ class MacOSAgent:
                     # Infinite retry poll -- no hard deadline (fixes the 600s bug)
                     consecutive_errors = 0
                     while not self._shutdown_event.is_set():
+                        _touch_health_marker()
                         try:
                             status_resp = self._session.get(
                                 f"/agent/join-status?deviceId={self._device_id}"
@@ -1202,7 +1221,12 @@ class MacOSAgent:
         """
         if not hasattr(self, "_initial_scan_done"):
             self._initial_scan_done = threading.Event()
-        if not _inventory_scan_enabled():
+        inventory_enabled = _inventory_scan_enabled()
+        logger.info(
+            "[INVENTORY_CONFIG] macOS startup inventory enabled=%s",
+            inventory_enabled,
+        )
+        if not inventory_enabled:
             logger.info("Inventory scan disabled by administrator; skipping initial inventory upload.")
             if approval_sync_claimed:
                 self._finish_approval_sync(False)
@@ -1441,6 +1465,7 @@ class MacOSAgent:
         logger.info("macOS heartbeat monitor started (interval=%ds).", HEARTBEAT_INTERVAL)
 
         while not self._shutdown_event.is_set() and not self._stop_event.is_set():
+            _touch_health_marker()
             now = time.monotonic()
 
             # Retry a complete startup upload until it is acknowledged. This
