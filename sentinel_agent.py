@@ -7941,7 +7941,7 @@ class DashboardFrame(tk.Frame):
                 messagebox.showerror("Administrator Authorization Required", "An administrator must authorize this inventory setting change.")
 
         make_toggle(top, inventory_enabled, toggle_inventory).pack(side=tk.RIGHT)
-        tk.Label(card, text="Automatically scan and collect hardware and software inventory. Administrator authorization is required on macOS.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
+        tk.Label(card, text="Automatically scan and collect hardware and software inventory.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
         
         card2 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=24, pady=18)
         card2.pack(fill=tk.X, pady=(0, 10))
@@ -7959,10 +7959,10 @@ class DashboardFrame(tk.Frame):
             if sys.platform == "darwin" and not setting_ok:
                 auto_start_enabled.set(not enabled)
                 from tkinter import messagebox
-                messagebox.showerror("Administrator Authorization Required", "An administrator must authorize this launchd setting change.")
+                messagebox.showerror("Administrator Authorization Required", "Administrator authorization is required to change the auto-start setting.")
 
         make_toggle(top2, auto_start_enabled, toggle_auto_start).pack(side=tk.RIGHT)
-        tk.Label(card2, text="Automatically start the agent through launchd. Administrator authorization is required on macOS.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
+        tk.Label(card2, text="Automatically start the agent in the background.", fg=self.c_gray, bg=self.c_bg_card, font=self.f_normal, justify=tk.LEFT).pack(anchor="w", pady=(12,0))
 
         card3 = tk.Frame(container, bg=self.c_bg_card, highlightbackground=self.c_border, highlightthickness=1, padx=24, pady=18)
         card3.pack(fill=tk.X, pady=(0, 10))
@@ -9379,16 +9379,14 @@ def run_interactive():
         is_enrolled_locally = zw_client.is_enrolled()
         
         if is_enrolled_locally:
-            logging.info("Startup: Device enrolled locally. Verifying with server (2s timeout)...")
-            # macOS approval is already represented by the authenticated JWT.
-            # Re-querying join-status during GUI startup can return a transient
-            # non-approved response after the request has been consumed and
-            # incorrectly wipe valid local state (as seen in the attached
-            # logs). Verify the authenticated device instead; only an explicit
-            # unlink response is destructive. Keep the old join-status check
-            # unchanged for Windows/Linux.
-            if sys.platform == "darwin" and zw_client.jwt:
-                verify_res = {"status": zw_client.heartbeat()}
+            logging.info("Startup: Device enrolled locally. Starting background service...")
+            # The background service owns server liveness on platforms that
+            # have a native service supervisor.  The GUI must not perform a
+            # destructive enrollment check while that service is starting:
+            # a transient response can otherwise erase valid local state
+            # before the agent has had a chance to send its heartbeat.
+            if sys.platform == "darwin":
+                verify_res = {"status": "local"}
             else:
                 verify_res = zw_client.refresh_join_status_once() # This has a timeout
             
@@ -9696,8 +9694,23 @@ def main():
             agent.run()
         elif sys.platform == "darwin":
             from sentinel_agent_macos import MacOSSentinelAgent
-            agent = MacOSSentinelAgent()
-            agent.run()
+            # launchd may start the daemon while the GUI is rotating shared
+            # state.  Keep the launchd-owned process alive and log the actual
+            # exception instead of letting it disappear after kickstart.
+            while True:
+                try:
+                    agent = MacOSSentinelAgent()
+                    agent.run()
+                    break
+                except SystemExit:
+                    raise
+                except Exception:
+                    logging.exception(
+                        "macOS background daemon crashed; retrying startup in 10 seconds."
+                    )
+                    if consume_shutdown_signal(get_base_dir()):
+                        break
+                    time.sleep(10)
         else:
             # A transient state/ACL/network exception must not leave the
             # endpoint permanently without a daemon.  The watchdog supervises

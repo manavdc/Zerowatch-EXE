@@ -1579,8 +1579,15 @@ def main() -> int:
         return 1
 
     _daemonize_if_needed()
-    agent = MacOSAgent()
-    return agent.run()
+    try:
+        agent = MacOSAgent()
+        return agent.run()
+    except Exception:
+        # Keep the failure visible in the LaunchDaemon error log.  Without
+        # this, launchd only reports a successful kickstart followed by an
+        # exited job, which hides the reason inventory/heartbeat never ran.
+        logger.exception("Fatal macOS agent startup/runtime failure")
+        raise
 
 
 if __name__ == "__main__":
