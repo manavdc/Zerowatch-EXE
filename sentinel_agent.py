@@ -7304,31 +7304,9 @@ class EnrollmentFrame(tk.Frame):
         self._stop_event.clear()
 
         def poll():
-            if sys.platform == "darwin":
-                # Approval polling belongs to the LaunchDaemon.  The GUI only
-                # observes the shared state written by that daemon, so closing
-                # this window cannot interrupt enrollment or cause two clients
-                # to consume the same approval transition.
-                while not self._stop_event.is_set():
-                    try:
-                        state = self.zw_client._load_join_state() or {}
-                        if str(state.get("status") or "").lower() == "approved":
-                            self.zw_client.join_state = state
-                            if not getattr(self.zw_client, "jwt", None):
-                                self.zw_client.jwt = self.zw_client._load_jwt()
-                            self.after(0, self._on_success)
-                            return
-                    except Exception as exc:
-                        logging.debug("[GUI] macOS local enrollment-state poll failed: %s", exc)
-                    for _ in range(10):
-                        if self._stop_event.is_set():
-                            return
-                        time.sleep(0.5)
-                return
-
             while not self._stop_event.is_set(): # Keep polling even if not in PENDING, to handle auto-routing if server comes back
                 res = self.zw_client.refresh_join_status_once()
-                if res.get("status") == "approved":
+                if res.get("status") == "approved" and self.zw_client.jwt:
                     self.after(0, self._on_success)
                     break
                 elif res.get("status") == "denied":
