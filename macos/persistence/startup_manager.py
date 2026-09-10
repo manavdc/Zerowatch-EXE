@@ -496,9 +496,13 @@ class MacOSPersistenceManager(PersistenceManager):
         if os.path.isfile(PLIST_PATH):
             if _service_running():
                 return True
-            if _service_loaded() and os.geteuid() != 0:
-                logger.info("System LaunchDaemon is loaded but not currently running; requesting launchd kickstart.")
-                return _kickstart()
+            if _service_loaded():
+                # KeepAlive is launchd's responsibility.  A GUI refresh must
+                # not repeatedly kickstart -k a job that is already loaded:
+                # doing so terminates an in-progress inventory scan and can
+                # leave only heartbeat traffic visible on the backend.
+                logger.info("System LaunchDaemon is loaded; leaving lifecycle under launchd supervision.")
+                return True
             if os.geteuid() == 0:
                 return _bootstrap(PLIST_PATH) and (_service_running() or _kickstart())
             # launchctl bootstrap of the system domain requires authorization;

@@ -1010,7 +1010,8 @@ class MacOSAgent:
 
     def _sync_full(self, software: list, hardware: dict,
                    inventory_scope: str = "complete", inventory_revision: str | None = None,
-                   batch_index: int | None = None, batch_count: int | None = None) -> int:
+                   batch_index: int | None = None, batch_count: int | None = None,
+                   timeout: int = 60) -> int:
         """Push full software + hardware inventory to backend. Returns HTTP status code."""
         payload = {
             "deviceId":  self._device_id,
@@ -1025,7 +1026,7 @@ class MacOSAgent:
         if batch_count is not None:
             payload["inventoryBatchCount"] = batch_count
         try:
-            resp = self._session.post("/agent/sync/full", payload, timeout=60)
+            resp = self._session.post("/agent/sync/full", payload, timeout=timeout)
             if resp.status_code in (200, 201, 204):
                 logger.info("Full sync: %d software items (scope=%s)", len(software), inventory_scope)
                 return resp.status_code
@@ -1207,6 +1208,37 @@ class MacOSAgent:
                 self._finish_approval_sync(False)
             self._initial_scan_done.set()
             return
+
+        # Send Layer 0 immediately after authentication.  The priority/deep
+        # scanner must not be allowed to delay the first useful inventory
+        # upload; macOS package/application collection is bounded and is the
+        # expected first sync for a newly approved device.
+        try:
+            layer0 = self._orchestrator._run_layer0()
+            layer0_items = _items_to_dicts(
+                self._orchestrator._deduplicate(layer0)
+            )
+            logger.info(
+                "[L0_SYNC_STARTED] macOS baseline device_id=%s items=%d",
+                getattr(self, "_device_id", "unknown"), len(layer0_items),
+            )
+            l0_status = self._sync_full(
+                layer0_items,
+                {},
+                inventory_scope="partial",
+                timeout=5,
+            )
+            l0_ok = l0_status in (200, 201, 204)
+            logger.info(
+                "[L0_SYNC_COMPLETED] macOS device_id=%s success=%s http=%s",
+                getattr(self, "_device_id", "unknown"), l0_ok, l0_status,
+            )
+            if not l0_ok:
+                with getattr(self, "_pending_full_lock", threading.Lock()):
+                    self._pending_full_inventory = (list(layer0_items), {})
+                    self._pending_full_approval = approval_sync_claimed
+        except Exception as exc:
+            logger.warning("[L0_SYNC] Fast macOS baseline failed: %s", exc)
 
         startup_items = []
         scan_done = threading.Event()
