@@ -1207,7 +1207,11 @@ class ZeroWatchClient:
 
     def is_enrolled(self):
         """Checks if this device is approved in the join state, independent of JWT."""
-        state = self.join_state if isinstance(self.join_state, dict) else self._load_join_state()
+        # GUI and daemon are separate processes.  Never keep an empty or
+        # pending in-memory snapshot after another process changes the shared
+        # enrollment file.
+        state = self._load_join_state()
+        self.join_state = state
         if not state or not isinstance(state, dict):
             return False
             
@@ -1528,7 +1532,10 @@ class ZeroWatchClient:
         threading.Thread(target=_bg_cancel, daemon=True).start()
 
     def has_pending_join(self):
-        current = self.join_state if isinstance(self.join_state, dict) else self._load_join_state()
+        # The GUI writes the pending request after the daemon may already have
+        # started.  Always reload the shared file so the daemon notices that
+        # request and continues polling after the GUI closes.
+        current = self._load_join_state()
         self.join_state = current
         if not current:
             return False
