@@ -4911,6 +4911,11 @@ def _auto_bootstrap_background_agent() -> None:
             if started:
                 logging.info("Auto-started background daemon (pid=%s).", pid)
             else:
+                # A failed child must be retryable from the window-close
+                # handler.  Keeping the timestamp here suppresses the only
+                # recovery attempt for the full cooldown period and leaves a
+                # pending Premium Individual enrollment with no daemon.
+                _last_daemon_spawn_at = 0.0
                 logging.error("Daemon auto-start failed to stay alive (pid=%s).", pid)
     except Exception as exc:
         logging.warning("Background daemon auto-start failed: %s", exc)
@@ -6242,7 +6247,14 @@ def main_agent():
     # while the backend is temporarily unavailable.  Exiting here leaves the
     # device stuck in linked_pending_sync until a user manually relaunches it.
     enrollment_attempt = 0
-    while not zw_client.jwt and not consume_shutdown_signal(base_dir):
+    while not zw_client.jwt:
+        shutdown_request = consume_shutdown_signal(base_dir)
+        if shutdown_request:
+            logging.info(
+                "Shutdown signal received while waiting for enrollment. Reason: %s",
+                shutdown_request.get("reason", "unknown") if isinstance(shutdown_request, dict) else "unknown",
+            )
+            return "shutdown"
         if _wait_for_enrollment(zw_client, base_dir):
             break
         enrollment_attempt += 1
@@ -6255,7 +6267,7 @@ def main_agent():
         time.sleep(retry_delay)
 
     if not zw_client.jwt:
-        return
+        return "waiting"
 
     def _send_immediate_daemon_heartbeat(reason):
         """Send a heartbeat before any potentially slow Windows work."""
@@ -6716,6 +6728,13 @@ def main_agent():
                         logging.warning("[MAIN] Error closing orchestrator (non-fatal): %s", _close_err)
 
                 zw_client.jwt = zw_client._load_jwt()
+                if not zw_client.jwt:
+                    # After unlink/re-enrollment, the GUI may be closed before
+                    # approval.  Do not wait only for a token file written by
+                    # the GUI; the daemon must poll the persisted pending join
+                    # request itself and save the JWT when the admin approves.
+                    if _wait_for_enrollment(zw_client, base_dir):
+                        zw_client.jwt = zw_client._load_jwt()
                 if zw_client.jwt:
                     logging.info("[MAIN] Token dynamically re-loaded from disk. Re-enrolling agent.")
                     _send_immediate_daemon_heartbeat("re-enrolled")
@@ -6867,6 +6886,7 @@ def main_agent():
     if ota_monitor is not None:
         ota_monitor.stop()
     logging.info("SentinelAgent shutdown completed.")
+    return "stopped" if zw_client.jwt else "waiting"
 
 class EnrollmentFrame(tk.Frame):
     def __init__(self, master, zw_client):
@@ -9699,13 +9719,21 @@ def main():
         )
 
         is_linked = os.path.exists(token_win) or os.path.exists(token_nix)
+        pending_enrollment = os.path.exists(
+            _state_path(base_dir, TEAM_JOIN_STATE_FILE)
+        )
 
         # macOS launchd must be allowed to start before enrollment.  The
         # daemon owns pending-request polling and waits for shared enrollment
         # state; exiting here makes a fresh LaunchDaemon repeatedly die before
         # the GUI has submitted its first request.  Windows/Linux retain their
         # existing consent gate.
-        if sys.platform != "darwin" and not is_linked and not os.path.exists(consent_file):
+        if (
+            sys.platform != "darwin"
+            and not is_linked
+            and not os.path.exists(consent_file)
+            and not pending_enrollment
+        ):
             logging.info(
                 "Daemon blocked: Consent not accepted yet and agent is not linked."
             )
@@ -9742,7 +9770,19 @@ def main():
             # mutex disappears; retry daemon startup here instead.
             while True:
                 try:
-                    main_agent()
+                    daemon_result = main_agent()
+                    if daemon_result == "shutdown":
+                        break
+                    if daemon_result == "waiting":
+                        # Keep the detached daemon alive while approval/JWT
+                        # state is being written by another process.  The old
+                        # behavior exited here, so no heartbeat was possible
+                        # until the GUI was opened again.
+                        logging.info(
+                            "Background daemon is waiting for enrollment state; retrying in 5 seconds."
+                        )
+                        time.sleep(5)
+                        continue
                     break
                 except Exception:
                     logging.exception("Background daemon crashed; retrying startup in 10 seconds.")
