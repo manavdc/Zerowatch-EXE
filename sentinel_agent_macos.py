@@ -883,15 +883,62 @@ class MacOSAgent:
                 "Set TEAM_CODE=<your-team-code> or INDIVIDUAL_CODE=<your-code> "
                 "then restart the agent, OR enroll the device from the ZeroWatch dashboard."
             )
-            logger.info("Waiting for enrollment code to be set in environment (Ctrl+C to abort)...")
+            logger.info(
+                "[DAEMON_WAITING] Waiting for credentials: env-var codes OR "
+                "GUI-written JWT/join_state.json (device_id=%s)...",
+                self._device_id,
+            )
+            # Paths where the GUI (or a previous daemon session) persists
+            # enrollment credentials.  The daemon must discover these even
+            # after the GUI process has exited — launchd keeps the daemon
+            # alive independently.
+            jwt_path        = os.path.join(self._state_dir, "agent_token.enc")
+            join_state_path = os.path.join(self._state_dir, "join_state.json")
+            legacy_jwt_path = os.path.join(self._state_dir, "zerowatch_token.dat")
+            wait_count = 0
             while not self._shutdown_event.is_set():
                 _touch_health_marker()
-                self._shutdown_event.wait(timeout=30)
-                team_code = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
+                self._shutdown_event.wait(timeout=8)
+                wait_count += 1
+
+                # Check for env-var codes being set
+                team_code       = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
                 individual_code = os.environ.get("INDIVIDUAL_CODE") or os.environ.get("ZEROWATCH_INDIVIDUAL_CODE")
                 if team_code or individual_code:
-                    logger.info("Enrollment code found. Proceeding with enrollment...")
+                    logger.info("[DAEMON_WAITING] Enrollment code found in environment. Proceeding.")
                     break
+
+                # Check if the GUI wrote a JWT or join_state.json after
+                # enrollment.  Return False so run()'s outer retry loop
+                # calls _register_or_authenticate() again from the top,
+                # where load_jwt() / load_join_state() will pick up the
+                # GUI-written credentials.  This is the critical fix: without
+                # it the daemon stays stuck in this loop forever after the
+                # GUI closes, because env vars die with the GUI process.
+                if os.path.exists(jwt_path) or os.path.exists(legacy_jwt_path):
+                    logger.info(
+                        "[DAEMON_WAITING] JWT appeared on disk (GUI enrolled?). "
+                        "Restarting authentication (device_id=%s).",
+                        self._device_id,
+                    )
+                    return False  # run() will retry immediately
+
+                join_state = self._session.load_join_state()
+                if str(join_state.get("status") or "").lower() in {"pending", "approved"}:
+                    logger.info(
+                        "[DAEMON_WAITING] join_state.json updated by GUI (status=%s). "
+                        "Restarting authentication (device_id=%s).",
+                        join_state.get("status"), self._device_id,
+                    )
+                    return False  # run() will retry immediately
+
+                if wait_count % 8 == 0:  # Log every ~64 seconds
+                    logger.info(
+                        "[DAEMON_WAITING] Still waiting for credentials... "
+                        "(checked %d times, device_id=%s)",
+                        wait_count, self._device_id,
+                    )
+
             if not team_code and not individual_code:
                 return False
 
