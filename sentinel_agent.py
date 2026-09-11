@@ -9753,6 +9753,34 @@ def main():
             agent.run()
         elif sys.platform == "darwin":
             from sentinel_agent_macos import MacOSSentinelAgent
+            # ── Ensure daemon output is captured to a file ──────────────────
+            # launchd swallows stdout/stderr if the plist has no
+            # StandardOutPath/StandardErrorPath.  Redirect early so every log
+            # line — including __init__ crashes — is visible.
+            _daemon_log_dir = "/Library/Application Support/ZeroWatch/state/logs"
+            try:
+                os.makedirs(_daemon_log_dir, mode=0o777, exist_ok=True)
+                _daemon_log_path = os.path.join(_daemon_log_dir, "agent-daemon.log")
+                _daemon_fh = open(_daemon_log_path, "a", buffering=1)
+                # Add a file handler so the logging module writes here too
+                _file_handler = logging.FileHandler(_daemon_log_path, mode="a")
+                _file_handler.setFormatter(logging.Formatter(
+                    "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+                ))
+                logging.getLogger().addHandler(_file_handler)
+                # Also capture raw print() / traceback output
+                sys.stdout = _daemon_fh
+                sys.stderr = _daemon_fh
+                try:
+                    os.chmod(_daemon_log_path, 0o666)
+                except OSError:
+                    pass
+            except OSError:
+                pass  # Best-effort; don't prevent daemon startup
+            logging.info(
+                "[DAEMON_ENTRY] macOS daemon process starting (pid=%d, ppid=%d, uid=%d)",
+                os.getpid(), os.getppid(), os.geteuid() if hasattr(os, "geteuid") else -1,
+            )
             # launchd may start the daemon while the GUI is rotating shared
             # state.  Keep the launchd-owned process alive and log the actual
             # exception instead of letting it disappear after kickstart.
