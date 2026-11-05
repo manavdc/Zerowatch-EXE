@@ -284,7 +284,8 @@ except (ImportError, AttributeError):
 
 
 
-KILL_PASSWORD = "Pass@123" # Fallback offline password
+# KILL_PASSWORD hardcoded fallback removed for commercial security.
+# Termination override must be validated against the backend authorization API.
 MUTEX_NAME = "Global\\SentinelAgent_ZeroWatch_4F9A2E1B"
 DAEMON_MUTEX_NAME = "Global\\SentinelAgent_Daemon_4F9A2E1B"
 WATCHDOG_MUTEX_NAME = "Global\\SentinelAgent_Watchdog_4F9A2E1B"
@@ -878,12 +879,6 @@ def encrypt_data(data_bytes, purpose="default"):
     if sys.platform == "win32":
         return _windows_dpapi_encrypt(data_bytes)
 
-    # macOS GUI and LaunchDaemon can run in different Keychain contexts.
-    # When Security.framework rejects a root/user Keychain operation, keep the
-    # shared GUI/daemon enrollment state usable with an explicit RAW:: fallback.
-    # This branch is macOS-only; Linux keeps its existing secure-store behavior.
-    macos_fallback = False
-
     if getattr(_in_crypto, "active", False):
         return None
     _in_crypto.active = True
@@ -897,26 +892,15 @@ def encrypt_data(data_bytes, purpose="default"):
                 encrypted = plat.secure_store.encrypt(data_bytes)
             if encrypted is not None:
                 return encrypted
-        macos_fallback = sys.platform == "darwin"
-    except Exception:
-        macos_fallback = sys.platform == "darwin"
+    except Exception as exc:
+        logging.error(f"Platform secure_store encrypt failed: {exc}")
     finally:
         _in_crypto.active = False
-    if macos_fallback:
-        import base64
-        return b"RAW::" + base64.b64encode(data_bytes)
     return None
 
 def decrypt_data(encrypted_bytes, purpose="default"):
     if sys.platform == "win32":
         return _windows_dpapi_decrypt(encrypted_bytes)
-
-    if sys.platform == "darwin" and encrypted_bytes.startswith(b"RAW::"):
-        try:
-            import base64
-            return base64.b64decode(encrypted_bytes[5:], validate=True)
-        except Exception:
-            return None
 
     if getattr(_in_crypto, "active", False):
         return None
@@ -1202,6 +1186,35 @@ class ZeroWatchClient:
         is_ok = (status == "approved" and team_code and device_id == self.device_id)
         logging.info(f"Enrollment check: status='{status}', team='{team_code}', match={device_id == self.device_id} => {is_ok}")
         return is_ok
+
+    def has_root_enrollment(self):
+        """Detects if an existing enrollment was created by root/admin on macOS/Linux.
+        When a normal user launches the GUI without sudo, they lack Keychain/root permissions
+        to decrypt the credentials, but the presence of encrypted state files proves the system
+        is already enrolled under administrative authority.
+        """
+        if sys.platform not in ("darwin", "linux"):
+            return False
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            return False  # Running as root, standard is_enrolled() check is authoritative
+
+        candidate_paths = [
+            getattr(self, "join_state_file", ""),
+            os.path.join(self.base_dir, "join_state.json"),
+            os.path.join(self.base_dir, "zw_team_join_state.dat"),
+            os.path.join(self.base_dir, "zerowatch_token.dat"),
+            os.path.join(self.base_dir, "agent_token.enc"),
+            "/Library/Application Support/ZeroWatch/state/join_state.json",
+            "/Library/Application Support/ZeroWatch/state/agent_token.enc",
+            "/var/lib/zerowatch/state/join_state.json",
+        ]
+        for p in candidate_paths:
+            try:
+                if p and os.path.isfile(p) and os.path.getsize(p) > 0:
+                    return True
+            except OSError:
+                continue
+        return False
 
 
 
@@ -2549,17 +2562,18 @@ class ZeroWatchClient:
 
     def verify_kill(self, password):
         if not self.jwt:
-            return password == KILL_PASSWORD
+            logging.warning("Kill verification rejected: Agent has no active authenticated session.")
+            return False
         try:
             payload = {"device_id": self.device_id, "password": password}
             resp = self.session.post(f"{AGENT_API_URL}/verify-kill", headers=self._auth_headers(), json=payload, timeout=10)
             if resp.ok and resp.json().get("success"):
                 return True
-            # Backend explicitly denied — also try local fallback password
-            return password == KILL_PASSWORD
+            logging.warning("Kill verification denied by backend server.")
+            return False
         except Exception as e:
             logging.error(f"Verify kill error: {e}")
-            return password == KILL_PASSWORD
+            return False
 
     def get_dashboard_stats(self):
         if not self.jwt: return None
@@ -5937,8 +5951,25 @@ def watchdog_process(target_exe_path):
                     logging.critical("[WATCHDOG] All OTA recovery attempts failed. Exiting.")
                     sys.exit(1)
 
-                logging.info("[WATCHDOG] Main agent killed! Exiting watchdog (termination protection disabled).")
-                sys.exit(0)
+                # Main agent terminated without an authorized shutdown signal.
+                logging.warning(
+                    "[WATCHDOG] Main agent terminated unexpectedly! "
+                    "Self-protection guardian reviving SentinelAgent..."
+                )
+                try:
+                    from common.os_replacer import _relaunch_detached
+                    if _relaunch_detached(target_exe_path, reopen_gui=False):
+                        logging.info("[WATCHDOG] SentinelAgent successfully revived by guardian watchdog.")
+                        time.sleep(10)
+                        continue
+                    else:
+                        logging.error("[WATCHDOG] Detached relaunch returned False. Retrying in 10s...")
+                        time.sleep(10)
+                        continue
+                except Exception as revive_exc:
+                    logging.error("[WATCHDOG] Failed to revive main agent: %s. Retrying in 10s...", revive_exc)
+                    time.sleep(10)
+                    continue
 
             time.sleep(5)  # Reduced polling frequency (was 3s)
         except Exception as e:
@@ -6790,6 +6821,80 @@ def main_agent():
     if ota_monitor is not None:
         ota_monitor.stop()
     logging.info("SentinelAgent shutdown completed.")
+
+class PrivilegeRequiredFrame(tk.Frame):
+    """Displayed on macOS when the agent is launched by an unprivileged user
+    on a machine that has already been enrolled by root/admin.
+    """
+    def __init__(self, master, zw_client):
+        super().__init__(master)
+        self.zw_client = zw_client
+        self.configure(bg="#13171d")
+
+        c_bg = "#13171d"
+        c_card = "#181d24"
+        c_white = "#ffffff"
+        c_gray = "#94a3b8"
+        c_yellow = "#fbbf24"
+
+        container = tk.Frame(self, bg=c_bg)
+        container.pack(expand=True, fill=tk.BOTH, padx=30, pady=30)
+
+        card = tk.Frame(container, bg=c_card, bd=1, relief=tk.SOLID)
+        card.pack(expand=True, fill=tk.BOTH, padx=15, pady=15)
+
+        lbl_alert = tk.Label(
+            card,
+            text="ADMINISTRATIVE PRIVILEGES REQUIRED",
+            font=("Courier New", 13, "bold"),
+            fg=c_yellow,
+            bg=c_card
+        )
+        lbl_alert.pack(pady=(25, 8))
+
+        lbl_title = tk.Label(
+            card,
+            text="ZeroWatch is Already Enrolled",
+            font=("Arial", 16, "bold"),
+            fg=c_white,
+            bg=c_card
+        )
+        lbl_title.pack(pady=(0, 16))
+
+        msg = (
+            "This endpoint has already been joined to your organization by an administrator.\n\n"
+            "On macOS, ZeroWatch requires administrator privileges (sudo) to access Apple Keychain\n"
+            "system credentials, read inventory, and maintain continuous security monitoring.\n\n"
+            "Please launch the agent using sudo from your terminal:\n\n"
+            "    sudo /Applications/ZeroWatch/SentinelAgent\n\n"
+            "If the background daemon is already running, ZeroWatch is actively protecting your system."
+        )
+
+        lbl_body = tk.Label(
+            card,
+            text=msg,
+            font=("Arial", 11),
+            fg=c_gray,
+            bg=c_card,
+            justify=tk.CENTER
+        )
+        lbl_body.pack(pady=10, padx=20)
+
+        btn_quit = tk.Button(
+            card,
+            text="Close Window",
+            font=("Arial", 12, "bold"),
+            bg="#2a313a",
+            fg=c_white,
+            activebackground="#3b4452",
+            activeforeground=c_white,
+            bd=0,
+            padx=20,
+            pady=8,
+            cursor="hand2",
+            command=master.destroy
+        )
+        btn_quit.pack(pady=(15, 25))
 
 class EnrollmentFrame(tk.Frame):
     def __init__(self, master, zw_client):
@@ -8972,6 +9077,9 @@ class UnifiedSentinelGUI(tk.Tk):
             # Default routing logic: strictly check enrollment status
             if self.zw_client.is_enrolled():
                 self.show_dashboard()
+            elif sys.platform == "darwin" and hasattr(os, "geteuid") and os.geteuid() != 0 and self.zw_client.has_root_enrollment():
+                logging.info("macOS normal user launch on root-enrolled system: displaying privilege required screen.")
+                self.show_privilege_required_screen()
             else:
                 self.show_enrollment()
 
@@ -9096,6 +9204,12 @@ class UnifiedSentinelGUI(tk.Tk):
         except Exception as exc:
             logging.error("[GUI] Notification processing failed: %s", exc)
         self.after(2000, self.process_notifications)
+
+    def show_privilege_required_screen(self):
+        if isinstance(self.current_frame, PrivilegeRequiredFrame):
+            return
+        self.title("ZEROWATCH SENTINEL AGENT — PRIVILEGES REQUIRED")
+        self._switch_frame(PrivilegeRequiredFrame)
 
     def show_enrollment(self):
         if isinstance(self.current_frame, EnrollmentFrame):

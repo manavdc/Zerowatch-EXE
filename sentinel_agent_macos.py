@@ -429,42 +429,32 @@ class MacOSAgentSession:
                 else self._platform.secure_store.encrypt(data)
             )
             if result is not None:
-                # Validate the token is a proper ZW_KC reference or RAW fallback
-                if not (result.startswith(b"ZW_KC::") or result.startswith(b"RAW::")):
+                # Validate the token is a proper ZW_KC reference
+                if not result.startswith(b"ZW_KC::"):
                     logger.error(
                         "encrypt() returned unexpected token format (len=%d) — "
                         "discarding to prevent corrupt disk state", len(result)
                     )
                     return None
                 return result
-            # Keychain unavailable — store raw bytes as base64 in state dir
-            logger.warning(
-                "Keychain unavailable — storing token unprotected in state dir. "
-                "This is expected during development on non-macOS hosts."
-            )
-            import base64
-            return b"RAW::" + base64.b64encode(data)
+            # Keychain unavailable — never store unencrypted tokens in production
+            logger.error("Keychain unavailable — refusing to store unprotected token.")
+            return None
         except Exception as exc:
-            # A root LaunchDaemon may not be able to access the logged-in
-            # user's Keychain. Keep the agent alive and persist the JWT in the
-            # same shared state directory using the explicit RAW:: fallback.
-            # The fallback is macOS-only; Linux and Windows use their own
-            # session implementations.
-            logger.warning(
-                "SecureStore encrypt failed: %s; using protected-state fallback.",
+            logger.error(
+                "SecureStore encrypt failed: %s; unencrypted storage is disabled.",
                 exc,
             )
-            import base64
-            return b"RAW::" + base64.b64encode(data)
+            return None
 
     def _decrypt(self, data: bytes, purpose: str = "default") -> bytes | None:
         """
-        Decrypt via MacOSSecureStore, or handle the RAW:: fallback token.
+        Decrypt via MacOSSecureStore. Reject unencrypted RAW:: tokens.
         """
         try:
             if data.startswith(b"RAW::"):
-                import base64
-                return base64.b64decode(data[5:])
+                logger.error("Unencrypted RAW:: token rejected for security compliance.")
+                return None
             named_decrypt = getattr(self._platform.secure_store, "decrypt_named", None)
             return (
                 named_decrypt(data, purpose)

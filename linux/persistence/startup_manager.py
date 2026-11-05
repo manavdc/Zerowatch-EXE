@@ -108,9 +108,10 @@ class LinuxPersistenceManager(PersistenceManager):
         exe_path: str,
         daemon_args: Optional[List[str]] = None,
     ) -> bool:
-        # The Linux agent binary has no --daemon flag — it always runs its
-        # blocking monitor loop directly.  Pass an empty string so ExecStart
-        # only contains the binary path.
+        # Ensure headless background services always run with --daemon flag
+        # so they do not attempt to invoke graphical GUI windows without a display.
+        if daemon_args is None:
+            daemon_args = ["--daemon"]
         args_str = " ".join(daemon_args) if daemon_args else ""
 
         # If a system-wide unit already exists, do not create a user unit.
