@@ -213,19 +213,14 @@ def prompt_password_to_quit():
     pwd = None
     try:
         # Ask for password
-        pwd = input("Enter termination password (Pass@123) to exit securely: ")
+        pwd = input("Enter administrative authorization password to exit securely: ")
     except Exception:
          pass
          
-    if pwd == "Pass@123":
-        print("\n[✓] Password accepted. Terminating watchdog and agent permanently...")
-        time.sleep(2)
-        sys.exit(0)
-    else:
-        print("\n[X] Incorrect password! Termination denied.")
-        print("This window will self-destruct in 5 seconds...")
-        time.sleep(5)
-        sys.exit(1)
+    print("\n[X] Hardcoded offline passwords are disabled for security.")
+    print("Administrative termination must be authorized via the ZeroWatch cloud console.")
+    time.sleep(3)
+    sys.exit(1)
 
 def watchdog_process(target_exe_path):
     """

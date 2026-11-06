@@ -285,7 +285,7 @@ except (ImportError, AttributeError):
 
 
 
-KILL_PASSWORD = "Pass@123" # Fallback offline password
+# KILL_PASSWORD hardcoded fallback removed for commercial security.
 MUTEX_NAME = "Global\\SentinelAgent_ZeroWatch_4F9A2E1B"
 DAEMON_MUTEX_NAME = "Global\\SentinelAgent_Daemon_4F9A2E1B"
 WATCHDOG_MUTEX_NAME = "Global\\SentinelAgent_Watchdog_4F9A2E1B"
@@ -2603,17 +2603,18 @@ class ZeroWatchClient:
 
     def verify_kill(self, password):
         if not self.jwt:
-            return password == KILL_PASSWORD
+            logging.warning("Kill verification rejected: Agent has no active authenticated session.")
+            return False
         try:
             payload = {"device_id": self.device_id, "password": password}
             resp = self.session.post(f"{AGENT_API_URL}/verify-kill", headers=self._auth_headers(), json=payload, timeout=10)
             if resp.ok and resp.json().get("success"):
                 return True
-            # Backend explicitly denied — also try local fallback password
-            return password == KILL_PASSWORD
+            logging.warning("Kill verification denied by backend server.")
+            return False
         except Exception as e:
             logging.error(f"Verify kill error: {e}")
-            return password == KILL_PASSWORD
+            return False
 
     def get_dashboard_stats(self):
         if not self.jwt: return None
