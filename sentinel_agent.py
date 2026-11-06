@@ -1974,7 +1974,14 @@ class ZeroWatchClient:
             return data
         except Exception as e:
             logging.warning(f"Join request failed: {e}")
-            return {"success": False, "message": "Network error"}
+            err_str = str(e)
+            if "pin" in err_str.lower():
+                msg = "SSL Certificate Pinning mismatch"
+            elif "timeout" in err_str.lower():
+                msg = "Connection timed out"
+            else:
+                msg = f"Network error: {e}" if len(err_str) < 50 else "Network connection error"
+            return {"success": False, "message": msg}
 
     def request_individual_join(self, individual_code):
         """Submit an individual registration request for the given code."""
@@ -2003,7 +2010,14 @@ class ZeroWatchClient:
             return data
         except Exception as e:
             logging.warning(f"Individual registration failed: {e}")
-            return {"success": False, "message": "Network error"}
+            err_str = str(e)
+            if "pin" in err_str.lower():
+                msg = "SSL Certificate Pinning mismatch"
+            elif "timeout" in err_str.lower():
+                msg = "Connection timed out"
+            else:
+                msg = f"Network error: {e}" if len(err_str) < 50 else "Network connection error"
+            return {"success": False, "message": msg}
 
     def poll_join_status(self, timeout=600, interval=8):
         """Poll join status until approved, denied, or timed out."""
