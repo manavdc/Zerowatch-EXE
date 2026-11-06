@@ -104,10 +104,14 @@ if "localhost" in BASE_API_URL or "127.0.0.1" in BASE_API_URL:
 # ── SPKI pins (identical to Windows agent) ────────────────────────────────────
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
-        "a6WoJxzcp0Im4dXEiaHUcio3U8wbbRWdVyaWoqsIlGQ=",  # Google Trust Services (Active from 2026-11-03)
-        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
-        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
-        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="
+        "a6WoJxzcp0Im4dXEiaHUcio3U8wbbRWdVyaWoqsIlGQ=",  # Google Trust Services (Active Leaf from 2026-11-03)
+        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",  # Previous Leaf
+        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",  # Google Trust Services WE1 Intermediate CA
+        "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",  # GTS Root R1
+        "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",  # GTS Root R4
+        "K87oWBWM9UZfyddvDfoxL+8lpNyoUB2ptGtn0fv6G2Q=",  # GlobalSign Root CA
+        "CLOmM1/OXvSPjw5UOYbAf9GKOxImEp9hhku9W90fHMk=",  # GlobalSign ECC Root R4
+        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="   # Backup pin
     ],
     "zerowatch-testing.eastasia.cloudapp.azure.com": [
         "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",

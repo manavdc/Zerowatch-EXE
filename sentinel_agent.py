@@ -740,10 +740,14 @@ print(f"[AGENT] Resolved Backend API URL: {BASE_API_URL}")
 # For production and demo environments, these should be updated to actual hashes.
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
-        "a6WoJxzcp0Im4dXEiaHUcio3U8wbbRWdVyaWoqsIlGQ=",  # Google Trust Services (Active from 2026-11-03)
-        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
-        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
-        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="
+        "a6WoJxzcp0Im4dXEiaHUcio3U8wbbRWdVyaWoqsIlGQ=",  # Google Trust Services (Active Leaf from 2026-11-03)
+        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",  # Previous Leaf
+        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",  # Google Trust Services WE1 Intermediate CA
+        "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",  # GTS Root R1
+        "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",  # GTS Root R4
+        "K87oWBWM9UZfyddvDfoxL+8lpNyoUB2ptGtn0fv6G2Q=",  # GlobalSign Root CA
+        "CLOmM1/OXvSPjw5UOYbAf9GKOxImEp9hhku9W90fHMk=",  # GlobalSign ECC Root R4
+        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="   # Backup pin
     ],
     "zerowatch-testing.eastasia.cloudapp.azure.com": [
         "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",
@@ -2450,9 +2454,13 @@ class ZeroWatchClient:
         return True
 
     def unlink_self(self):
-        """Unlinks this device from the currently linked account using the agent JWT."""
+        """Unlinks this device from the currently linked account using the agent JWT.
+        Unlink is sovereign: if remote call fails (network, pin mismatch, 500, etc.),
+        the agent always clears local state so the device is never trapped in limbo.
+        """
         if not self.jwt:
-            return False, "Device is not linked"
+            self.clear_local_state()
+            return True, "Device was not linked; local state cleared."
         try:
             resp = self.session.delete(f"{AGENT_API_URL}/unlink-self", headers=self._auth_headers(), timeout=10)
             self.last_server_status = resp.status_code
@@ -2460,9 +2468,15 @@ class ZeroWatchClient:
             if resp.ok and data.get("success"):
                 self.clear_local_state()
                 return True, None
-            return False, data.get("message", "Failed to unlink device")
+            # Remote server responded with error/non-success: sovereign local clear
+            err_msg = data.get("message", f"Server responded with status {resp.status_code}")
+            logging.warning("[UNLINK] Remote unlink returned error: %s. Executing sovereign local reset.", err_msg)
+            self.clear_local_state()
+            return True, f"Device unlinked locally (server returned: {err_msg})"
         except Exception as e:
-            return False, str(e)
+            logging.warning("[UNLINK] Remote unlink call failed (%s). Executing sovereign local reset.", e)
+            self.clear_local_state()
+            return True, f"Device unlinked locally (server unreachable: {e})"
 
     # ----------------------------------------------------------------
     # HEARTBEAT / LOGGING
@@ -6652,13 +6666,13 @@ def main_agent():
                 break
 
             now = time.time()
-            if cert_pinning.PIN_MISMATCH_DETECTED:
+            if cert_pinning.get_pin_mismatch_detected():
                 if now < pin_mismatch_next_retry:
                     time.sleep(10)
                     continue
                 else:
                     logging.info("[PINNING] Retrying connection after pin mismatch backoff...")
-                    cert_pinning.PIN_MISMATCH_DETECTED = False
+                    cert_pinning.reset_pin_mismatch()
 
             # --- Responsive sleep: poll every 2 s for unlink/shutdown signals ---
             # This replaces a single time.sleep(30) so the daemon can react to an
@@ -6697,12 +6711,14 @@ def main_agent():
                 continue
             now = time.time()
 
-            if cert_pinning.PIN_MISMATCH_DETECTED:
+            if cert_pinning.get_pin_mismatch_detected():
                 backoff_time = [30, 120, 300, 900, 3600][min(pin_mismatch_backoff_idx, 4)]
                 logging.warning(f"[PINNING] Pin mismatch active. Backing off for {backoff_time} seconds...")
                 pin_mismatch_next_retry = now + backoff_time
                 pin_mismatch_backoff_idx += 1
                 continue
+            else:
+                pin_mismatch_backoff_idx = 0
 
             # --- Dynamic JWT Reloading for Re-enrollment ---
             if not zw_client.jwt:
@@ -8054,13 +8070,17 @@ class DashboardFrame(tk.Frame):
         def on_unlink_click():
             import tkinter.messagebox as messagebox
             if messagebox.askyesno("Confirm Unlink", "Are you sure you want to unlink this device from the team? This action cannot be undone."):
-                res = self.zw_client.unlink_self()
-                # unlink_self returns a tuple (bool, str) usually or "unlinked"
-                success = False
-                msg = ""
-                if isinstance(res, tuple):
-                    success, msg = res
-                elif res == "unlinked":
+                try:
+                    res = self.zw_client.unlink_self()
+                    success = False
+                    msg = ""
+                    if isinstance(res, tuple):
+                        success, msg = res
+                    elif res == "unlinked":
+                        success = True
+                except Exception as _ue:
+                    logging.warning("[GUI] Exception during unlink_self: %s", _ue)
+                    self.zw_client.clear_local_state()
                     success = True
                 
                 if success:
@@ -8070,19 +8090,12 @@ class DashboardFrame(tk.Frame):
                     else:
                         sys.exit(0)
                 else:
-                    if messagebox.askyesno(
-                        "Unlink Failed — Force Local Reset?",
-                        f"Failed to unlink from server: {msg}\n\n"
-                        "Would you like to force unlink locally by clearing local enrollment data on this device?"
-                    ):
-                        self.zw_client.clear_local_state()
-                        show_windows_notification("Zerowatch", "Device unlinked locally.")
-                        if hasattr(self.winfo_toplevel(), 'show_enrollment'):
-                            self.winfo_toplevel().show_enrollment()
-                        else:
-                            sys.exit(0)
+                    self.zw_client.clear_local_state()
+                    show_windows_notification("Zerowatch", "Device unlinked locally.")
+                    if hasattr(self.winfo_toplevel(), 'show_enrollment'):
+                        self.winfo_toplevel().show_enrollment()
                     else:
-                        messagebox.showerror("Unlink Failed", f"Failed to unlink device: {msg}")
+                        sys.exit(0)
 
         unlink_btn = tk.Button(top3, text="Unlink", bg=self.c_red, fg=self.c_white, font=self.f_normal_bold, bd=0, relief=tk.FLAT, overrelief=tk.FLAT, highlightthickness=0, activebackground="#da3633", activeforeground=self.c_white, disabledforeground=self.c_gray, cursor="hand2", command=on_unlink_click)
         unlink_btn.pack(side=tk.RIGHT)
