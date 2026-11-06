@@ -30,7 +30,7 @@ GitHub Releases distribution:
   Uses plain requests (no cert pinning) against GitHub CDN — the Ed25519
   signature is the trust anchor, not TLS.
 
-Background check: every UPDATE_CHECK_INTERVAL_SECS (4 hours) via a daemon thread.
+Background check: every UPDATE_CHECK_INTERVAL_SECS (4 minutes) via a daemon thread.
 Manual check:     UpdateChecker.check_for_update(force=True)
 ─────────────────────────────────────────────────────────────────────────────
 """
@@ -115,8 +115,8 @@ MANIFEST_SIG_URL = f"{_RELEASES_BASE}/release-manifest.json.sig"
 # TUF-inspired Timestamp: refuse to trust manifests older than this
 MANIFEST_MAX_AGE_DAYS: int = 3
 
-# Background poll: 4 hours (14400 seconds) for local OTA verification & restart check
-RESTART_CHECK_TIME: int = 180
+# Background poll: 4 minutes (240 seconds) for local OTA verification & restart check
+RESTART_CHECK_TIME: int = 240
 UPDATE_CHECK_INTERVAL_SECS: int = RESTART_CHECK_TIME
 
 # Download streaming chunk size
