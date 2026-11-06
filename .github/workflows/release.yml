@@ -404,6 +404,15 @@ jobs:
               "targets":              targets,
           }
 
+          # ── Embed SPKI pins for dynamic certificate rotation recovery ───────
+          try:
+              sys.path.insert(0, ".")
+              from sentinel_agent import SPKI_PINS
+              manifest["spki_pins"] = SPKI_PINS
+              print(f"Embedded SPKI pins for domains: {list(SPKI_PINS.keys())}")
+          except Exception as e:
+              print(f"Notice: Failed to load SPKI_PINS ({e}); skipping manifest spki_pins field.")
+
           manifest_bytes = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
 
           # Write manifest
