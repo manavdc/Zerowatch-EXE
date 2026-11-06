@@ -396,8 +396,12 @@ def _secure_state_dir(base_dir):
             return explicit
 
         system_dir = "/var/lib/zerowatch/state"
-        user_dir   = os.path.expanduser("~/.local/share/zerowatch/state")
-        local_dir  = os.path.join(base_dir, "state")
+        xdg_data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+        user_dir   = os.path.join(xdg_data_home, "zerowatch", "state")
+        # /tmp fallback matches sentinel_agent_linux.py's last-resort so both
+        # GUI and daemon resolve to the same path when neither system_dir nor
+        # user_dir is writable.
+        local_dir  = "/tmp/zerowatch/state"
 
         # ── Try system dir first (preferred — consistent across UIDs) ──────
         try:
@@ -454,7 +458,8 @@ def _secure_state_dir(base_dir):
 
             return fallback
 
-        # Last-resort — return local dir without write verification
+        # Last-resort — /tmp is always writable and matches sentinel_agent_linux.py's
+        # fallback so both GUI and daemon land in the same directory.
         return local_dir
 
     return os.path.join(base_dir, "state")
@@ -548,8 +553,13 @@ def _daemon_lock_path(base_dir):
 
     macOS intentionally uses the same shared state directory for normal-user and
     sudo-launched agents so the GUI and daemon share a single lock and state set.
+
+    Linux: use the shared secure state dir so the same lock file is found
+    regardless of whether the agent runs as root or non-root.
     """
     if sys.platform == "darwin":
+        return os.path.join(_secure_state_dir(base_dir), "daemon.lock")
+    if sys.platform.startswith("linux"):
         return os.path.join(_secure_state_dir(base_dir), "daemon.lock")
     return os.path.join(base_dir, "state", "daemon.lock")
 
@@ -4750,11 +4760,15 @@ def _is_agent_active(zw_client):
 def _is_daemon_running():
     if sys.platform != "win32":
         base_dir = get_base_dir()
-        # Linux daemon writes .zerowatch.lock in the shared secure state dir.
-        # Keep daemon.lock as a legacy fallback for older builds.
+        shared_state = _secure_state_dir(base_dir)
+        # Linux daemon now writes .zerowatch-daemon.lock (separate from GUI lock).
+        # Also check legacy .zerowatch.lock and daemon.lock for older builds.
         lock_candidates = [
-            os.path.join(_secure_state_dir(base_dir), ".zerowatch.lock"),
+            os.path.join(shared_state, ".zerowatch-daemon.lock"),
+            os.path.join(shared_state, ".zerowatch.lock"),
+            "/Library/Application Support/ZeroWatch/state/.zerowatch-daemon.lock",
             "/Library/Application Support/ZeroWatch/state/.zerowatch.lock",
+            "/var/lib/zerowatch/state/.zerowatch-daemon.lock",
             "/var/lib/zerowatch/state/.zerowatch.lock",
             _daemon_lock_path(base_dir),
         ]

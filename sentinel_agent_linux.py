@@ -241,13 +241,21 @@ _lock_fh = None   # module-level handle — keeps fd open for the process lifeti
 
 def _acquire_single_instance_lock(state_dir: str) -> bool:
     """
-    Acquire an exclusive non-blocking flock on the ZeroWatch lock file.
-    Returns True if this process is the only running instance.
+    Acquire an exclusive non-blocking flock on the ZeroWatch daemon lock file.
+
+    The daemon uses '.zerowatch-daemon.lock' so it can coexist with a running
+    GUI process (which the Windows GUI's _spawn_daemon_process() may launch
+    while the user has the GUI open).  The old '.zerowatch.lock' name is kept
+    as a compatibility fallback for probing by sentinel_agent.py.
     """
     global _lock_fh
     import fcntl
 
-    lock_path = os.path.join(state_dir, ".zerowatch.lock")
+    # Use a daemon-specific lock file so the GUI and daemon can coexist.
+    # sentinel_agent.py's _is_daemon_running() checks both names.
+    is_daemon = "--daemon" in sys.argv
+    lock_name = ".zerowatch-daemon.lock" if is_daemon else ".zerowatch.lock"
+    lock_path = os.path.join(state_dir, lock_name)
     try:
         os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
     except OSError:
@@ -269,8 +277,8 @@ def _acquire_single_instance_lock(state_dir: str) -> bool:
         except OSError:
             pid = "unknown"
         logger.error(
-            "ZeroWatch agent is already running (pid=%s). "
-            "Only one instance may run at a time. Exiting.",
+            "ZeroWatch daemon is already running (pid=%s). "
+            "Only one daemon instance may run at a time. Exiting.",
             pid,
         )
         return False
