@@ -479,6 +479,15 @@ def log_pin_failure_event(host: str, error_msg: str):
         logger.debug(f"OS Event log writing unavailable or failed: {e}")
 
 
+_LAST_EMERGENCY_OTA_TIME = 0.0
+
+
+def reset_emergency_ota_cooldown() -> None:
+    """Resets the emergency OTA throttling cooldown (used in testing and explicit recovery)."""
+    global _LAST_EMERGENCY_OTA_TIME
+    _LAST_EMERGENCY_OTA_TIME = 0.0
+
+
 class PinnedSession(requests.Session):
     def request(self, method, url, *args, **kwargs):
         # Sovereign unlinking requests must never be blocked by pin cooldown
@@ -496,12 +505,49 @@ class PinnedSession(requests.Session):
             return resp
         except Exception as e:
             if is_pin_failure(e):
-                set_pin_mismatch_detected(True)
                 try:
                     parsed = urlparse(url)
                     host = parsed.hostname or url
                 except Exception:
                     host = url
+
+                # Reactive OTA Auto-Healing:
+                # Attempt to fetch latest Ed25519-signed pins out-of-band before hard-failing
+                if self._attempt_emergency_ota_recovery(host):
+                    logger.info(f"[PINNING] Emergency OTA recovery refreshed pins for {host}. Retrying request...")
+                    try:
+                        reset_pin_mismatch()
+                        resp = super().request(method, url, *args, **kwargs)
+                        if resp.ok and PIN_MISMATCH_DETECTED:
+                            reset_pin_mismatch()
+                        return resp
+                    except Exception as retry_err:
+                        logger.warning(f"[PINNING] Request retry after emergency OTA update still failed: {retry_err}")
+
+                set_pin_mismatch_detected(True)
                 log_pin_failure_event(host, str(e))
                 raise PinError(f"Certificate pinning verification failed for {host}") from e
             raise
+
+    def _attempt_emergency_ota_recovery(self, host: str) -> bool:
+        """
+        Attempts to fetch out-of-band Ed25519-signed pins via OTA.
+        Throttled to at most once per 60 seconds to prevent connection storms.
+        """
+        global _LAST_EMERGENCY_OTA_TIME
+        now = time.time()
+        if (now - _LAST_EMERGENCY_OTA_TIME) < 60.0:
+            logger.debug(f"[PINNING] Emergency OTA check throttled (last attempt {now - _LAST_EMERGENCY_OTA_TIME:.1f}s ago).")
+            return False
+
+        _LAST_EMERGENCY_OTA_TIME = now
+        try:
+            logger.info(f"[PINNING] Pin mismatch on {host}. Triggering emergency Ed25519 OTA pin sync...")
+            from common.updater import fetch_dynamic_pins
+            updated = fetch_dynamic_pins(timeout=10)
+            if updated and any(h.lower() == host.lower() for h in updated):
+                register_dynamic_pins(updated)
+                return True
+        except Exception as ota_err:
+            logger.warning(f"[PINNING] Emergency OTA recovery attempt failed: {ota_err}")
+        return False

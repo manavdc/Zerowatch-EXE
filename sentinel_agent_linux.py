@@ -343,9 +343,21 @@ class LinuxAgentSession:
             pass
         pins = SPKI_PINS.get(hostname, [])
         adapter = build_pinning_adapter(pins)
-        sess = requests.Session()
+        sess = PinnedSession()
         sess.mount("https://", adapter)
         return sess
+
+    def heal_certificate_pins(self) -> bool:
+        """Forces an immediate out-of-band Ed25519 OTA refresh of dynamic certificate pins."""
+        try:
+            from common.updater import fetch_dynamic_pins
+            updated = fetch_dynamic_pins(timeout=10)
+            if updated:
+                logging.info(f"[PINNING] Certificate pins manually refreshed: {list(updated.keys())}")
+                return True
+        except Exception as e:
+            logging.warning(f"[PINNING] Manual certificate pin refresh failed: {e}")
+        return False
 
     @property
     def headers(self) -> dict:
