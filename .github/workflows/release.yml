@@ -71,6 +71,7 @@ jobs:
           python -m nuitka ^
             --standalone ^
             --onefile ^
+            --lto=no ^
             --windows-console-mode=disable ^
             --enable-plugin=tk-inter ^
             --output-dir=dist\windows ^
@@ -143,6 +144,7 @@ jobs:
           python -m nuitka \
             --standalone \
             --onefile \
+            --lto=no \
             --enable-plugin=tk-inter \
             --output-dir=dist/linux \
             --output-filename=SentinelAgent-linux-x64 \
@@ -211,6 +213,7 @@ jobs:
           python -m nuitka \
             --standalone \
             --onefile \
+            --lto=no \
             --enable-plugin=tk-inter \
             --output-dir=dist/macos \
             --output-filename=SentinelAgent-macos-arm64 \
