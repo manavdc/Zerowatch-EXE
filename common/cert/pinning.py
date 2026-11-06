@@ -83,6 +83,45 @@ def is_valid_sha256_base64(pin: str) -> bool:
         return False
 
 
+# Base64-encoded raw Ed25519 public key (32 bytes) used as trust anchor for OTA updates
+OTA_ED25519_PUBLIC_KEY_B64 = "A05PfsGyjAJZJAP2u4qbqaUJUObMJkETbPeBcVecky0="
+
+# Dynamic in-memory SPKI pins received via verified Ed25519 OTA updates
+_DYNAMIC_PINS_CACHE: dict[str, list[str]] = {}
+
+
+def register_dynamic_pins(pins: dict[str, list[str]]) -> None:
+    """
+    Registers cryptographically verified dynamic SPKI pins into memory for immediate use.
+    Merges with existing pins without discarding valid pins.
+    """
+    global _DYNAMIC_PINS_CACHE
+    if not isinstance(pins, dict):
+        return
+    for host, host_pins in pins.items():
+        if not isinstance(host, str) or not isinstance(host_pins, list):
+            continue
+        valid = [p for p in host_pins if is_valid_sha256_base64(str(p))]
+        if valid:
+            existing = _DYNAMIC_PINS_CACHE.get(host, [])
+            merged = list(dict.fromkeys(existing + valid))
+            _DYNAMIC_PINS_CACHE[host] = merged
+            logger.info(f"[PINNING] Registered {len(valid)} dynamic SPKI pin(s) for host {host}")
+
+
+def get_dynamic_pins_for_host(hostname: str) -> list[str]:
+    """Returns runtime-registered dynamic pins for the given hostname."""
+    if not hostname:
+        return []
+    return list(_DYNAMIC_PINS_CACHE.get(hostname.lower(), []))
+
+
+def clear_dynamic_pins() -> None:
+    """Clears dynamic in-memory pins (primarily used for testing)."""
+    global _DYNAMIC_PINS_CACHE
+    _DYNAMIC_PINS_CACHE.clear()
+
+
 # In-memory cache for AIA-fetched intermediate certificates to avoid repeated network roundtrips
 _CA_ISSUER_CACHE: dict[str, bytes] = {}
 
@@ -172,9 +211,12 @@ def _resolve_aia_issuers(cert: x509.Certificate, max_depth: int = 2) -> list[tup
 def _verify_pin(hostname: str, der_cert: bytes, allowed_pins: list[str]):
     """
     Verifies that the SPKI hash of the certificate (or any discovered issuing CA in its chain)
-    matches one of the allowed pins. Preserved for backwards compatibility with single-cert callers.
+    matches one of the allowed pins (hardcoded or OTA dynamic).
+    Preserved for backwards compatibility with single-cert callers.
     """
-    valid_pins = [p for p in allowed_pins if is_valid_sha256_base64(p)]
+    dynamic = get_dynamic_pins_for_host(hostname)
+    combined = list(dict.fromkeys(allowed_pins + dynamic))
+    valid_pins = [p for p in combined if is_valid_sha256_base64(p)]
     if not valid_pins:
         raise PinError(f"No valid SPKI pins configured for validation against {hostname}")
 
@@ -220,9 +262,11 @@ def _verify_pin(hostname: str, der_cert: bytes, allowed_pins: list[str]):
 def _verify_socket_pins(hostname: str, wrapped_sock, allowed_pins: list[str]):
     """
     Verifies that at least one certificate in the TLS peer chain (leaf, intermediate CA, or root CA)
-    matches one of the allowed SPKI pins.
+    matches one of the allowed SPKI pins (hardcoded or OTA dynamic).
     """
-    valid_pins = [p for p in allowed_pins if is_valid_sha256_base64(p)]
+    dynamic = get_dynamic_pins_for_host(hostname)
+    combined = list(dict.fromkeys(allowed_pins + dynamic))
+    valid_pins = [p for p in combined if is_valid_sha256_base64(p)]
     if not valid_pins:
         raise PinError(f"No valid SPKI pins configured for validation against {hostname}")
 

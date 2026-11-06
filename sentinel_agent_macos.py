@@ -415,6 +415,14 @@ class MacOSAgentSession:
         hostname = parsed.hostname or ""
         if is_loopback(self._api_url):
             return requests.Session()
+        try:
+            from common.updater import load_cached_dynamic_pins
+            from common.cert.pinning import register_dynamic_pins
+            cached = load_cached_dynamic_pins()
+            if cached:
+                register_dynamic_pins(cached)
+        except Exception:
+            pass
         pins    = SPKI_PINS.get(hostname, [])
         adapter = build_pinning_adapter(pins)
         sess    = requests.Session()

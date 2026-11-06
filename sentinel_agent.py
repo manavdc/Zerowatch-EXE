@@ -812,17 +812,34 @@ def _load_pins_for_url(base_url: str) -> list[str]:
     except Exception as e:
         logging.debug(f"Failed to load custom pins from agent_config.json: {e}")
 
-    # 2. Enforce hardcoded pins for official domains unless explicitly overridden in dev mode
+    # 2. Load dynamic OTA pins from memory / disk cache
+    dynamic_pins = []
+    try:
+        from common.cert.pinning import get_dynamic_pins_for_host, register_dynamic_pins
+        dynamic_pins = get_dynamic_pins_for_host(hostname)
+        if not dynamic_pins:
+            from common.updater import load_cached_dynamic_pins
+            cached_all = load_cached_dynamic_pins()
+            if cached_all:
+                register_dynamic_pins(cached_all)
+                dynamic_pins = get_dynamic_pins_for_host(hostname)
+    except Exception as _ota_err:
+        logging.debug(f"Dynamic OTA pin lookup: {_ota_err}")
+
+    # 3. Enforce hardcoded and dynamic pins for official domains unless explicitly overridden in dev mode
     if hostname in SPKI_PINS:
         if is_dev_mode and custom_pins:
             logging.warning(f"Development mode active. Overriding hardcoded pins for {hostname} with custom configuration pins.")
             return custom_pins
-        return SPKI_PINS[hostname]
+        # Merge official hardcoded pins with dynamic verified OTA pins
+        merged = list(dict.fromkeys(SPKI_PINS[hostname] + dynamic_pins))
+        return merged
 
-    # 3. For custom staging/on-premise domains, return the configured custom pins
-    if custom_pins:
-        logging.info(f"Loaded {len(custom_pins)} valid custom pins from agent_config.json for host {hostname}")
-        return custom_pins
+    # 4. For custom staging/on-premise domains, return dynamic pins or configured custom pins
+    staging_pins = list(dict.fromkeys(custom_pins + dynamic_pins))
+    if staging_pins:
+        logging.info(f"Loaded {len(staging_pins)} valid custom/dynamic pins for host {hostname}")
+        return staging_pins
 
     # 4. If HTTPS but no pins are defined, raise a fatal error to prevent unpinned connection.
     if base_url.lower().startswith("https://"):
