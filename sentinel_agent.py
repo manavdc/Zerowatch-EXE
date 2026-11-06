@@ -740,10 +740,9 @@ print(f"[AGENT] Resolved Backend API URL: {BASE_API_URL}")
 # For production and demo environments, these should be updated to actual hashes.
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
+        "a6WoJxzcp0Im4dXEiaHUcio3U8wbbRWdVyaWoqsIlGQ=",  # Google Trust Services (Active from 2026-11-03)
         "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
         "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
-        # Cloudflare/Google Trust Services certificate rotation observed on
-        # 2026-09-07; retain the previous pins for rollover compatibility.
         "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="
     ],
     "zerowatch-testing.eastasia.cloudapp.azure.com": [
@@ -8071,7 +8070,19 @@ class DashboardFrame(tk.Frame):
                     else:
                         sys.exit(0)
                 else:
-                    messagebox.showerror("Unlink Failed", f"Failed to unlink device: {msg}")
+                    if messagebox.askyesno(
+                        "Unlink Failed — Force Local Reset?",
+                        f"Failed to unlink from server: {msg}\n\n"
+                        "Would you like to force unlink locally by clearing local enrollment data on this device?"
+                    ):
+                        self.zw_client.clear_local_state()
+                        show_windows_notification("Zerowatch", "Device unlinked locally.")
+                        if hasattr(self.winfo_toplevel(), 'show_enrollment'):
+                            self.winfo_toplevel().show_enrollment()
+                        else:
+                            sys.exit(0)
+                    else:
+                        messagebox.showerror("Unlink Failed", f"Failed to unlink device: {msg}")
 
         unlink_btn = tk.Button(top3, text="Unlink", bg=self.c_red, fg=self.c_white, font=self.f_normal_bold, bd=0, relief=tk.FLAT, overrelief=tk.FLAT, highlightthickness=0, activebackground="#da3633", activeforeground=self.c_white, disabledforeground=self.c_gray, cursor="hand2", command=on_unlink_click)
         unlink_btn.pack(side=tk.RIGHT)

@@ -104,6 +104,7 @@ if "localhost" in BASE_API_URL or "127.0.0.1" in BASE_API_URL:
 # ── SPKI pins (identical to Windows agent) ────────────────────────────────────
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
+        "a6WoJxzcp0Im4dXEiaHUcio3U8wbbRWdVyaWoqsIlGQ=",  # Google Trust Services (Active from 2026-11-03)
         "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
         "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
         "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="
