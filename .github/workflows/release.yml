@@ -65,6 +65,14 @@ jobs:
               f.write(f'FORCED_BASE_API_URL = "{api_url}"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
 
+      - name: Cache Nuitka compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\Nuitka\Nuitka\Cache
+          key: ${{ runner.os }}-nuitka-${{ hashFiles('sentinel_agent.py', 'requirements-windows.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-nuitka-
+
       - name: Build with Nuitka (onefile)
         shell: cmd
         run: |
@@ -72,6 +80,9 @@ jobs:
             --standalone ^
             --onefile ^
             --lto=no ^
+            --jobs=2 ^
+            --low-memory ^
+            --enable-plugin=anti-bloat ^
             --windows-console-mode=disable ^
             --enable-plugin=tk-inter ^
             --output-dir=dist\windows ^
@@ -139,12 +150,23 @@ jobs:
               f.write(f'FORCED_BASE_API_URL = "{api_url}"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
 
+      - name: Cache Nuitka compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Nuitka
+          key: ${{ runner.os }}-nuitka-${{ hashFiles('sentinel_agent.py', 'requirements-linux.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-nuitka-
+
       - name: Build with Nuitka (onefile)
         run: |
           python -m nuitka \
             --standalone \
             --onefile \
             --lto=no \
+            --jobs=2 \
+            --low-memory \
+            --enable-plugin=anti-bloat \
             --enable-plugin=tk-inter \
             --output-dir=dist/linux \
             --output-filename=SentinelAgent-linux-x64 \
@@ -176,7 +198,9 @@ jobs:
   # ===========================================================================
   build-macos:
     name: "Build macOS (arm64)"
-    runs-on: macos-14
+    runs-on: macos-latest
+    outputs:
+      binary-name: ${{ steps.set-names.outputs.binary }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -208,12 +232,23 @@ jobs:
               f.write(f'FORCED_BASE_API_URL = "{api_url}"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
 
+      - name: Cache Nuitka compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Nuitka
+          key: ${{ runner.os }}-nuitka-${{ hashFiles('sentinel_agent.py', 'requirements-linux.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-nuitka-
+
       - name: Build with Nuitka (onefile)
         run: |
           python -m nuitka \
             --standalone \
             --onefile \
             --lto=no \
+            --jobs=3 \
+            --low-memory \
+            --enable-plugin=anti-bloat \
             --enable-plugin=tk-inter \
             --output-dir=dist/macos \
             --output-filename=SentinelAgent-macos-arm64 \
