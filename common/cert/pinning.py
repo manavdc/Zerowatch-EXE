@@ -87,10 +87,92 @@ def is_valid_sha256_base64(pin: str) -> bool:
 _CA_ISSUER_CACHE: dict[str, bytes] = {}
 
 
+def _extract_spki_from_cert(cert_input) -> str | None:
+    """
+    Safely extracts the SHA-256 SPKI base64 string from:
+      - x509.Certificate
+      - _ssl.Certificate (or any object implementing public_bytes)
+      - raw DER bytes
+      - raw PEM string or bytes
+    """
+    try:
+        if isinstance(cert_input, x509.Certificate):
+            cert = cert_input
+        elif hasattr(cert_input, "public_bytes"):
+            raw = cert_input.public_bytes()
+            if isinstance(raw, str):
+                raw = raw.encode("ascii", errors="replace")
+            if b"BEGIN CERTIFICATE" in raw:
+                cert = x509.load_pem_x509_certificate(raw)
+            else:
+                cert = x509.load_der_x509_certificate(raw)
+        elif isinstance(cert_input, (bytes, bytearray)):
+            if b"BEGIN CERTIFICATE" in cert_input:
+                cert = x509.load_pem_x509_certificate(cert_input)
+            else:
+                cert = x509.load_der_x509_certificate(cert_input)
+        elif isinstance(cert_input, str):
+            cert = x509.load_pem_x509_certificate(cert_input.encode("ascii", errors="replace"))
+        else:
+            return None
+
+        spki_bytes = cert.public_key().public_bytes(
+            encoding=Encoding.DER,
+            format=PublicFormat.SubjectPublicKeyInfo
+        )
+        h = hashes.Hash(hashes.SHA256())
+        h.update(spki_bytes)
+        return base64.b64encode(h.finalize()).decode("ascii")
+    except Exception as e:
+        logger.debug(f"Failed extracting SPKI from cert input: {e}")
+        return None
+
+
+def _resolve_aia_issuers(cert: x509.Certificate, max_depth: int = 2) -> list[tuple[str, x509.Certificate]]:
+    """
+    Follows Authority Information Access (AIA) caIssuers URLs up to max_depth
+    to discover intermediate and root CA certificates not included directly in the TLS handshake.
+    Returns list of (spki_hash, x509.Certificate).
+    """
+    discovered: list[tuple[str, x509.Certificate]] = []
+    current_cert = cert
+
+    for _ in range(max_depth):
+        try:
+            aia = current_cert.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
+            ca_issuers = [d.access_location.value for d in aia if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS]
+        except Exception:
+            break
+
+        next_cert = None
+        for issuer_url in ca_issuers:
+            try:
+                if issuer_url not in _CA_ISSUER_CACHE:
+                    req = urllib.request.Request(issuer_url, headers={"User-Agent": "ZeroWatch-Pinning/1.0"})
+                    with urllib.request.urlopen(req, timeout=3) as resp:
+                        _CA_ISSUER_CACHE[issuer_url] = resp.read()
+
+                issuer_der = _CA_ISSUER_CACHE.get(issuer_url)
+                if issuer_der:
+                    parsed_issuer = x509.load_der_x509_certificate(issuer_der)
+                    issuer_spki = get_spki_sha256(issuer_der)
+                    discovered.append((issuer_spki, parsed_issuer))
+                    next_cert = parsed_issuer
+                    break
+            except Exception as e:
+                logger.debug(f"AIA resolution failed for {issuer_url}: {e}")
+
+        if next_cert is None:
+            break
+        current_cert = next_cert
+
+    return discovered
+
+
 def _verify_pin(hostname: str, der_cert: bytes, allowed_pins: list[str]):
     """
-    Verifies that the SPKI hash of the certificate matches one of the allowed pins.
-    Preserved for backwards compatibility with single-cert callers.
+    Verifies that the SPKI hash of the certificate (or any discovered issuing CA in its chain)
+    matches one of the allowed pins. Preserved for backwards compatibility with single-cert callers.
     """
     valid_pins = [p for p in allowed_pins if is_valid_sha256_base64(p)]
     if not valid_pins:
@@ -105,34 +187,17 @@ def _verify_pin(hostname: str, der_cert: bytes, allowed_pins: list[str]):
         logger.debug("SPKI pin verified successfully against leaf certificate.")
         return
 
-    # Leaf did not match directly; check if AIA intermediate matches an allowed pin
+    # Leaf did not match directly; traverse AIA chain (intermediate & root CAs)
     try:
         leaf_cert = x509.load_der_x509_certificate(der_cert)
-        try:
-            aia = leaf_cert.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
-            ca_issuers = [d.access_location.value for d in aia if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS]
-        except Exception:
-            ca_issuers = []
-
-        for issuer_url in ca_issuers:
-            try:
-                if issuer_url not in _CA_ISSUER_CACHE:
-                    req = urllib.request.Request(issuer_url, headers={"User-Agent": "ZeroWatch-Pinning/1.0"})
-                    with urllib.request.urlopen(req, timeout=3) as resp:
-                        _CA_ISSUER_CACHE[issuer_url] = resp.read()
-
-                issuer_der = _CA_ISSUER_CACHE.get(issuer_url)
-                if issuer_der:
-                    issuer_cert = x509.load_der_x509_certificate(issuer_der)
-                    leaf_cert.verify_directly_issued_by(issuer_cert)
-                    issuer_spki = get_spki_sha256(issuer_der)
-                    if issuer_spki in valid_pins:
-                        logger.info(f"SPKI pin verified successfully via issuing intermediate ({issuer_url}).")
-                        return
-            except Exception as _aia_err:
-                logger.debug(f"AIA issuer validation check failed for {issuer_url}: {_aia_err}")
-    except Exception:
-        pass
+        aia_chain = _resolve_aia_issuers(leaf_cert, max_depth=2)
+        for depth, (issuer_spki, issuer_cert) in enumerate(aia_chain, start=1):
+            if issuer_spki in valid_pins:
+                issuer_name = issuer_cert.subject.rfc4514_string()
+                logger.info(f"SPKI pin verified successfully via AIA CA (depth {depth}, {issuer_name}: {issuer_spki}).")
+                return
+    except Exception as _aia_err:
+        logger.debug(f"AIA issuer traversal error: {_aia_err}")
 
     try:
         cert = x509.load_der_x509_certificate(der_cert)
@@ -154,7 +219,7 @@ def _verify_pin(hostname: str, der_cert: bytes, allowed_pins: list[str]):
 
 def _verify_socket_pins(hostname: str, wrapped_sock, allowed_pins: list[str]):
     """
-    Verifies that at least one certificate in the TLS peer chain (leaf, intermediate, or root)
+    Verifies that at least one certificate in the TLS peer chain (leaf, intermediate CA, or root CA)
     matches one of the allowed SPKI pins.
     """
     valid_pins = [p for p in allowed_pins if is_valid_sha256_base64(p)]
@@ -164,7 +229,7 @@ def _verify_socket_pins(hostname: str, wrapped_sock, allowed_pins: list[str]):
     presented_spkis: list[str] = []
     leaf_cert = None
 
-    # 1. Extract leaf certificate DER
+    # 1. Check leaf certificate
     try:
         leaf_der = wrapped_sock.getpeercert(binary_form=True)
         if leaf_der:
@@ -177,7 +242,7 @@ def _verify_socket_pins(hostname: str, wrapped_sock, allowed_pins: list[str]):
     except Exception as e:
         logger.debug(f"Failed extracting leaf cert SPKI: {e}")
 
-    # 2. Extract full verified/unverified certificate chain from SSLSocket
+    # 2. Check full certificate chain from SSLSocket (verified chain from OpenSSL)
     sslobj = getattr(wrapped_sock, '_sslobj', None)
     if sslobj is not None:
         for getter_name in ('get_verified_chain', 'get_unverified_chain'):
@@ -186,16 +251,9 @@ def _verify_socket_pins(hostname: str, wrapped_sock, allowed_pins: list[str]):
                 try:
                     chain = getter() or []
                     for depth, cert_obj in enumerate(chain):
-                        pem = cert_obj.public_bytes()
-                        pem_bytes = pem.encode('ascii') if isinstance(pem, str) else pem
-                        chain_cert = x509.load_pem_x509_certificate(pem_bytes)
-                        chain_spki_bytes = chain_cert.public_key().public_bytes(
-                            encoding=Encoding.DER,
-                            format=PublicFormat.SubjectPublicKeyInfo
-                        )
-                        h = hashes.Hash(hashes.SHA256())
-                        h.update(chain_spki_bytes)
-                        chain_spki = base64.b64encode(h.finalize()).decode('ascii')
+                        chain_spki = _extract_spki_from_cert(cert_obj)
+                        if not chain_spki:
+                            continue
                         if chain_spki not in presented_spkis:
                             presented_spkis.append(chain_spki)
                         if chain_spki in valid_pins:
@@ -204,32 +262,19 @@ def _verify_socket_pins(hostname: str, wrapped_sock, allowed_pins: list[str]):
                 except Exception as _chain_err:
                     logger.debug(f"{getter_name} extraction error: {_chain_err}")
 
-    # 3. Fallback: check leaf AIA issuer
+    # 3. Fallback: Traverse Authority Information Access (AIA) caIssuers
     if leaf_cert is not None:
         try:
-            aia = leaf_cert.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
-            ca_issuers = [d.access_location.value for d in aia if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS]
-            for issuer_url in ca_issuers:
-                try:
-                    if issuer_url not in _CA_ISSUER_CACHE:
-                        req = urllib.request.Request(issuer_url, headers={"User-Agent": "ZeroWatch-Pinning/1.0"})
-                        with urllib.request.urlopen(req, timeout=3) as resp:
-                            _CA_ISSUER_CACHE[issuer_url] = resp.read()
-
-                    issuer_der = _CA_ISSUER_CACHE.get(issuer_url)
-                    if issuer_der:
-                        issuer_cert = x509.load_der_x509_certificate(issuer_der)
-                        leaf_cert.verify_directly_issued_by(issuer_cert)
-                        issuer_spki = get_spki_sha256(issuer_der)
-                        if issuer_spki not in presented_spkis:
-                            presented_spkis.append(issuer_spki)
-                        if issuer_spki in valid_pins:
-                            logger.info(f"SPKI pin verified successfully via AIA intermediate ({issuer_url}: {issuer_spki}).")
-                            return
-                except Exception as _aia_err:
-                    logger.debug(f"AIA issuer validation error for {issuer_url}: {_aia_err}")
-        except Exception:
-            pass
+            aia_chain = _resolve_aia_issuers(leaf_cert, max_depth=2)
+            for depth, (issuer_spki, issuer_cert) in enumerate(aia_chain, start=1):
+                if issuer_spki not in presented_spkis:
+                    presented_spkis.append(issuer_spki)
+                if issuer_spki in valid_pins:
+                    issuer_name = issuer_cert.subject.rfc4514_string()
+                    logger.info(f"SPKI pin verified successfully via AIA CA (depth {depth}, {issuer_name}: {issuer_spki}).")
+                    return
+        except Exception as _aia_err:
+            logger.debug(f"AIA issuer validation error: {_aia_err}")
 
     # If no certificate in the chain matched allowed pins, fail
     issuer_desc = "Unknown"
