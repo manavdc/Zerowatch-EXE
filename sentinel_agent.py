@@ -7392,6 +7392,21 @@ class EnrollmentFrame(tk.Frame):
 
     def _run_join(self):
         try:
+            # Write consent file now so the background daemon can start even if
+            # the GUI is closed before the admin approves the join request.
+            # This is defensive — prompt_consent() normally writes it, but on
+            # some first-run paths the consent screen may not have been shown.
+            try:
+                _consent_path = os.path.join(
+                    _secure_state_dir(self.zw_client.base_dir), "consent_accepted.dat"
+                )
+                if not os.path.exists(_consent_path):
+                    os.makedirs(os.path.dirname(_consent_path), exist_ok=True)
+                    with open(_consent_path, "w") as _cf:
+                        _cf.write("1")
+            except Exception as _ce:
+                logging.debug("Could not write consent file during join: %s", _ce)
+
             if getattr(self, "is_individual", False):
                 res = self.zw_client.request_individual_join(self.individual_code)
                 if res.get("success"):
@@ -9170,6 +9185,19 @@ class UnifiedSentinelGUI(tk.Tk):
             self.show_enrollment()
         elif force_frame == "dashboard":
             self.show_dashboard()
+        elif force_frame == "pending":
+            # Reopen directly on the pending-approval screen so the user sees
+            # the "waiting for admin approval" state rather than the enrollment
+            # form asking for a code they already submitted.
+            self.show_enrollment()   # builds the enrollment frame first
+            # Then navigate to pending without re-submitting the join request
+            enroll_frame = self.current_frame
+            if hasattr(enroll_frame, "_goto_pending"):
+                enroll_frame._goto_pending()
+            else:
+                # Fallback: show enrollment (user will see correct state via
+                # the polling thread started by show_enrollment)
+                logging.warning("[GUI] EnrollmentFrame has no _goto_pending — falling back to enrollment view.")
         else:
             # Default routing logic: strictly check enrollment status
             if self.zw_client.is_enrolled():
@@ -9512,13 +9540,20 @@ def run_interactive():
         )
         _append_gui_log(base_dir, "GUI startup: client initialized")
 
-        if not zw_client.is_enrolled():
+        # Determine enrollment state before showing consent or routing the GUI.
+        is_enrolled_locally = zw_client.is_enrolled()
+        is_pending_locally = zw_client.has_pending_join()
+
+        # Only force-show consent when the user has NEVER interacted with the
+        # agent (no enrollment and no pending request).  If a join request is
+        # already in-flight, the user already consented during the original
+        # enrollment submission — reopening the GUI must not re-show consent.
+        if not is_enrolled_locally and not is_pending_locally:
             prompt_consent(base_dir, force_show=True)
         else:
             prompt_consent(base_dir, force_show=False)
 
         # Default routing logic with a 2-second "Server Veto"
-        is_enrolled_locally = zw_client.is_enrolled()
         
         if is_enrolled_locally:
             logging.info("Startup: Device enrolled locally. Verifying with server (2s timeout)...")
@@ -9541,6 +9576,7 @@ def run_interactive():
                 logging.info("Startup: Server rejected enrollment. Wiping local state.")
                 zw_client.clear_local_state()
                 is_enrolled_locally = False
+                is_pending_locally = False
             else:
                 logging.info(f"Startup: Server verification result: {verify_res.get('status')}")
                 # FIX: Daemon spawned only after server confirms enrollment valid.
@@ -9551,6 +9587,13 @@ def run_interactive():
         if is_enrolled_locally:
             logging.info("Startup: Proceeding to Dashboard.")
             app = UnifiedSentinelGUI(zw_client, force_frame="dashboard")
+        elif is_pending_locally:
+            # Enrollment was submitted before the GUI closed; reopen on the
+            # pending-approval screen so the user sees progress instead of an
+            # enrollment form asking for a code they already entered.
+            logging.info("Startup: Pending enrollment detected — restoring Pending screen.")
+            _auto_bootstrap_background_agent()   # ensure daemon is polling
+            app = UnifiedSentinelGUI(zw_client, force_frame="pending")
         else:
             logging.info("Startup: Proceeding to Enrollment.")
             app = UnifiedSentinelGUI(zw_client, force_frame="enroll")
@@ -9811,18 +9854,21 @@ def main():
             "consent_accepted.dat"
         )
 
-        # Check if the agent is already linked
+        # Check if the agent is already linked (has JWT) OR has a pending enrollment
         token_win = _state_path(base_dir, "zerowatch_token.dat")
         token_nix = os.path.join(
             _secure_state_dir(base_dir),
             "agent_token.enc"
         )
+        join_state_win = _state_path(base_dir, TEAM_JOIN_STATE_FILE)
+        join_state_nix = os.path.join(_secure_state_dir(base_dir), "join_state.json")
 
         is_linked = os.path.exists(token_win) or os.path.exists(token_nix)
+        has_join_state = os.path.exists(join_state_win) or os.path.exists(join_state_nix)
 
-        if not is_linked and not os.path.exists(consent_file):
+        if not is_linked and not has_join_state and not os.path.exists(consent_file):
             logging.info(
-                "Daemon blocked: Consent not accepted yet and agent is not linked."
+                "Daemon blocked: No enrollment in progress and consent not accepted yet."
             )
             sys.exit(0)
 
