@@ -727,15 +727,27 @@ print(f"[AGENT] Resolved Backend API URL: {BASE_API_URL}")
 # For production and demo environments, these should be updated to actual hashes.
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
-        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
-        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
-        # Cloudflare/Google Trust Services certificate rotation observed on
-        # 2026-09-07; retain the previous pins for rollover compatibility.
-        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="
-    ],
-    "zerowatch-testing.eastasia.cloudapp.azure.com": [
-        "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",
-        "EzSBE12fT2ZrphmumaBjrpdpXv9G71RhZQHMvuwszI4="
+        # --- Leaf Public Keys (90-Day Lifespan) ---
+        "a6WoJxzcp0Im4dXEiaHUcio3U8wbbRWdVyaWoqsIlGQ=",  # Google Trust Services (Active Leaf from 2026-11-03)
+        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",  # Previous Leaf
+
+        # --- Intermediate CAs (1 to 5-Year Lifespan) ---
+        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",  # Google Trust Services WE1 Intermediate CA
+        "jQJTbIh0grw0/1TkHSumWb+Fs0Ggogr621gT3PvPKG0=",  # Let's Encrypt R3 Intermediate CA
+
+        # --- Root CAs (10 to 25-Year Lifespan - Immune to 90-Day Rotations) ---
+        "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",  # Google Trust Services GTS Root R1 (RSA 4096)
+        "Vfd95BwDeSQo+NUYxVEEIlvkOlWY2SalKK1lPhzOx78=",  # Google Trust Services GTS Root R2 (RSA 4096)
+        "QXnt2YHvdHR3tJYmQIr0Paosp6t/nggsEGD4QJZ3Q0g=",  # Google Trust Services GTS Root R3 (ECDSA P-256)
+        "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",  # Google Trust Services GTS Root R4 (ECDSA P-384)
+        "C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=",  # Let's Encrypt ISRG Root X1 (RSA 4096, valid to 2035)
+        "diGVwiVYbubAI3RW4hB9xU8e/CH2GnkuvVFZE8zmgzI=",  # Let's Encrypt ISRG Root X2 (ECDSA P-384, valid to 2040)
+        "K87oWBWM9UZfyddvDfoxL+8lpNyoUB2ptGtn0fv6G2Q=",  # GlobalSign Root CA (GTS cross-sign anchor)
+        "CLOmM1/OXvSPjw5UOYbAf9GKOxImEp9hhku9W90fHMk=",  # GlobalSign ECC Root R4
+        "cGuxAXyFXFkWm61cF4HPWX8S0srS9j0aSqN0k4AP+4A=",  # GlobalSign Root CA - R3
+
+        # --- Emergency / Rollover Backup Pin ---
+        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="   # Rollover backup pin
     ]
 }
 
