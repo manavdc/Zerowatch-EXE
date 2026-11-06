@@ -164,7 +164,7 @@ set "BUILD_CFG=agent_build_config.py"
 
 rem Fetch latest release tag from GitHub to stamp the build
 echo [2/5] Fetching release version from GitHub...
-for /f "delims=" %%V in ('py -3.11 -c "import urllib.request,json; r=json.loads(urllib.request.urlopen(urllib.request.Request(\"https://api.github.com/repos/manavdc/Zerowatch-EXE/releases/latest\",headers={\"User-Agent\":\"build-agent\"}),timeout=8).read()); print(r.get(\"tag_name\",\"0.0.0\").lstrip(\"v\"))" 2^>nul') do set "RELEASE_VERSION=%%V"
+for /f "delims=" %%V in ('py -3.11 -c "import urllib.request,json; r=json.loads(urllib.request.urlopen(urllib.request.Request(\"https://api.github.com/repos/jatinhendre/sentinel-agent-testing/releases/latest\",headers={\"User-Agent\":\"build-agent\"}),timeout=8).read()); print(r.get(\"tag_name\",\"0.0.0\").lstrip(\"v\"))" 2^>nul') do set "RELEASE_VERSION=%%V"
 if not defined RELEASE_VERSION set "RELEASE_VERSION=0.0.0"
 echo [2/5] Detected release version: %RELEASE_VERSION%
 

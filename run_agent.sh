@@ -172,7 +172,7 @@ echo "[2/3] Writing server config..."
 BUILD_CFG="${SCRIPT_DIR}/agent_build_config.py"
 RELEASE_VERSION="${ZEROWATCH_AGENT_VERSION:-}"
 if [[ -z "${RELEASE_VERSION}" ]]; then
-    RELEASE_VERSION="$(${PYTHON} -c 'import json,urllib.request; r=urllib.request.Request("https://api.github.com/repos/manavdc/Zerowatch-EXE/releases/latest", headers={"User-Agent":"zerowatch-agent-launcher"}); print(json.loads(urllib.request.urlopen(r, timeout=8).read()).get("tag_name", "0.0.0").lstrip("v"))' 2>/dev/null || true)"
+    RELEASE_VERSION="$(${PYTHON} -c 'import json,urllib.request; r=urllib.request.Request("https://api.github.com/repos/jatinhendre/sentinel-agent-testing/releases/latest", headers={"User-Agent":"zerowatch-agent-launcher"}); print(json.loads(urllib.request.urlopen(r, timeout=8).read()).get("tag_name", "0.0.0").lstrip("v"))' 2>/dev/null || true)"
 fi
 if [[ -z "${RELEASE_VERSION}" ]]; then
     RELEASE_VERSION="0.0.0"

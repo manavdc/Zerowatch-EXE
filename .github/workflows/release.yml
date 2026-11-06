@@ -284,7 +284,7 @@ jobs:
         env:
           OTA_SIGNING_KEY_HEX: ${{ secrets.OTA_SIGNING_KEY_HEX }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
-          GITHUB_REPO: manavdc/Zerowatch-EXE
+          GITHUB_REPO: ${{ github.repository }}
         run: |
           python - <<'PYEOF'
           import base64, hashlib, json, os, sys, datetime
@@ -301,7 +301,7 @@ jobs:
 
           # ── Extract version from environment ─────────────────────────────────
           version = os.environ.get("RELEASE_VERSION", "0.0.0")
-          repo    = os.environ.get("GITHUB_REPO", "manavdc/Zerowatch-EXE")
+          repo    = os.environ.get("GITHUB_REPO", "${{ github.repository }}")
 
           # ── Per-platform binary paths ─────────────────────────────────────────
           BINARIES = {

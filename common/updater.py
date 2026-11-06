@@ -67,7 +67,7 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 
-GITHUB_REPO = "manavdc/Zerowatch-EXE"
+GITHUB_REPO = "jatinhendre/sentinel-agent-testing"
 
 # GitHub Releases CDN URLs (no API rate-limit risk — static asset downloads)
 _RELEASES_BASE   = f"https://github.com/{GITHUB_REPO}/releases/latest/download"

@@ -244,17 +244,30 @@ def _setup_tcl_tk_paths():
             if os.environ.get("TCL_LIBRARY") and os.environ.get("TK_LIBRARY"):
                 break
 
-_setup_tcl_tk_paths()
+_is_headless = any(
+    flag in sys.argv for flag in ("--daemon", "--watchdog", "--password-prompt", "--uninstall")
+)
 
-
-try:
-    import tkinter as tk
-    from tkinter import font as tkfont
-    from tkinter import ttk
-except ImportError:
-    tk = None
-    tkfont = None
-    ttk = None
+if _is_headless:
+    class _DummyTk:
+        def __getattr__(self, name):
+            return object
+    tk = _DummyTk()
+    tkfont = _DummyTk()
+    ttk = _DummyTk()
+else:
+    _setup_tcl_tk_paths()
+    try:
+        import tkinter as tk
+        from tkinter import font as tkfont
+        from tkinter import ttk
+    except ImportError:
+        class _DummyTk:
+            def __getattr__(self, name):
+                return object
+        tk = _DummyTk()
+        tkfont = _DummyTk()
+        ttk = _DummyTk()
 
 import math
 
@@ -270,7 +283,7 @@ except (ImportError, AttributeError):
         try:
             import urllib.request
             import json as _json
-            url = "https://api.github.com/repos/manavdc/Zerowatch-EXE/releases/latest"
+            url = "https://api.github.com/repos/jatinhendre/sentinel-agent-testing/releases/latest"
             req = urllib.request.Request(url, headers={"User-Agent": "SentinelAgent-init"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = _json.loads(resp.read().decode())
@@ -2796,6 +2809,42 @@ def get_base_dir():
 # MODULE 1: BOOTSTRAP — Single Instance Mutex
 # ============================================================================
 
+def _windows_create_permissive_mutex(mutex_name: str, initial_owner: bool = True):
+    """Create or probe a named Windows kernel mutex with a NULL DACL.
+    
+    A NULL DACL in the security descriptor explicitly grants access to ALL callers
+    regardless of integrity level (Medium, High/Admin, SYSTEM). This ensures that
+    non-elevated processes and elevated processes can detect each other without
+    failing with ERROR_ACCESS_DENIED (5).
+    Returns (handle, last_error).
+    """
+    if sys.platform != "win32":
+        return None, 0
+
+    class _SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [
+            ("nLength", ctypes.c_ulong),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", ctypes.c_int),
+        ]
+
+    try:
+        sd = (ctypes.c_byte * 64)()
+        ctypes.windll.advapi32.InitializeSecurityDescriptor(ctypes.byref(sd), 1)
+        ctypes.windll.advapi32.SetSecurityDescriptorDacl(ctypes.byref(sd), True, None, False)
+        sa = _SECURITY_ATTRIBUTES()
+        sa.nLength = ctypes.sizeof(_SECURITY_ATTRIBUTES)
+        sa.lpSecurityDescriptor = ctypes.addressof(sd)
+        sa.bInheritHandle = False
+        h = ctypes.windll.kernel32.CreateMutexW(ctypes.byref(sa), initial_owner, mutex_name)
+        err = ctypes.windll.kernel32.GetLastError()
+        return h, err
+    except Exception:
+        h = ctypes.windll.kernel32.CreateMutexW(None, initial_owner, mutex_name)
+        err = ctypes.windll.kernel32.GetLastError()
+        return h, err
+
+
 def enforce_single_instance():
     """
     Claims a named Windows kernel mutex or POSIX lock file. If one already exists from another 
@@ -2815,10 +2864,11 @@ def enforce_single_instance():
             logging.info("Another instance is already running. Exiting silently.")
             sys.exit(0)
 
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
-    last_err = ctypes.windll.kernel32.GetLastError()
-    if last_err == 183:  # ERROR_ALREADY_EXISTS
-        logging.info("Another instance is already running. Exiting silently.")
+    mutex, last_err = _windows_create_permissive_mutex(MUTEX_NAME, True)
+    if not mutex or last_err in (183, 5):  # 183=ERROR_ALREADY_EXISTS, 5=ERROR_ACCESS_DENIED
+        if mutex:
+            ctypes.windll.kernel32.CloseHandle(mutex)
+        logging.info("Another instance is already running (err=%s). Exiting silently.", last_err)
         sys.exit(0)
     return mutex  # MUST keep reference alive — releasing frees the mutex
 
@@ -2844,14 +2894,13 @@ def enforce_single_daemon_instance():
 
     start_wait = time.monotonic()
     while True:
-        mutex = ctypes.windll.kernel32.CreateMutexW(None, True, DAEMON_MUTEX_NAME)
-        last_err = ctypes.windll.kernel32.GetLastError()
-        if last_err != 183:  # Successfully acquired without collision
+        mutex, last_err = _windows_create_permissive_mutex(DAEMON_MUTEX_NAME, True)
+        if mutex and last_err not in (183, 5):  # Successfully acquired without collision
             return mutex
         if mutex:
             ctypes.windll.kernel32.CloseHandle(mutex)
         if time.monotonic() - start_wait >= 5.0:
-            logging.info("Another daemon instance is already running. Exiting silently.")
+            logging.info("Another daemon instance is already running (err=%s). Exiting silently.", last_err)
             sys.exit(0)
         time.sleep(0.5)
 
@@ -4727,22 +4776,20 @@ def _is_daemon_running():
                 pass
         return False
 
-    probe = ctypes.windll.kernel32.CreateMutexW(None, True, DAEMON_MUTEX_NAME)
-    err = ctypes.windll.kernel32.GetLastError()
+    probe, err = _windows_create_permissive_mutex(DAEMON_MUTEX_NAME, True)
     if probe:
         ctypes.windll.kernel32.CloseHandle(probe)
-    return err == 183
+    return err in (183, 5) or not probe
 
 
 def _is_windows_mutex_held(mutex_name):
     """Return True when another process currently owns a named mutex."""
     if sys.platform != "win32":
         return False
-    probe = ctypes.windll.kernel32.CreateMutexW(None, True, mutex_name)
-    err = ctypes.windll.kernel32.GetLastError()
+    probe, err = _windows_create_permissive_mutex(mutex_name, True)
     if probe:
         ctypes.windll.kernel32.CloseHandle(probe)
-    return err == 183
+    return err in (183, 5) or not probe
 
 
 def _wait_for_auxiliary_processes(timeout=10.0):
@@ -5844,10 +5891,11 @@ def watchdog_process(target_exe_path):
     # Claim the watchdog mutex.  A daemon restart can briefly overlap the old
     # and new processes; without this check every restart leaves another
     # watchdog behind, which appears as extra SentinelAgent processes.
-    wd_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, WATCHDOG_MUTEX_NAME)
-    wd_error = ctypes.windll.kernel32.GetLastError()
-    if wd_error == 183:  # ERROR_ALREADY_EXISTS
-        logging.info("[WATCHDOG] Another watchdog is already active; exiting.")
+    wd_mutex, wd_error = _windows_create_permissive_mutex(WATCHDOG_MUTEX_NAME, True)
+    if not wd_mutex or wd_error in (183, 5):  # 183=ERROR_ALREADY_EXISTS, 5=ERROR_ACCESS_DENIED
+        if wd_mutex:
+            ctypes.windll.kernel32.CloseHandle(wd_mutex)
+        logging.info("[WATCHDOG] Another watchdog is already active (err=%s); exiting.", wd_error)
         return
 
     while True:
@@ -5862,11 +5910,10 @@ def watchdog_process(target_exe_path):
             # The watchdog must check BOTH — if either is held, the agent is alive.
             agent_alive = False
             for probe_name in (MUTEX_NAME, DAEMON_MUTEX_NAME):
-                probe_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, probe_name)
-                probe_err = ctypes.windll.kernel32.GetLastError()
+                probe_mutex, probe_err = _windows_create_permissive_mutex(probe_name, True)
                 if probe_mutex:
                     ctypes.windll.kernel32.CloseHandle(probe_mutex)
-                if probe_err == 183:  # ERROR_ALREADY_EXISTS — mutex is held
+                if probe_err in (183, 5):  # Mutex is held by the agent process
                     agent_alive = True
                     break
 
@@ -5906,11 +5953,10 @@ def watchdog_process(target_exe_path):
                         time.sleep(5)
                         # Check if the replacement agent acquired a mutex
                         for probe_name in (MUTEX_NAME, DAEMON_MUTEX_NAME):
-                            probe_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, probe_name)
-                            probe_err = ctypes.windll.kernel32.GetLastError()
+                            probe_mutex, probe_err = _windows_create_permissive_mutex(probe_name, True)
                             if probe_mutex:
                                 ctypes.windll.kernel32.CloseHandle(probe_mutex)
-                            if probe_err == 183:  # ERROR_ALREADY_EXISTS
+                            if probe_err in (183, 5):  # ERROR_ALREADY_EXISTS or ERROR_ACCESS_DENIED
                                 replacement_started = True
                                 break
                         if replacement_started:
@@ -6136,7 +6182,10 @@ def main_agent():
             logging.info("Watchdog guardian spawned as detached process.")
 
         if not skip_watchdog:
-            spawn_watchdog()
+            if not _is_windows_mutex_held(WATCHDOG_MUTEX_NAME):
+                spawn_watchdog()
+            else:
+                logging.info("[MAIN] Watchdog already active; skipping spawn.")
         else:
             logging.info("Skipping watchdog spawn (--no-watchdog mode, existing watchdog is monitoring).")
 
@@ -6704,16 +6753,12 @@ def main_agent():
             # Check if Watchdog is still alive (every 60s) — Windows only
             if sys.platform == "win32" and not skip_watchdog and (now - last_watchdog_check) > 60:
                 last_watchdog_check = now
-                wd = ctypes.windll.kernel32.CreateMutexW(None, True, WATCHDOG_MUTEX_NAME)
-                wd_err = ctypes.windll.kernel32.GetLastError()
-                if wd:
-                    ctypes.windll.kernel32.CloseHandle(wd)
-
-                if wd_err != 183 and _is_windows_mutex_held(MUTEX_NAME):
-                    logging.warning("[MAIN] Watchdog missing while GUI is active; reviving watchdog...")
-                    spawn_watchdog()
-                elif wd_err != 183:
-                    logging.debug("[MAIN] GUI is not active; watchdog revival suppressed.")
+                if not _is_windows_mutex_held(WATCHDOG_MUTEX_NAME):
+                    if _is_windows_mutex_held(MUTEX_NAME):
+                        logging.warning("[MAIN] Watchdog missing while GUI is active; reviving watchdog...")
+                        spawn_watchdog()
+                    else:
+                        logging.debug("[MAIN] GUI is not active; watchdog revival suppressed.")
 
             # Poll asset info every 15 minutes
             if (now - last_asset_poll) >= 15 * 60:
