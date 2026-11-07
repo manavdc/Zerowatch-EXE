@@ -80,7 +80,7 @@ except ImportError:
         def register_dynamic_pins(pins: dict) -> None:
             pass
 
-        OTA_ED25519_PUBLIC_KEY_B64 = "JwdNVR9ZJ8sG63bZ1iWUW2yt+TJwElvf/czhnW2bQQY="
+        OTA_ED25519_PUBLIC_KEY_B64 = "A05PfsGyjAJZJAP2u4qbqaUJUObMJkETbPeBcVecky0="
 
 
 def normalize_ed25519_signature(sig_bytes: bytes) -> bytes:
@@ -105,7 +105,7 @@ def normalize_ed25519_signature(sig_bytes: bytes) -> bytes:
 # Constants
 # ---------------------------------------------------------------------------
 
-GITHUB_REPO = "jatinhendre/sentinel-agent-testing"
+GITHUB_REPO = "manavdc/Zerowatch-EXE"
 
 # GitHub Releases CDN URLs (no API rate-limit risk — static asset downloads)
 _RELEASES_BASE   = f"https://github.com/{GITHUB_REPO}/releases/latest/download"
@@ -115,8 +115,8 @@ MANIFEST_SIG_URL = f"{_RELEASES_BASE}/release-manifest.json.sig"
 # TUF-inspired Timestamp: refuse to trust manifests older than this
 MANIFEST_MAX_AGE_DAYS: int = 3
 
-# Background poll: 4 minutes (240 seconds) for local OTA verification & restart check
-RESTART_CHECK_TIME: int = 240
+# Background poll: 4 hours (14400 seconds) for local OTA verification & restart check
+RESTART_CHECK_TIME: int = 14400
 UPDATE_CHECK_INTERVAL_SECS: int = RESTART_CHECK_TIME
 
 # Download streaming chunk size

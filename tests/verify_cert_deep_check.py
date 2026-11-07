@@ -386,14 +386,14 @@ def check_6_configuration_and_multi_os_parity():
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
     # 1. Check interval in updater.py
-    interval_pass = (UPDATE_CHECK_INTERVAL_SECS == 240)
-    print_result("OTA Update Interval in updater.py is 240s (4 mins)", interval_pass)
+    interval_pass = (UPDATE_CHECK_INTERVAL_SECS == 14400)
+    print_result("OTA Update Interval in updater.py is 14400s (4 hours)", interval_pass)
 
     # 2. Check updater.py release repo URL
     with open(os.path.join(base_dir, "common", "updater.py"), "r", encoding="utf-8") as f:
         updater_src = f.read()
-    repo_pass = "jatinhendre/sentinel-agent-testing" in updater_src
-    print_result("OTA Release URL points to 'jatinhendre/sentinel-agent-testing'", repo_pass)
+    repo_pass = "manavdc/Zerowatch-EXE" in updater_src
+    print_result("OTA Release URL points to 'manavdc/Zerowatch-EXE'", repo_pass)
 
     # 3. Check release workflow
     wf_path = os.path.join(base_dir, ".github", "workflows", "release.yml")
