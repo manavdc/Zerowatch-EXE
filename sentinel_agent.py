@@ -1501,6 +1501,10 @@ class ZeroWatchClient:
                 "asset_name": self.asset_name,
                 "os_info": f"Windows ({AGENT_VERSION})",
                 "fingerprint_json": self.fingerprint_data,
+                "consent": {
+                    "dataCollectionAccepted": True,
+                    "version": "v1.0",
+                },
             }
             
             resp = self.session.post(
