@@ -80,7 +80,7 @@ except ImportError:
         def register_dynamic_pins(pins: dict) -> None:
             pass
 
-        OTA_ED25519_PUBLIC_KEY_B64 = "3hfDBxdsbVK9M+QGIeYtH0tnJjxA64ITQZkN34mykIY="
+        OTA_ED25519_PUBLIC_KEY_B64 = "A05PfsGyjAJZJAP2u4qbqaUJUObMJkETbPeBcVecky0="
 
 
 def normalize_ed25519_signature(sig_bytes: bytes) -> bytes:
