@@ -66,6 +66,12 @@ class ScanCache:
                 raise sqlite3.OperationalError("SQLite sidecar files are not writable")
             self._init_connection()
             self._check_invalidation()
+            if sys.platform != "win32" and self._db_path != ":memory:":
+                try:
+                    if os.path.exists(self._db_path):
+                        os.chmod(self._db_path, 0o666)
+                except OSError:
+                    pass
         except sqlite3.OperationalError as exc:
             if "readonly" not in str(exc).lower() and "writable" not in str(exc).lower():
                 raise

@@ -355,6 +355,7 @@ _LINUX_IDENTITY_FILES = (
     "device_fingerprint.json",
     "asset_info.json",
     "dashboard_cache.dat",
+    "scan_cache.db",
 )
 
 
@@ -395,28 +396,58 @@ def _secure_state_dir(base_dir):
         if explicit:
             return explicit
 
+        system_parent = "/var/lib/zerowatch"
         system_dir = "/var/lib/zerowatch/state"
         xdg_data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
         user_dir   = os.path.join(xdg_data_home, "zerowatch", "state")
-        # /tmp fallback matches sentinel_agent_linux.py's last-resort so both
-        # GUI and daemon resolve to the same path when neither system_dir nor
-        # user_dir is writable.
+        var_tmp_dir = "/var/tmp/zerowatch/state"
         local_dir  = "/tmp/zerowatch/state"
 
         # ── Try system dir first (preferred — consistent across UIDs) ──────
         try:
             os.makedirs(system_dir, mode=0o777, exist_ok=True)
-            os.chmod(system_dir, 0o777)
+            try:
+                os.chmod(system_parent, 0o777)
+                os.chmod(system_dir, 0o777)
+            except OSError:
+                pass
             _probe = os.path.join(system_dir, ".write_probe")
             with open(_probe, "w") as _fh:
                 _fh.write("x")
             os.remove(_probe)
+
+            # Privileged repair: ensure all existing files in system dir are world-writable (0666)
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                for entry in os.listdir(system_dir):
+                    fpath = os.path.join(system_dir, entry)
+                    if os.path.isfile(fpath):
+                        try:
+                            os.chmod(fpath, 0o666)
+                        except OSError:
+                            pass
+
+                # If launched via sudo, import any state from the calling user's directory
+                sudo_user = os.environ.get("SUDO_USER")
+                if sudo_user:
+                    sudo_user_dir = os.path.expanduser(f"~{sudo_user}/.local/share/zerowatch/state")
+                    if os.path.isdir(sudo_user_dir):
+                        for name in _LINUX_IDENTITY_FILES:
+                            src = os.path.join(sudo_user_dir, name)
+                            dst = os.path.join(system_dir, name)
+                            if os.path.isfile(src) and not os.path.exists(dst):
+                                try:
+                                    import shutil as _shutil
+                                    _shutil.copy2(src, dst)
+                                    os.chmod(dst, 0o666)
+                                except OSError:
+                                    pass
+
             return system_dir                          # writable → use it
         except OSError:
             pass  # root-owned or missing; fall through to user-dir
 
         # ── System dir not writable. Find the first user-writable fallback ─
-        for fallback in (user_dir, local_dir):
+        for fallback in (var_tmp_dir, user_dir, local_dir):
             try:
                 os.makedirs(fallback, mode=0o777, exist_ok=True)
                 os.chmod(fallback, 0o777)
@@ -470,8 +501,8 @@ def _state_path(base_dir, filename):
 
 
 def _make_macos_shared_file(path):
-    """Allow the root LaunchDaemon and console user to share state files."""
-    if sys.platform == "darwin":
+    """Allow the root LaunchDaemon/daemon and console user to share state files on Linux and macOS."""
+    if sys.platform != "win32":
         try:
             os.chmod(path, 0o666)
         except OSError:

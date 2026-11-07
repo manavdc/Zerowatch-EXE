@@ -191,3 +191,26 @@ class TestLinuxPersistenceManager:
                  patch("linux.persistence.startup_manager._USER_UNIT_DIR_TEMPLATE", "/nonexistent"):
 
                 assert manager.is_persistence_active() is True
+
+    def test_scanner_orchestrator_state_dir_linux_var_preference(self):
+        """ScanOrchestrator must resolve to /var/lib/zerowatch/state on Linux, NOT CWD ZeroWatch/state."""
+        from scanner.orchestrator import ScanOrchestrator
+
+        with tempfile.TemporaryDirectory() as tmp_var:
+            var_state = os.path.join(tmp_var, "zerowatch", "state")
+            os.makedirs(var_state, exist_ok=True)
+
+            orch = MagicMock()
+            orch._base_dir = "/home/user/SentinelAgent"
+
+            with patch("sys.platform", "linux"), \
+                 patch.dict("os.environ", {}, clear=True), \
+                 patch("scanner.orchestrator.os.makedirs") as mock_mkdirs, \
+                 patch("builtins.open") as mock_open, \
+                 patch("scanner.orchestrator.os.remove") as mock_remove:
+
+                # Force first candidate to succeed
+                resolved = ScanOrchestrator._state_dir(orch)
+                assert resolved == "/var/lib/zerowatch/state"
+                assert not resolved.startswith("ZeroWatch")
+
