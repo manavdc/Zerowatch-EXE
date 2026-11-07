@@ -33,7 +33,7 @@ _LAST_PIN_FAILURE_TIME = 0.0
 # Base64-encoded raw Ed25519 public key (32 bytes) used to verify the
 # cryptographic signature on release-manifest.json before any OTA binary
 # is downloaded or staged.
-OTA_ED25519_PUBLIC_KEY_B64 = "A05PfsGyjAJZJAP2u4qbqaUJUObMJkETbPeBcVecky0="
+OTA_ED25519_PUBLIC_KEY_B64 = "3hfDBxdsbVK9M+QGIeYtH0tnJjxA64ITQZkN34mykIY="
 
 __all__ = [
     "PinError",
