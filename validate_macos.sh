@@ -54,7 +54,7 @@ if [ "$EUID" -ne 0 ]; then
     fi
 fi
 
-# Ensure script is executed from Endpoint-Agent directory
+# Ensure script is executed from Zerowatch-EXE directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 cd "$SCRIPT_DIR"
 

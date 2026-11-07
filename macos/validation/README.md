@@ -5,9 +5,9 @@ This validation harness is designed for remote QA / native validation on macOS h
 ## Instructions for Friend / Tester
 
 1. **Open Terminal** on your Mac.
-2. Navigate to the `Endpoint-Agent` directory:
+2. Navigate to the `Zerowatch-EXE` directory:
    ```bash
-   cd Endpoint-Agent
+   cd Zerowatch-EXE
    ```
 3. Make the launcher script executable and run it with `sudo`:
    ```bash
