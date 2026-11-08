@@ -815,11 +815,44 @@ class UpdateChecker:
         Returns UpdateInfo if a newer version is available.
         Raises UpdateNotAvailable if current version is already up-to-date.
         """
-        logger.info("[OTA] Fetching manifest from GitHub Releases CDN...")
+        logger.info("[OTA] Fetching manifest from GitHub Releases...")
 
         # 1. Fetch raw manifest bytes and signature
-        manifest_bytes = self._fetch_raw(MANIFEST_URL)
-        sig_bytes      = self._fetch_raw(MANIFEST_SIG_URL)
+        manifest_bytes = None
+        sig_bytes = None
+        asset_api_urls: dict[str, str] = {}
+
+        # First attempt: GitHub REST API (bypasses 504 CDN gateway timeouts)
+        try:
+            api_resp = self._session.get(
+                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                headers={"User-Agent": "SentinelAgent-OTA", "Accept": "application/vnd.github.v3+json"},
+                timeout=10,
+            )
+            if api_resp.status_code == 200:
+                rel_data = api_resp.json()
+                for asset in rel_data.get("assets", []):
+                    name = asset.get("name")
+                    url = asset.get("url")
+                    if name and url:
+                        asset_api_urls[name] = url
+
+                if "release-manifest.json" in asset_api_urls and "release-manifest.json.sig" in asset_api_urls:
+                    manifest_bytes = self._fetch_raw(
+                        asset_api_urls["release-manifest.json"],
+                        headers={"Accept": "application/octet-stream", "User-Agent": "SentinelAgent-OTA"}
+                    )
+                    sig_bytes = self._fetch_raw(
+                        asset_api_urls["release-manifest.json.sig"],
+                        headers={"Accept": "application/octet-stream", "User-Agent": "SentinelAgent-OTA"}
+                    )
+        except Exception as api_err:
+            logger.debug("[OTA] GitHub API release check failed (%s); trying direct CDN download", api_err)
+
+        # Fallback to direct CDN download if API was not used or failed
+        if manifest_bytes is None or sig_bytes is None:
+            manifest_bytes = self._fetch_raw(MANIFEST_URL)
+            sig_bytes      = self._fetch_raw(MANIFEST_SIG_URL)
 
         # 2. ROOT layer — Ed25519 signature over entire manifest JSON
         _TUFLayers.verify_root(manifest_bytes, sig_bytes)
@@ -872,7 +905,11 @@ class UpdateChecker:
             )
 
         filename = entry["filename"]
-        asset_url = f"https://github.com/{GITHUB_REPO}/releases/latest/download/{filename}"
+        # Use direct API asset download URL if available, otherwise direct download URL
+        asset_url = asset_api_urls.get(
+            filename,
+            f"https://github.com/{GITHUB_REPO}/releases/latest/download/{filename}"
+        )
 
         target = TargetInfo(
             filename    = filename,
@@ -897,10 +934,13 @@ class UpdateChecker:
             target       = target,
         )
 
-    def _fetch_raw(self, url: str) -> bytes:
+    def _fetch_raw(self, url: str, headers: Optional[dict] = None) -> bytes:
         """Download a small file (manifest/sig) and return its raw bytes."""
         try:
-            resp = self._session.get(url, timeout=_HTTP_TIMEOUT)
+            req_headers = {"User-Agent": "SentinelAgent-OTA"}
+            if headers:
+                req_headers.update(headers)
+            resp = self._session.get(url, headers=req_headers, timeout=_HTTP_TIMEOUT)
             resp.raise_for_status()
             return resp.content
         except requests.HTTPError as exc:
@@ -982,7 +1022,10 @@ class BinaryDownloader:
         try:
             with open(tmp_path, "wb") as fh:
                 while bytes_done < total and retries <= max_retries:
-                    headers = {}
+                    headers = {
+                        "Accept": "application/octet-stream",
+                        "User-Agent": "SentinelAgent-OTA",
+                    }
                     if bytes_done > 0:
                         headers["Range"] = f"bytes={bytes_done}-"
 

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import threading
 from typing import Callable, Iterator, List, Optional
 

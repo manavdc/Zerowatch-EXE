@@ -280,18 +280,31 @@ except (ImportError, AttributeError):
     # This ensures the version badge and update check reflect the real release tag,
     # even when running directly from source (no CI build config present).
     def _fetch_github_release_version() -> str:
+        # First check local git tags if running from repo source
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["git", "describe", "--tags", "--abbrev=0"],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            if out:
+                return out.lstrip("v")
+        except Exception:
+            pass
+
         try:
             import urllib.request
             import json as _json
             url = "https://api.github.com/repos/jatinhendre/sentinel-agent-testing/releases/latest"
             req = urllib.request.Request(url, headers={"User-Agent": "SentinelAgent-init"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = _json.loads(resp.read().decode())
                 tag = data.get("tag_name", "")
                 # Strip leading "v": "v3" → "3", "v1.2.3" → "1.2.3"
-                return tag.lstrip("v") if tag else "0.0.0"
+                return tag.lstrip("v") if tag else "1.0.48"
         except Exception:
-            return "0.0.0"
+            return "1.0.48"
 
     AGENT_VERSION = _fetch_github_release_version()
 

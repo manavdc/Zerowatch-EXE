@@ -84,7 +84,7 @@ def is_valid_sha256_base64(pin: str) -> bool:
 
 
 # Base64-encoded raw Ed25519 public key (32 bytes) used as trust anchor for OTA updates
-OTA_ED25519_PUBLIC_KEY_B64 = "A05PfsGyjAJZJAP2u4qbqaUJUObMJkETbPeBcVecky0="
+OTA_ED25519_PUBLIC_KEY_B64 = "uJ7OJWcMDHdkshzP38SpOh57/pX7vqku80HC8Yx7ZLk="
 
 # Dynamic in-memory SPKI pins received via verified Ed25519 OTA updates
 _DYNAMIC_PINS_CACHE: dict[str, list[str]] = {}
