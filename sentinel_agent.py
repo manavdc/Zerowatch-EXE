@@ -275,7 +275,9 @@ try:
     # Use dynamic import to prevent IDE/linter warnings for the auto-generated config file
     _build_config = __import__("agent_build_config")
     AGENT_VERSION = getattr(_build_config, "FORCED_AGENT_VERSION")
-except (ImportError, AttributeError):
+    if not AGENT_VERSION or AGENT_VERSION == "0.0.0":
+        raise ValueError("FORCED_AGENT_VERSION unset or 0.0.0 fallback")
+except (ImportError, AttributeError, ValueError):
     # Fallback: fetch the current release version from GitHub at runtime.
     # This ensures the version badge and update check reflect the real release tag,
     # even when running directly from source (no CI build config present).

@@ -55,12 +55,28 @@ jobs:
 
       - name: Write build-time server config (production)
         shell: python
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          import os, re
+          import os, re, subprocess
           ref = os.environ.get("GITHUB_REF_NAME", "")
+          input_ver = os.environ.get("INPUT_VERSION", "")
           api_url = (os.environ.get("ZEROWATCH_API_URL") or "").strip() or "https://zerowatch.deepcytes.io/api"
-          # Strip leading "v" — "v3" → "3", "v1.2.2" → "1.2.2"; fallback to "0.0.0"
-          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+", ref) else "0.0.0"
+          version = ""
+          if re.match(r"^v?\d+(\.\d+)*", ref):
+              version = re.sub(r"^v", "", ref)
+          elif input_ver and re.match(r"^v?\d+(\.\d+)*", input_ver):
+              version = re.sub(r"^v", "", input_ver)
+          if not version or version == "0.0.0":
+              try:
+                  out = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"], stderr=subprocess.DEVNULL).decode().strip()
+                  if out:
+                      version = re.sub(r"^v", "", out)
+              except Exception:
+                  pass
+          if not version or version == "0.0.0":
+              version = "1.0.48"
+
           with open("agent_build_config.py", "w") as f:
               f.write(f'FORCED_BASE_API_URL = "{api_url}"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
@@ -140,12 +156,28 @@ jobs:
 
       - name: Write build-time server config (production)
         shell: python
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          import os, re
+          import os, re, subprocess
           ref = os.environ.get("GITHUB_REF_NAME", "")
+          input_ver = os.environ.get("INPUT_VERSION", "")
           api_url = (os.environ.get("ZEROWATCH_API_URL") or "").strip() or "https://zerowatch.deepcytes.io/api"
-          # Strip leading "v" — "v3" → "3", "v1.2.2" → "1.2.2"; fallback to "0.0.0"
-          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+", ref) else "0.0.0"
+          version = ""
+          if re.match(r"^v?\d+(\.\d+)*", ref):
+              version = re.sub(r"^v", "", ref)
+          elif input_ver and re.match(r"^v?\d+(\.\d+)*", input_ver):
+              version = re.sub(r"^v", "", input_ver)
+          if not version or version == "0.0.0":
+              try:
+                  out = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"], stderr=subprocess.DEVNULL).decode().strip()
+                  if out:
+                      version = re.sub(r"^v", "", out)
+              except Exception:
+                  pass
+          if not version or version == "0.0.0":
+              version = "1.0.48"
+
           with open("agent_build_config.py", "w") as f:
               f.write(f'FORCED_BASE_API_URL = "{api_url}"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
@@ -222,12 +254,28 @@ jobs:
 
       - name: Write build-time server config (production)
         shell: python
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          import os, re
+          import os, re, subprocess
           ref = os.environ.get("GITHUB_REF_NAME", "")
+          input_ver = os.environ.get("INPUT_VERSION", "")
           api_url = (os.environ.get("ZEROWATCH_API_URL") or "").strip() or "https://zerowatch.deepcytes.io/api"
-          # Strip leading "v" — "v3" → "3", "v1.2.2" → "1.2.2"; fallback to "0.0.0"
-          version = re.sub(r"^v", "", ref) if re.match(r"^v\d+", ref) else "0.0.0"
+          version = ""
+          if re.match(r"^v?\d+(\.\d+)*", ref):
+              version = re.sub(r"^v", "", ref)
+          elif input_ver and re.match(r"^v?\d+(\.\d+)*", input_ver):
+              version = re.sub(r"^v", "", input_ver)
+          if not version or version == "0.0.0":
+              try:
+                  out = subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"], stderr=subprocess.DEVNULL).decode().strip()
+                  if out:
+                      version = re.sub(r"^v", "", out)
+              except Exception:
+                  pass
+          if not version or version == "0.0.0":
+              version = "1.0.48"
+
           with open("agent_build_config.py", "w") as f:
               f.write(f'FORCED_BASE_API_URL = "{api_url}"\n')
               f.write(f'FORCED_AGENT_VERSION = "{version}"\n')
