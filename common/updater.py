@@ -904,6 +904,9 @@ class UpdateChecker:
             resp.raise_for_status()
             return resp.content
         except requests.HTTPError as exc:
+            status_code = getattr(exc.response, "status_code", 0)
+            if status_code in (502, 503, 504):
+                raise OTAError(f"GitHub CDN is temporarily unavailable (HTTP {status_code} Gateway Timeout). Please retry shortly.") from exc
             raise OTAError(f"HTTP error fetching {url}: {exc}") from exc
         except requests.RequestException as exc:
             raise OTAError(f"Network error fetching {url}: {exc}") from exc

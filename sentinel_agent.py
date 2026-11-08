@@ -8362,10 +8362,17 @@ class DashboardFrame(tk.Frame):
                         fg=self.c_orange
                     ))
                 except _ota_updater.OTAError as exc:
-                    self.after(0, lambda e=exc: banner_lbl.config(
-                        text=f"✗ Update check failed: {e}",
-                        fg=self.c_red
-                    ))
+                    err_str = str(exc)
+                    if any(c in err_str for c in ("502", "503", "504", "Gateway Timeout", "temporarily unavailable")):
+                        self.after(0, lambda: banner_lbl.config(
+                            text="⚠ GitHub CDN is temporarily busy (504 Gateway Timeout). Please retry in a moment.",
+                            fg=self.c_orange
+                        ))
+                    else:
+                        self.after(0, lambda e=exc: banner_lbl.config(
+                            text=f"✗ Update check failed: {e}",
+                            fg=self.c_red
+                        ))
                 except Exception as exc:
                     self.after(0, lambda e=exc: banner_lbl.config(
                         text=f"✗ Network error: {e}",
