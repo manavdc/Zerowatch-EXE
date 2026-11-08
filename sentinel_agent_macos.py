@@ -75,10 +75,10 @@ from common.os_replacer import commit_macos_update
 # AGENT CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-AGENT_VERSION      = "1.0.0-macos"
+AGENT_VERSION      = "1.0.48-macos"
 HEARTBEAT_INTERVAL = 30    # seconds between heartbeats
 MONITOR_INTERVAL   = 120   # seconds between delta scan checks
-RESTART_CHECK_TIME = 14400  # 4 hours in seconds (OTA update & restart check interval)
+RESTART_CHECK_TIME = 240  # 4 minutes in seconds (OTA update & restart check interval)
 RECONNECT_DELAY    = 10    # seconds before reconnect attempt
 
 # Build-time server URL injection (written by run_agent.sh)

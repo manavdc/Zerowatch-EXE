@@ -65,7 +65,7 @@ from common.state_cleanup import clear_device_state
 AGENT_VERSION = "1.0.0-linux"
 HEARTBEAT_INTERVAL = 30        # seconds between heartbeats
 MONITOR_INTERVAL   = 120       # seconds between delta scan checks
-RESTART_CHECK_TIME = 14400  # 4 hours in seconds (OTA update & restart check interval)
+RESTART_CHECK_TIME = 240  # 4 minutes in seconds (OTA update & restart check interval)
 RECONNECT_DELAY    = 10        # seconds before reconnect attempt
 
 # Build-time server URL injection (written by run_agent.sh)
@@ -953,7 +953,8 @@ class LinuxAgent:
         return False
 
     def _sync_full(self, software: list, hardware: dict | None = None,
-                   inventory_scope: str = "complete") -> int:
+                   inventory_scope: str = "complete",
+                   batch_index: int = 1, batch_count: int = 1) -> int:
         """Push full software inventory and hardware profile to backend."""
         if hardware is None:
             try:
@@ -970,6 +971,8 @@ class LinuxAgent:
             "hardware":  hardware,
             "inventoryScope": inventory_scope,
             "inventoryRevision": time.time_ns(),
+            "batch_index": batch_index,
+            "batch_count": batch_count,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         try:
@@ -983,32 +986,26 @@ class LinuxAgent:
             logger.warning("Full sync error: %s", exc)
             return 0
 
-    def _sync_complete_inventory(self, software_list: list, hardware: dict | None = None) -> bool:
-        """Sync complete inventory, proactively chunking large payloads.
+    def _sync_complete_inventory(self, software_list: list, hardware: dict | None = None,
+                                 inventory_scope: str = "complete") -> bool:
+        """Sync complete inventory, falling back to chunked delivery only on HTTP 413.
 
-        Cloudflare and similar WAF/proxy layers silently kill SSL connections
-        for oversized request bodies (returning SSLEOFError, status 0).  To
-        avoid this, inventories with >= 400 items are chunked proactively
-        without attempting the full payload first.  Smaller inventories still
-        try a single request and only fall back to chunking on 413 or
-        connection errors.
+        Attempts a single sync_full request first (fastest and atomic).
+        Only falls back to chunking if the backend or proxy returns HTTP 413
+        (Payload Too Large) or connection drops.
         """
         items = list(software_list or [])
         if not items:
             return False
 
-        # For small inventories, try sending everything in one request.
-        if len(items) < 400:
-            status_code = self._sync_full(items, hardware, inventory_scope="complete")
-            if status_code in (200, 201, 204):
-                return True
-            # Only fall back to chunking on 413 or connection-level failures
-            # (status 0 = exception before any HTTP response, e.g. SSLEOFError).
-            if status_code not in (413, 0):
-                return False
-            logger.info("[SYNC] Full sync returned %d; falling back to chunked delivery.", status_code)
-        else:
-            logger.info("[SYNC] Large inventory (%d items); proactively chunking to avoid proxy drops.", len(items))
+        # Attempt atomic single-request upload first
+        status_code = self._sync_full(items, hardware, inventory_scope=inventory_scope)
+        if status_code in (200, 201, 204):
+            return True
+        if status_code not in (413, 0):
+            return False
+
+        logger.info("[SYNC] Full sync returned %d; falling back to chunked delivery.", status_code)
 
         batches = []
         current = []
@@ -1023,19 +1020,28 @@ class LinuxAgent:
         if current:
             batches.append(current)
 
-        logger.info("[SYNC] Chunking inventory (%d items) into %d requests.", len(items), len(batches))
-        first_status = self._sync_full(batches[0], hardware, inventory_scope="complete")
+        batch_count = len(batches)
+        logger.info("[SYNC] Chunking inventory (%d items) into %d requests.", len(items), batch_count)
+        first_status = self._sync_full(
+            batches[0], hardware, inventory_scope=inventory_scope,
+            batch_index=1, batch_count=batch_count,
+        )
         if first_status not in (200, 201, 204):
             return False
 
         for index, batch in enumerate(batches[1:], start=2):
-            if not self._sync_delta(batch, []):
-                logger.warning("[SYNC] Inventory chunk %d/%d failed.", index, len(batches))
+            if not self._sync_delta(
+                batch, [], inventory_scope=inventory_scope,
+                batch_index=index, batch_count=batch_count,
+            ):
+                logger.warning("[SYNC] Inventory chunk %d/%d failed.", index, batch_count)
                 return False
         logger.info("[SYNC] Chunked inventory sync finished: %d items delivered.", len(items))
         return True
 
-    def _sync_delta(self, added: list, removed: list) -> bool:
+    def _sync_delta(self, added: list, removed: list,
+                    inventory_scope: str = "delta",
+                    batch_index: int = 1, batch_count: int = 1) -> bool:
         """Push incremental delta to backend."""
         if not added and not removed:
             return True
@@ -1043,6 +1049,9 @@ class LinuxAgent:
             "deviceId": self._device_id,
             "added":    added,
             "removed":  removed,
+            "inventoryScope": inventory_scope,
+            "batch_index": batch_index,
+            "batch_count": batch_count,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         try:
@@ -1090,7 +1099,7 @@ class LinuxAgent:
         for attempt in range(3):
             if self._shutdown_event.is_set():
                 return False
-            if self._sync_complete_inventory(software, hardware):
+            if self._sync_complete_inventory(software, hardware, inventory_scope=inventory_scope):
                 return True
             logger.warning("Full sync attempt %d/3 failed. Retrying in 15s...", attempt + 1)
             self._shutdown_event.wait(timeout=15)
@@ -1098,65 +1107,14 @@ class LinuxAgent:
         return False
 
     def _initial_scan_and_sync(self, approval_sync_claimed: bool = False) -> None:
-        """Run a startup-optimized L0 + priority-path L1/L2 scan.
-
-        Strategy:
-          1. Run run_startup_scan() which does:
-             - L0 (package managers) synchronously (<1s)
-             - L1/L2 on priority paths only, parallelized with 6 workers
-          2. 90-second safety timeout as a defensive backstop.
-          3. If the priority scan exceeds the timeout or errors out,
-             fall back to L0-only sync so the device goes Active immediately.
-             The periodic deep scan will fill in the rest.
-
-        The full-disk exhaustive walk is NOT run at startup. It runs on the
-        existing 24h cadence via start_periodic_scans().
-
-        approval_sync_claimed: if True this invocation owns the approval-sync slot
-            and must call _finish_approval_sync() when the upload completes.
+        """Run two-stage post-enrollment scan:
+        1. Immediate Layer 0 baseline (package managers: dpkg/rpm/pacman/snap/flatpak)
+           published to backend immediately within ~10 seconds of joining.
+        2. Background Layer 1 + 2 startup scan (priority filesystem, ELF, manifests)
+           published to backend as complete inventory within ~1 minute of joining.
         """
-        _SAFETY_TIMEOUT = 90  # seconds — backstop for pathological disks
-
-        startup_items: list = []
-        scan_done = threading.Event()
-        self._initial_scan_done = scan_done
-        scan_error: list = []
-
-        logger.info(
-            "[STARTUP_SCAN_STARTED] Linux initial scan started "
-            "(timeout=%ds, device_id=%s, approval_claimed=%s).",
-            _SAFETY_TIMEOUT, self._device_id, approval_sync_claimed,
-        )
-
-        def _run_startup():
-            try:
-                logger.info(
-                    "[STARTUP_SCAN] L0 + priority-path L1/L2 scan started "
-                    "(device_id=%s).", self._device_id,
-                )
-                result = self._orchestrator.run_startup_scan(
-                    stop_event=self._shutdown_event,
-                )
-                startup_items.extend(result)
-                logger.info(
-                    "[STARTUP_SCAN] Priority scan finished: %d items (device_id=%s).",
-                    len(startup_items), self._device_id,
-                )
-            except Exception as exc:
-                scan_error.append(exc)
-                logger.error(
-                    "[STARTUP_SCAN] Scan error (device_id=%s): %s",
-                    self._device_id, exc, exc_info=True,
-                )
-            finally:
-                scan_done.set()
-
-        scan_thread = threading.Thread(
-            target=_run_startup, daemon=True, name="initial-startup-scan",
-        )
-        scan_thread.start()
-
-        completed_in_time = scan_done.wait(timeout=_SAFETY_TIMEOUT)
+        if not hasattr(self, "_initial_scan_done"):
+            self._initial_scan_done = threading.Event()
 
         # Collect full hardware profile
         try:
@@ -1165,46 +1123,19 @@ class LinuxAgent:
             logger.warning("Hardware collection failed: %s", hw_exc)
             hardware = {}
 
-        if completed_in_time and not scan_error:
-            logger.info(
-                "[STARTUP_SCAN] Completed within %ds — "
-                "syncing %d items in one shot (device_id=%s).",
-                _SAFETY_TIMEOUT, len(startup_items), self._device_id,
-            )
-            logger.info("[INVENTORY_UPLOAD_STARTED] device_id=%s items=%d", self._device_id, len(startup_items))
-            ok = self._sync_full_with_retry(startup_items, hardware, "complete")
-            logger.info("[INVENTORY_UPLOAD_COMPLETED] device_id=%s success=%s", self._device_id, ok)
-            if approval_sync_claimed:
-                self._finish_approval_sync(ok)
-                logger.info("[FULL_SYNC_COMPLETED] device_id=%s", self._device_id)
-            return
-
-        # ── Safety timeout path: fall back to L0-only sync ───────────────────
-        if not completed_in_time:
-            logger.warning(
-                "[STARTUP_SCAN] Priority scan exceeded %ds safety timeout — "
-                "falling back to L0-only immediate sync. "
-                "L1/L2 results will arrive via periodic deep scan.",
-                _SAFETY_TIMEOUT,
-            )
-        else:
-            logger.warning(
-                "[STARTUP_SCAN] Scan encountered an error (%s) — "
-                "falling back to L0-only sync.",
-                scan_error[0],
-            )
-
+        # ── Stage 1: Fast Immediate Layer 0 Baseline Sync (<1s collection, immediate send) ──
+        raw_items = []
         try:
             raw_items = self._platform.software_collector.collect_software()
-            items = []
+            l0_items = []
             for item in raw_items:
                 try:
                     if hasattr(item, "to_api_dict"):
-                        items.append(item.to_api_dict())
+                        l0_items.append(item.to_api_dict())
                     elif isinstance(item, dict):
-                        items.append(item)
+                        l0_items.append(item)
                     else:
-                        items.append({
+                        l0_items.append({
                             "name":     getattr(item, "name", ""),
                             "version":  getattr(item, "version", ""),
                             "vendor":   getattr(item, "vendor", ""),
@@ -1214,8 +1145,15 @@ class LinuxAgent:
                 except Exception:
                     pass
 
-            logger.info("Fallback L0 scan: %d items — syncing now.", len(items))
-            self._sync_full_with_retry(items, hardware, "partial")
+            logger.info(
+                "[STARTUP_SCAN] Publishing initial Layer 0 baseline (%d items, device_id=%s)...",
+                len(l0_items), self._device_id,
+            )
+            l0_ok = self._sync_full_with_retry(l0_items, hardware, inventory_scope="partial")
+            logger.info(
+                "[STARTUP_SCAN] Initial Layer 0 baseline synced to backend: %s (%d items).",
+                l0_ok, len(l0_items),
+            )
 
             # Seed orchestrator snapshot so subsequent deltas are accurate
             try:
@@ -1224,13 +1162,57 @@ class LinuxAgent:
                         if hasattr(item, "dedup_key"):
                             self._orchestrator._last_snapshot[item.dedup_key()] = item
             except Exception as seed_exc:
-                logger.debug("Snapshot seed skipped (non-fatal): %s", seed_exc)
+                logger.debug("Snapshot seed skipped: %s", seed_exc)
+        except Exception as l0_exc:
+            logger.error("[STARTUP_SCAN] Immediate Layer 0 baseline failed: %s", l0_exc, exc_info=True)
 
-            if approval_sync_claimed:
-                self._finish_approval_sync(False)
+        # ── Stage 2: Background Layer 1 + 2 Priority Startup Scan ──────────
+        def _run_deep_startup():
+            started = time.perf_counter()
+            logger.info(
+                "[STARTUP_SCAN] Background priority L1/L2 scan started "
+                "(device_id=%s, approval_claimed=%s).",
+                self._device_id, approval_sync_claimed,
+            )
+            sync_ok = False
+            try:
+                startup_items = self._orchestrator.run_startup_scan(
+                    stop_event=self._shutdown_event,
+                )
+                if startup_items and self._session._jwt:
+                    logger.info(
+                        "[INVENTORY_UPLOAD_STARTED] device_id=%s items=%d",
+                        self._device_id, len(startup_items),
+                    )
+                    sync_ok = self._sync_full_with_retry(startup_items, hardware, inventory_scope="complete")
+                    logger.info(
+                        "[STARTUP_SCAN] Complete inventory synced: %d items in %.1fs (device_id=%s, success=%s).",
+                        len(startup_items), time.perf_counter() - started, self._device_id, sync_ok,
+                    )
+                    if approval_sync_claimed:
+                        self._finish_approval_sync(sync_ok)
+                        logger.info("[FULL_SYNC_COMPLETED] device_id=%s", self._device_id)
+            except Exception as exc:
+                logger.error(
+                    "[STARTUP_SCAN] Background deep scan error (device_id=%s): %s",
+                    self._device_id, exc, exc_info=True,
+                )
+                if approval_sync_claimed:
+                    self._finish_approval_sync(False)
+            finally:
+                self._initial_scan_done.set()
+                if self._session._jwt and not self._shutdown_event.is_set():
+                    try:
+                        self._orchestrator.start_periodic_scans(on_delta=self._on_fs_delta)
+                        logger.info("Periodic filesystem scans started after initial deep scan.")
+                    except Exception as p_exc:
+                        logger.warning("Failed to start periodic filesystem scans: %s", p_exc)
 
-        except Exception as exc:
-            logger.error("Fallback L0 scan failed: %s", exc, exc_info=True)
+        scan_thread = threading.Thread(
+            target=_run_deep_startup, daemon=True, name="initial-startup-scan",
+        )
+        scan_thread.start()
+        logger.info("[STARTUP_SCAN] Background priority scan queued immediately after Layer 0 baseline.")
 
     def _on_fs_delta(self, added_items: list, removed_items: list) -> None:
         """

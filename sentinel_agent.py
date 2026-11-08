@@ -283,7 +283,7 @@ except (ImportError, AttributeError):
         try:
             import urllib.request
             import json as _json
-            url = "https://api.github.com/repos/manavdc/Zerowatch-EXE/releases/latest"
+            url = "https://api.github.com/repos/jatinhendre/sentinel-agent-testing/releases/latest"
             req = urllib.request.Request(url, headers={"User-Agent": "SentinelAgent-init"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = _json.loads(resp.read().decode())
@@ -305,7 +305,7 @@ WATCHDOG_MUTEX_NAME = "Global\\SentinelAgent_Watchdog_4F9A2E1B"
 PROMPT_MUTEX_NAME = "Global\\SentinelAgent_Prompt_4F9A2E1B"  # Prevents multiple password prompts
 HEARTBEAT_INTERVAL = 30  # Reduced from 60 to lower CPU
 MONITOR_INTERVAL = 60     # Reduced from 30 to lower CPU
-RESTART_CHECK_TIME = 14400  # 4 hours in seconds (OTA update & restart check interval)
+RESTART_CHECK_TIME = 240  # 4 minutes in seconds (OTA update & restart check interval)
 OFFLINE_FLUSH_MIN_INTERVAL = 15
 OFFLINE_FLUSH_MAX_INTERVAL = 300
 USERNAME_MAX_LENGTH = 20
@@ -2295,7 +2295,7 @@ class ZeroWatchClient:
     # ----------------------------------------------------------------
     # SYNC
     # ----------------------------------------------------------------
-    def sync_full(self, software_list, hardware_info=None, inventory_scope="complete"):
+    def sync_full(self, software_list, hardware_info=None, inventory_scope="complete", batch_index=1, batch_count=1):
         if not self.jwt: return False
         if not hardware_info:
             try:
@@ -2313,6 +2313,8 @@ class ZeroWatchClient:
             "hardware": hardware_info,
             "inventoryScope": inventory_scope,
             "inventoryRevision": time.time_ns(),
+            "batch_index": batch_index,
+            "batch_count": batch_count,
         }
         try:
             formatted_software = []
@@ -2459,17 +2461,18 @@ class ZeroWatchClient:
         if current:
             batches.append(current)
 
-        logging.info("[SYNC] Chunking oversized complete inventory into %d requests.", len(batches))
-        if not self.sync_full(batches[0], hardware_info, inventory_scope="partial"):
+        batch_count = len(batches)
+        logging.info("[SYNC] Chunking oversized complete inventory into %d requests.", batch_count)
+        if not self.sync_full(batches[0], hardware_info, inventory_scope="complete", batch_index=1, batch_count=batch_count):
             return False
         for index, batch in enumerate(batches[1:], start=2):
-            if not self.sync_delta(batch, []):
-                logging.warning("[SYNC] Inventory chunk %d/%d failed.", index, len(batches))
+            if not self.sync_delta(batch, [], inventory_scope="complete", batch_index=index, batch_count=batch_count):
+                logging.warning("[SYNC] Inventory chunk %d/%d failed.", index, batch_count)
                 return False
         logging.info("[SYNC] Chunked complete inventory sync finished: %d items.", len(items))
         return True
 
-    def sync_delta(self, added, removed, added_hw=None, removed_hw=None, hardware_snapshot=None):
+    def sync_delta(self, added, removed, added_hw=None, removed_hw=None, hardware_snapshot=None, inventory_scope="delta", batch_index=1, batch_count=1):
         if not self.jwt: return False
 
         def _to_dict(it):
@@ -2483,9 +2486,13 @@ class ZeroWatchClient:
 
         payload = {
             "device_id": self.device_id,
+            "deviceId": self.device_id,
             "username": self.operator_username,
             "added": added_dicts,
-            "removed": removed_dicts
+            "removed": removed_dicts,
+            "inventoryScope": inventory_scope,
+            "batch_index": batch_index,
+            "batch_count": batch_count,
         }
         try:
             if added_hw:
