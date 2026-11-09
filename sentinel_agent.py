@@ -5225,6 +5225,10 @@ def _wait_for_enrollment(zw_client, base_dir):
     if zw_client.has_pending_join() or zw_client.join_state_tampered:
         refresh = zw_client.refresh_join_status_once()
         if refresh.get("status") == "approved":
+            if not zw_client.jwt and refresh.get("jwt"):
+                zw_client._save_jwt(refresh.get("jwt"))
+            if not zw_client.jwt:
+                zw_client.jwt = zw_client._load_jwt()
             if not zw_client.jwt:
                 logging.warning(
                     "Pending join approved but no shared JWT is available yet; "
@@ -5233,6 +5237,7 @@ def _wait_for_enrollment(zw_client, base_dir):
                 return False
             logging.info("Pending join request approved after refresh; enrollment completed.")
             join_state_needs_verification = False
+            return True
         elif refresh.get("status") == "denied":
             logging.info("Pending join request denied; resetting to first-run enrollment state.")
             zw_client.clear_join_state()
@@ -5259,9 +5264,14 @@ def _wait_for_enrollment(zw_client, base_dir):
             if zw_client.has_pending_join() or zw_client.join_state_tampered:
                 refresh = zw_client.refresh_join_status_once()
                 if refresh.get("status") == "approved":
+                    if not zw_client.jwt and refresh.get("jwt"):
+                        zw_client._save_jwt(refresh.get("jwt"))
+                    if not zw_client.jwt:
+                        zw_client.jwt = zw_client._load_jwt()
                     if zw_client.jwt:
                         logging.info("Pending join approved while waiting; enrollment completed.")
                         join_state_needs_verification = False
+                        return True
                     else:
                         logging.warning(
                             "Pending join approved but JWT is not readable; retrying shared-state load."
@@ -6693,9 +6703,9 @@ def main_agent():
             # before the GUI's clear_local_state() tries to delete the db files.
             _orchestrator_closed_for_unlink = False
             shutdown_during_sleep = False
-            for _tick in range(15):  # 15 × 2 s = 30 s total base interval
-                time.sleep(2)
-                # Fast-path: check for an unlink signal written by the GUI
+            if not zw_client.jwt or zw_client.has_pending_join():
+                # Fast reaction: if unlinked or waiting for join approval, do NOT
+                # wait 30 seconds before reaching the enrollment polling handler.
                 if consume_unlink_signal(base_dir):
                     logging.info("[MAIN] Unlink signal received: closing orchestrator to release db locks.")
                     if _orchestrator is not None:
@@ -6704,18 +6714,39 @@ def main_agent():
                             _orchestrator.close()
                         except Exception as _ce:
                             logging.warning("[MAIN] Error closing orchestrator: %s", _ce)
-                    _orchestrator_closed_for_unlink = True
-                    break
-                # Also respect OTA update restart or shutdown signal mid-sleep
+                    _orchestrator = None
+                    zw_client.jwt = None
                 if ota_shutdown.is_set():
                     request_shutdown_signal(base_dir, "ota-restart")
-                    logging.info("[MAIN] OTA restart requested mid-sleep. Exiting heartbeat loop.")
+                    logging.info("[MAIN] OTA restart requested. Exiting heartbeat loop.")
                     shutdown_during_sleep = True
-                    break
-                if consume_shutdown_signal(base_dir):
-                    logging.info("[MAIN] Shutdown signal detected mid-sleep. Exiting.")
+                elif consume_shutdown_signal(base_dir):
+                    logging.info("[MAIN] Shutdown signal detected. Exiting.")
                     shutdown_during_sleep = True
-                    break
+            else:
+                for _tick in range(15):  # 15 × 2 s = 30 s total base interval
+                    time.sleep(2)
+                    # Fast-path: check for an unlink signal written by the GUI
+                    if consume_unlink_signal(base_dir):
+                        logging.info("[MAIN] Unlink signal received: closing orchestrator to release db locks.")
+                        if _orchestrator is not None:
+                            try:
+                                _orchestrator.stop_periodic_scans()
+                                _orchestrator.close()
+                            except Exception as _ce:
+                                logging.warning("[MAIN] Error closing orchestrator: %s", _ce)
+                        _orchestrator_closed_for_unlink = True
+                        break
+                    # Also respect OTA update restart or shutdown signal mid-sleep
+                    if ota_shutdown.is_set():
+                        request_shutdown_signal(base_dir, "ota-restart")
+                        logging.info("[MAIN] OTA restart requested mid-sleep. Exiting heartbeat loop.")
+                        shutdown_during_sleep = True
+                        break
+                    if consume_shutdown_signal(base_dir):
+                        logging.info("[MAIN] Shutdown signal detected mid-sleep. Exiting.")
+                        shutdown_during_sleep = True
+                        break
             if shutdown_during_sleep:
                 break
             if _orchestrator_closed_for_unlink:
@@ -6763,6 +6794,7 @@ def main_agent():
                     was_offline = False
                 else:
                     # Skip active heartbeat checks until token is available
+                    time.sleep(2)
                     continue
 
             # --- Connectivity-aware offline queue flush ---
