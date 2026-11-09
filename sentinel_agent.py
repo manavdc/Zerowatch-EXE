@@ -298,7 +298,7 @@ except (ImportError, AttributeError, ValueError):
         try:
             import urllib.request
             import json as _json
-            url = "https://api.github.com/repos/jatinhendre/sentinel-agent-testing/releases/latest"
+            url = "https://api.github.com/repos/manavdc/Zerowatch-EXE/releases/latest"
             req = urllib.request.Request(url, headers={"User-Agent": "SentinelAgent-init"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = _json.loads(resp.read().decode())
@@ -320,7 +320,7 @@ WATCHDOG_MUTEX_NAME = "Global\\SentinelAgent_Watchdog_4F9A2E1B"
 PROMPT_MUTEX_NAME = "Global\\SentinelAgent_Prompt_4F9A2E1B"  # Prevents multiple password prompts
 HEARTBEAT_INTERVAL = 30  # Reduced from 60 to lower CPU
 MONITOR_INTERVAL = 60     # Reduced from 30 to lower CPU
-RESTART_CHECK_TIME = 240  # 4 minutes in seconds (OTA update & restart check interval)
+RESTART_CHECK_TIME = 14400  # 4 hours in seconds (OTA update & restart check interval)
 OFFLINE_FLUSH_MIN_INTERVAL = 15
 OFFLINE_FLUSH_MAX_INTERVAL = 300
 USERNAME_MAX_LENGTH = 20
