@@ -175,7 +175,7 @@ if [[ -z "${RELEASE_VERSION}" ]]; then
     RELEASE_VERSION="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)"
 fi
 if [[ -z "${RELEASE_VERSION}" ]]; then
-    RELEASE_VERSION="$(${PYTHON} -c 'import json,urllib.request; r=urllib.request.Request("https://api.github.com/repos/jatinhendre/sentinel-agent-testing/releases/latest", headers={"User-Agent":"zerowatch-agent-launcher"}); print(json.loads(urllib.request.urlopen(r, timeout=8).read()).get("tag_name", "1.0.48").lstrip("v"))' 2>/dev/null || true)"
+    RELEASE_VERSION="$(${PYTHON} -c 'import json,urllib.request; r=urllib.request.Request("https://api.github.com/repos/manavdc/Zerowatch-EXE/releases/latest", headers={"User-Agent":"zerowatch-agent-launcher"}); print(json.loads(urllib.request.urlopen(r, timeout=8).read()).get("tag_name", "1.0.48").lstrip("v"))' 2>/dev/null || true)"
 fi
 if [[ -z "${RELEASE_VERSION}" ]]; then
     RELEASE_VERSION="1.0.48"
