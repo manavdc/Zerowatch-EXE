@@ -38,7 +38,8 @@ from common.crypto.interfaces import SecureStore
 logger = logging.getLogger("linux.crypto.secure_store")
 
 _VAULT_FILENAME = "agent.vault"
-_PBKDF2_ITERATIONS = 2_000  # Optimized for performance, machine-id input has 128-bit entropy
+_PBKDF2_ITERATIONS = 600_000   # OWASP recommended standard for PBKDF2-HMAC-SHA256
+_LEGACY_PBKDF2_ITERATIONS = 2_000
 _KEY_LEN = 32                  # 256-bit AES key
 _SALT_LEN = 16
 _NONCE_LEN = 12
@@ -46,11 +47,36 @@ _NONCE_LEN = 12
 
 # ── Key derivation ────────────────────────────────────────────────────────────
 
-def _derive_key(salt: bytes) -> bytes:
+def _get_or_create_vault_secret() -> bytes:
+    """Retrieve or generate a 256-bit installation secret stored with strict permissions (0600).
+    This ensures unprivileged users cannot derive the vault key from world-readable /etc/machine-id.
     """
-    Derive a 256-bit key from stable system properties via PBKDF2-HMAC-SHA256.
-    Uses /etc/machine-id + hostname as the password material — stable across
-    reboots but unique per machine.
+    secret_dir = "/etc/zerowatch" if (hasattr(os, "geteuid") and os.geteuid() == 0) else os.path.dirname(_vault_path())
+    secret_path = os.path.join(secret_dir, "vault.key")
+    try:
+        if os.path.exists(secret_path):
+            with open(secret_path, "rb") as fh:
+                secret = fh.read()
+            if len(secret) >= 32:
+                return secret[:32]
+        os.makedirs(secret_dir, mode=0o700, exist_ok=True)
+        new_secret = os.urandom(32)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        mode = 0o600
+        fd = os.open(secret_path, flags, mode)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(new_secret)
+        return new_secret
+    except Exception as exc:
+        logger.debug("Could not access or create vault secret file: %s", exc)
+        return b""
+
+
+def _derive_key(salt: bytes, iterations: int = _PBKDF2_ITERATIONS, use_secret: bool = True) -> bytes:
+    """
+    Derive a 256-bit key using PBKDF2-HMAC-SHA256.
+    Combines /etc/machine-id, hostname, and an installation-specific secret key
+    stored with root-only permissions (0600) to protect against unprivileged local derivation.
     """
     machine_id = ""
     for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
@@ -62,13 +88,14 @@ def _derive_key(salt: bytes) -> bytes:
             pass
 
     hostname = socket.gethostname() or "localhost"
-    password = f"{machine_id}:{hostname}:ZeroWatchAgent".encode("utf-8")
+    secret = _get_or_create_vault_secret().hex() if use_secret else ""
+    password = f"{machine_id}:{hostname}:{secret}:ZeroWatchAgent".encode("utf-8")
 
     return hashlib.pbkdf2_hmac(
         "sha256",
         password,
         salt,
-        _PBKDF2_ITERATIONS,
+        iterations,
         dklen=_KEY_LEN,
     )
 
@@ -162,7 +189,7 @@ def _vault_encrypt(data: bytes) -> Optional[bytes]:
 
 
 def _vault_decrypt(blob: bytes) -> Optional[bytes]:
-    """Decrypt vault-format blob."""
+    """Decrypt vault-format blob with automatic fallback for legacy iterations."""
     try:
         if not blob.startswith(_MAGIC):
             return None
@@ -171,8 +198,29 @@ def _vault_decrypt(blob: bytes) -> Optional[bytes]:
             return None
         salt = blob[:_SALT_LEN]
         payload = blob[_SALT_LEN:]
-        key = _derive_key(salt)
-        return _aes_gcm_decrypt(key, payload)
+
+        # 1. Try modern key derivation (600,000 iterations + secret file)
+        try:
+            key = _derive_key(salt, iterations=_PBKDF2_ITERATIONS, use_secret=True)
+            return _aes_gcm_decrypt(key, payload)
+        except Exception:
+            pass
+
+        # 2. Try modern iterations without secret (e.g. if secret file was created after first write)
+        try:
+            key = _derive_key(salt, iterations=_PBKDF2_ITERATIONS, use_secret=False)
+            return _aes_gcm_decrypt(key, payload)
+        except Exception:
+            pass
+
+        # 3. Fallback to legacy key derivation (2,000 iterations)
+        try:
+            key_legacy = _derive_key(salt, iterations=_LEGACY_PBKDF2_ITERATIONS, use_secret=False)
+            return _aes_gcm_decrypt(key_legacy, payload)
+        except Exception:
+            pass
+
+        return None
     except Exception as exc:
         logger.error("Vault decryption failed: %s", exc)
         return None

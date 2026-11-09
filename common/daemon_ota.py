@@ -41,6 +41,32 @@ class DaemonOTAMonitor:
             from common.os_replacer import perform_update
             if perform_update(dest, self.current_exe):
                 if os.name == "nt":
+                    # Signal active watchdog to stand down and expect an OTA restart.
+                    # Without this, the old watchdog detects the daemon mutex release
+                    # and triggers a panic recovery restart, spawning orphan processes.
+                    try:
+                        base_dir = os.path.dirname(os.path.abspath(self.current_exe))
+                        try:
+                            from sentinel_agent import request_shutdown_signal
+                            request_shutdown_signal(base_dir, reason="ota-restart")
+                        except Exception:
+                            import json
+                            import datetime
+                            prog_data = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
+                            state_dir = os.path.join(prog_data, "ZeroWatch", "state")
+                            os.makedirs(state_dir, exist_ok=True)
+                            sig_path = os.path.join(state_dir, "shutdown.signal")
+                            sig_data = json.dumps({
+                                "reason": "ota-restart",
+                                "requested_at": datetime.datetime.now().isoformat(),
+                            }).encode("utf-8")
+                            with open(sig_path + ".tmp", "wb") as f:
+                                f.write(sig_data)
+                            os.replace(sig_path + ".tmp", sig_path)
+                        logger.info("[OTA] Watchdog stand-down signal written (reason=ota-restart).")
+                    except Exception as sig_err:
+                        logger.warning("[OTA] Failed to write watchdog stand-down signal: %s", sig_err)
+
                     from common.os_replacer import (
                         _relaunch_detached,
                         _trigger_windows_daemon_task,

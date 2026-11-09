@@ -245,17 +245,30 @@ def _setup_tcl_tk_paths():
             if os.environ.get("TCL_LIBRARY") and os.environ.get("TK_LIBRARY"):
                 break
 
-_setup_tcl_tk_paths()
+_is_headless = any(
+    flag in sys.argv for flag in ("--daemon", "--watchdog", "--password-prompt", "--uninstall")
+)
 
-
-try:
-    import tkinter as tk
-    from tkinter import font as tkfont
-    from tkinter import ttk
-except ImportError:
-    tk = None
-    tkfont = None
-    ttk = None
+if _is_headless:
+    class _DummyTk:
+        def __getattr__(self, name):
+            return object
+    tk = _DummyTk()
+    tkfont = _DummyTk()
+    ttk = _DummyTk()
+else:
+    _setup_tcl_tk_paths()
+    try:
+        import tkinter as tk
+        from tkinter import font as tkfont
+        from tkinter import ttk
+    except ImportError:
+        class _DummyTk:
+            def __getattr__(self, name):
+                return object
+        tk = _DummyTk()
+        tkfont = _DummyTk()
+        ttk = _DummyTk()
 
 import math
 
@@ -263,36 +276,52 @@ try:
     # Use dynamic import to prevent IDE/linter warnings for the auto-generated config file
     _build_config = __import__("agent_build_config")
     AGENT_VERSION = getattr(_build_config, "FORCED_AGENT_VERSION")
-except (ImportError, AttributeError):
+    if not AGENT_VERSION or AGENT_VERSION == "0.0.0":
+        raise ValueError("FORCED_AGENT_VERSION unset or 0.0.0 fallback")
+except (ImportError, AttributeError, ValueError):
     # Fallback: fetch the current release version from GitHub at runtime.
     # This ensures the version badge and update check reflect the real release tag,
     # even when running directly from source (no CI build config present).
     def _fetch_github_release_version() -> str:
+        # First check local git tags if running from repo source
+        try:
+            import subprocess
+            out = subprocess.check_output(
+                ["git", "describe", "--tags", "--abbrev=0"],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            if out:
+                return out.lstrip("v")
+        except Exception:
+            pass
+
         try:
             import urllib.request
             import json as _json
             url = "https://api.github.com/repos/manavdc/Zerowatch-EXE/releases/latest"
             req = urllib.request.Request(url, headers={"User-Agent": "SentinelAgent-init"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = _json.loads(resp.read().decode())
                 tag = data.get("tag_name", "")
                 # Strip leading "v": "v3" → "3", "v1.2.3" → "1.2.3"
-                return tag.lstrip("v") if tag else "0.0.0"
+                return tag.lstrip("v") if tag else "1.0.48"
         except Exception:
-            return "0.0.0"
+            return "1.0.48"
 
     AGENT_VERSION = _fetch_github_release_version()
 
 
 
 # KILL_PASSWORD hardcoded fallback removed for commercial security.
+# Termination override must be validated against the backend authorization API.
 MUTEX_NAME = "Global\\SentinelAgent_ZeroWatch_4F9A2E1B"
 DAEMON_MUTEX_NAME = "Global\\SentinelAgent_Daemon_4F9A2E1B"
 WATCHDOG_MUTEX_NAME = "Global\\SentinelAgent_Watchdog_4F9A2E1B"
 PROMPT_MUTEX_NAME = "Global\\SentinelAgent_Prompt_4F9A2E1B"  # Prevents multiple password prompts
 HEARTBEAT_INTERVAL = 30  # Reduced from 60 to lower CPU
 MONITOR_INTERVAL = 60     # Reduced from 30 to lower CPU
-RESTART_CHECK_TIME = 180  # 4 hours in seconds (OTA update & restart check interval)
+RESTART_CHECK_TIME = 14400  # 4 hours in seconds (OTA update & restart check interval)
 OFFLINE_FLUSH_MIN_INTERVAL = 15
 OFFLINE_FLUSH_MAX_INTERVAL = 300
 USERNAME_MAX_LENGTH = 20
@@ -342,6 +371,7 @@ _LINUX_IDENTITY_FILES = (
     "device_fingerprint.json",
     "asset_info.json",
     "dashboard_cache.dat",
+    "scan_cache.db",
 )
 
 
@@ -382,24 +412,58 @@ def _secure_state_dir(base_dir):
         if explicit:
             return explicit
 
+        system_parent = "/var/lib/zerowatch"
         system_dir = "/var/lib/zerowatch/state"
-        user_dir   = os.path.expanduser("~/.local/share/zerowatch/state")
-        local_dir  = os.path.join(base_dir, "state")
+        xdg_data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
+        user_dir   = os.path.join(xdg_data_home, "zerowatch", "state")
+        var_tmp_dir = "/var/tmp/zerowatch/state"
+        local_dir  = "/tmp/zerowatch/state"
 
         # ── Try system dir first (preferred — consistent across UIDs) ──────
         try:
             os.makedirs(system_dir, mode=0o777, exist_ok=True)
-            os.chmod(system_dir, 0o777)
+            try:
+                os.chmod(system_parent, 0o777)
+                os.chmod(system_dir, 0o777)
+            except OSError:
+                pass
             _probe = os.path.join(system_dir, ".write_probe")
             with open(_probe, "w") as _fh:
                 _fh.write("x")
             os.remove(_probe)
+
+            # Privileged repair: ensure all existing files in system dir are world-writable (0666)
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                for entry in os.listdir(system_dir):
+                    fpath = os.path.join(system_dir, entry)
+                    if os.path.isfile(fpath):
+                        try:
+                            os.chmod(fpath, 0o666)
+                        except OSError:
+                            pass
+
+                # If launched via sudo, import any state from the calling user's directory
+                sudo_user = os.environ.get("SUDO_USER")
+                if sudo_user:
+                    sudo_user_dir = os.path.expanduser(f"~{sudo_user}/.local/share/zerowatch/state")
+                    if os.path.isdir(sudo_user_dir):
+                        for name in _LINUX_IDENTITY_FILES:
+                            src = os.path.join(sudo_user_dir, name)
+                            dst = os.path.join(system_dir, name)
+                            if os.path.isfile(src) and not os.path.exists(dst):
+                                try:
+                                    import shutil as _shutil
+                                    _shutil.copy2(src, dst)
+                                    os.chmod(dst, 0o666)
+                                except OSError:
+                                    pass
+
             return system_dir                          # writable → use it
         except OSError:
             pass  # root-owned or missing; fall through to user-dir
 
         # ── System dir not writable. Find the first user-writable fallback ─
-        for fallback in (user_dir, local_dir):
+        for fallback in (var_tmp_dir, user_dir, local_dir):
             try:
                 os.makedirs(fallback, mode=0o777, exist_ok=True)
                 os.chmod(fallback, 0o777)
@@ -441,7 +505,8 @@ def _secure_state_dir(base_dir):
 
             return fallback
 
-        # Last-resort — return local dir without write verification
+        # Last-resort — /tmp is always writable and matches sentinel_agent_linux.py's
+        # fallback so both GUI and daemon land in the same directory.
         return local_dir
 
     return os.path.join(base_dir, "state")
@@ -452,8 +517,8 @@ def _state_path(base_dir, filename):
 
 
 def _make_macos_shared_file(path):
-    """Allow the root LaunchDaemon and console user to share state files."""
-    if sys.platform == "darwin":
+    """Allow the root LaunchDaemon/daemon and console user to share state files on Linux and macOS."""
+    if sys.platform != "win32":
         try:
             os.chmod(path, 0o666)
         except OSError:
@@ -535,8 +600,13 @@ def _daemon_lock_path(base_dir):
 
     macOS intentionally uses the same shared state directory for normal-user and
     sudo-launched agents so the GUI and daemon share a single lock and state set.
+
+    Linux: use the shared secure state dir so the same lock file is found
+    regardless of whether the agent runs as root or non-root.
     """
     if sys.platform == "darwin":
+        return os.path.join(_secure_state_dir(base_dir), "daemon.lock")
+    if sys.platform.startswith("linux"):
         return os.path.join(_secure_state_dir(base_dir), "daemon.lock")
     return os.path.join(base_dir, "state", "daemon.lock")
 
@@ -785,17 +855,34 @@ def _load_pins_for_url(base_url: str) -> list[str]:
     except Exception as e:
         logging.debug(f"Failed to load custom pins from agent_config.json: {e}")
 
-    # 2. Enforce hardcoded pins for official domains unless explicitly overridden in dev mode
+    # 2. Load dynamic OTA pins from memory / disk cache
+    dynamic_pins = []
+    try:
+        from common.cert.pinning import get_dynamic_pins_for_host, register_dynamic_pins
+        dynamic_pins = get_dynamic_pins_for_host(hostname)
+        if not dynamic_pins:
+            from common.updater import load_cached_dynamic_pins
+            cached_all = load_cached_dynamic_pins()
+            if cached_all:
+                register_dynamic_pins(cached_all)
+                dynamic_pins = get_dynamic_pins_for_host(hostname)
+    except Exception as _ota_err:
+        logging.debug(f"Dynamic OTA pin lookup: {_ota_err}")
+
+    # 3. Enforce hardcoded and dynamic pins for official domains unless explicitly overridden in dev mode
     if hostname in SPKI_PINS:
         if is_dev_mode and custom_pins:
             logging.warning(f"Development mode active. Overriding hardcoded pins for {hostname} with custom configuration pins.")
             return custom_pins
-        return SPKI_PINS[hostname]
+        # Merge official hardcoded pins with dynamic verified OTA pins
+        merged = list(dict.fromkeys(SPKI_PINS[hostname] + dynamic_pins))
+        return merged
 
-    # 3. For custom staging/on-premise domains, return the configured custom pins
-    if custom_pins:
-        logging.info(f"Loaded {len(custom_pins)} valid custom pins from agent_config.json for host {hostname}")
-        return custom_pins
+    # 4. For custom staging/on-premise domains, return dynamic pins or configured custom pins
+    staging_pins = list(dict.fromkeys(custom_pins + dynamic_pins))
+    if staging_pins:
+        logging.info(f"Loaded {len(staging_pins)} valid custom/dynamic pins for host {hostname}")
+        return staging_pins
 
     # 4. If HTTPS but no pins are defined, raise a fatal error to prevent unpinned connection.
     if base_url.lower().startswith("https://"):
@@ -906,13 +993,6 @@ def encrypt_data(data_bytes, purpose="default"):
     ):
         import base64
         return b"RAW::" + base64.b64encode(data_bytes)
-
-    # macOS GUI and LaunchDaemon can run in different Keychain contexts.
-    # When Security.framework rejects a root/user Keychain operation, keep the
-    # shared GUI/daemon enrollment state usable with an explicit RAW:: fallback.
-    # This branch is macOS-only; Linux keeps its existing secure-store behavior.
-    macos_fallback = False
-
     if getattr(_in_crypto, "active", False):
         return None
     _in_crypto.active = True
@@ -926,26 +1006,15 @@ def encrypt_data(data_bytes, purpose="default"):
                 encrypted = plat.secure_store.encrypt(data_bytes)
             if encrypted is not None:
                 return encrypted
-        macos_fallback = sys.platform == "darwin"
-    except Exception:
-        macos_fallback = sys.platform == "darwin"
+    except Exception as exc:
+        logging.error(f"Platform secure_store encrypt failed: {exc}")
     finally:
         _in_crypto.active = False
-    if macos_fallback:
-        import base64
-        return b"RAW::" + base64.b64encode(data_bytes)
     return None
 
 def decrypt_data(encrypted_bytes, purpose="default"):
     if sys.platform == "win32":
         return _windows_dpapi_decrypt(encrypted_bytes)
-
-    if sys.platform == "darwin" and encrypted_bytes.startswith(b"RAW::"):
-        try:
-            import base64
-            return base64.b64decode(encrypted_bytes[5:], validate=True)
-        except Exception:
-            return None
 
     if getattr(_in_crypto, "active", False):
         return None
@@ -1215,6 +1284,21 @@ class ZeroWatchClient:
             logging.info("[WS] Received unlink notification")
             self.notification_queue.append({"type": "unlink", "data": data})
 
+    def heal_certificate_pins(self) -> bool:
+        """
+        Forces an immediate out-of-band Ed25519 OTA refresh of dynamic certificate pins.
+        Used to recover from certificate rotations or unblock connectivity.
+        """
+        try:
+            from common.updater import fetch_dynamic_pins
+            updated = fetch_dynamic_pins(timeout=10)
+            if updated:
+                logging.info(f"[PINNING] Certificate pins manually refreshed: {list(updated.keys())}")
+                return True
+        except Exception as e:
+            logging.warning(f"[PINNING] Manual certificate pin refresh failed: {e}")
+        return False
+
 
 
     def is_enrolled(self):
@@ -1235,6 +1319,35 @@ class ZeroWatchClient:
         is_ok = (status == "approved" and device_id == self.device_id)
         logging.info(f"Enrollment check: status='{status}', team='{team_code}', match={device_id == self.device_id} => {is_ok}")
         return is_ok
+
+    def has_root_enrollment(self):
+        """Detects if an existing enrollment was created by root/admin on macOS/Linux.
+        When a normal user launches the GUI without sudo, they lack Keychain/root permissions
+        to decrypt the credentials, but the presence of encrypted state files proves the system
+        is already enrolled under administrative authority.
+        """
+        if sys.platform not in ("darwin", "linux"):
+            return False
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            return False  # Running as root, standard is_enrolled() check is authoritative
+
+        candidate_paths = [
+            getattr(self, "join_state_file", ""),
+            os.path.join(self.base_dir, "join_state.json"),
+            os.path.join(self.base_dir, "zw_team_join_state.dat"),
+            os.path.join(self.base_dir, "zerowatch_token.dat"),
+            os.path.join(self.base_dir, "agent_token.enc"),
+            "/Library/Application Support/ZeroWatch/state/join_state.json",
+            "/Library/Application Support/ZeroWatch/state/agent_token.enc",
+            "/var/lib/zerowatch/state/join_state.json",
+        ]
+        for p in candidate_paths:
+            try:
+                if p and os.path.isfile(p) and os.path.getsize(p) > 0:
+                    return True
+            except OSError:
+                continue
+        return False
 
 
 
@@ -1987,7 +2100,14 @@ class ZeroWatchClient:
             return data
         except Exception as e:
             logging.warning(f"Join request failed: {e}")
-            return {"success": False, "message": "Network error"}
+            err_str = str(e)
+            if "pin" in err_str.lower():
+                msg = "SSL Certificate Pinning mismatch"
+            elif "timeout" in err_str.lower():
+                msg = "Connection timed out"
+            else:
+                msg = f"Network error: {e}" if len(err_str) < 50 else "Network connection error"
+            return {"success": False, "message": msg}
 
     def request_individual_join(self, individual_code):
         """Submit an individual registration request for the given code."""
@@ -2040,7 +2160,14 @@ class ZeroWatchClient:
             return data
         except Exception as e:
             logging.warning(f"Individual registration failed: {e}")
-            return {"success": False, "message": "Network error"}
+            err_str = str(e)
+            if "pin" in err_str.lower():
+                msg = "SSL Certificate Pinning mismatch"
+            elif "timeout" in err_str.lower():
+                msg = "Connection timed out"
+            else:
+                msg = f"Network error: {e}" if len(err_str) < 50 else "Network connection error"
+            return {"success": False, "message": msg}
 
     def poll_join_status(self, timeout=600, interval=8):
         """Poll join status until approved, denied, or timed out."""
@@ -2236,7 +2363,7 @@ class ZeroWatchClient:
     # ----------------------------------------------------------------
     # SYNC
     # ----------------------------------------------------------------
-    def sync_full(self, software_list, hardware_info=None, inventory_scope="complete"):
+    def sync_full(self, software_list, hardware_info=None, inventory_scope="complete", batch_index=1, batch_count=1):
         if not self.jwt: return False
         if not hardware_info:
             try:
@@ -2254,6 +2381,8 @@ class ZeroWatchClient:
             "hardware": hardware_info,
             "inventoryScope": inventory_scope,
             "inventoryRevision": time.time_ns(),
+            "batch_index": batch_index,
+            "batch_count": batch_count,
         }
         try:
             formatted_software = []
@@ -2400,17 +2529,18 @@ class ZeroWatchClient:
         if current:
             batches.append(current)
 
-        logging.info("[SYNC] Chunking oversized complete inventory into %d requests.", len(batches))
-        if not self.sync_full(batches[0], hardware_info, inventory_scope="partial"):
+        batch_count = len(batches)
+        logging.info("[SYNC] Chunking oversized complete inventory into %d requests.", batch_count)
+        if not self.sync_full(batches[0], hardware_info, inventory_scope="complete", batch_index=1, batch_count=batch_count):
             return False
         for index, batch in enumerate(batches[1:], start=2):
-            if not self.sync_delta(batch, []):
-                logging.warning("[SYNC] Inventory chunk %d/%d failed.", index, len(batches))
+            if not self.sync_delta(batch, [], inventory_scope="complete", batch_index=index, batch_count=batch_count):
+                logging.warning("[SYNC] Inventory chunk %d/%d failed.", index, batch_count)
                 return False
         logging.info("[SYNC] Chunked complete inventory sync finished: %d items.", len(items))
         return True
 
-    def sync_delta(self, added, removed, added_hw=None, removed_hw=None, hardware_snapshot=None):
+    def sync_delta(self, added, removed, added_hw=None, removed_hw=None, hardware_snapshot=None, inventory_scope="delta", batch_index=1, batch_count=1):
         if not self.jwt: return False
 
         def _to_dict(it):
@@ -2424,9 +2554,13 @@ class ZeroWatchClient:
 
         payload = {
             "device_id": self.device_id,
+            "deviceId": self.device_id,
             "username": self.operator_username,
             "added": added_dicts,
-            "removed": removed_dicts
+            "removed": removed_dicts,
+            "inventoryScope": inventory_scope,
+            "batch_index": batch_index,
+            "batch_count": batch_count,
         }
         try:
             if added_hw:
@@ -2491,9 +2625,13 @@ class ZeroWatchClient:
         return True
 
     def unlink_self(self):
-        """Unlinks this device from the currently linked account using the agent JWT."""
+        """Unlinks this device from the currently linked account using the agent JWT.
+        Unlink is sovereign: if remote call fails (network, pin mismatch, 500, etc.),
+        the agent always clears local state so the device is never trapped in limbo.
+        """
         if not self.jwt:
-            return False, "Device is not linked"
+            self.clear_local_state()
+            return True, "Device was not linked; local state cleared."
         try:
             resp = self.session.delete(f"{AGENT_API_URL}/unlink-self", headers=self._auth_headers(), timeout=10)
             self.last_server_status = resp.status_code
@@ -2501,9 +2639,15 @@ class ZeroWatchClient:
             if resp.ok and data.get("success"):
                 self.clear_local_state()
                 return True, None
-            return False, data.get("message", "Failed to unlink device")
+            # Remote server responded with error/non-success: sovereign local clear
+            err_msg = data.get("message", f"Server responded with status {resp.status_code}")
+            logging.warning("[UNLINK] Remote unlink returned error: %s. Executing sovereign local reset.", err_msg)
+            self.clear_local_state()
+            return True, f"Device unlinked locally (server returned: {err_msg})"
         except Exception as e:
-            return False, str(e)
+            logging.warning("[UNLINK] Remote unlink call failed (%s). Executing sovereign local reset.", e)
+            self.clear_local_state()
+            return True, f"Device unlinked locally (server unreachable: {e})"
 
     # ----------------------------------------------------------------
     # HEARTBEAT / LOGGING
@@ -2849,6 +2993,42 @@ def get_base_dir():
 # MODULE 1: BOOTSTRAP — Single Instance Mutex
 # ============================================================================
 
+def _windows_create_permissive_mutex(mutex_name: str, initial_owner: bool = True):
+    """Create or probe a named Windows kernel mutex with a NULL DACL.
+    
+    A NULL DACL in the security descriptor explicitly grants access to ALL callers
+    regardless of integrity level (Medium, High/Admin, SYSTEM). This ensures that
+    non-elevated processes and elevated processes can detect each other without
+    failing with ERROR_ACCESS_DENIED (5).
+    Returns (handle, last_error).
+    """
+    if sys.platform != "win32":
+        return None, 0
+
+    class _SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [
+            ("nLength", ctypes.c_ulong),
+            ("lpSecurityDescriptor", ctypes.c_void_p),
+            ("bInheritHandle", ctypes.c_int),
+        ]
+
+    try:
+        sd = (ctypes.c_byte * 64)()
+        ctypes.windll.advapi32.InitializeSecurityDescriptor(ctypes.byref(sd), 1)
+        ctypes.windll.advapi32.SetSecurityDescriptorDacl(ctypes.byref(sd), True, None, False)
+        sa = _SECURITY_ATTRIBUTES()
+        sa.nLength = ctypes.sizeof(_SECURITY_ATTRIBUTES)
+        sa.lpSecurityDescriptor = ctypes.addressof(sd)
+        sa.bInheritHandle = False
+        h = ctypes.windll.kernel32.CreateMutexW(ctypes.byref(sa), initial_owner, mutex_name)
+        err = ctypes.windll.kernel32.GetLastError()
+        return h, err
+    except Exception:
+        h = ctypes.windll.kernel32.CreateMutexW(None, initial_owner, mutex_name)
+        err = ctypes.windll.kernel32.GetLastError()
+        return h, err
+
+
 def enforce_single_instance():
     """
     Claims a named Windows kernel mutex or POSIX lock file. If one already exists from another 
@@ -2868,10 +3048,11 @@ def enforce_single_instance():
             logging.info("Another instance is already running. Exiting silently.")
             sys.exit(0)
 
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, True, MUTEX_NAME)
-    last_err = ctypes.windll.kernel32.GetLastError()
-    if last_err == 183:  # ERROR_ALREADY_EXISTS
-        logging.info("Another instance is already running. Exiting silently.")
+    mutex, last_err = _windows_create_permissive_mutex(MUTEX_NAME, True)
+    if not mutex or last_err in (183, 5):  # 183=ERROR_ALREADY_EXISTS, 5=ERROR_ACCESS_DENIED
+        if mutex:
+            ctypes.windll.kernel32.CloseHandle(mutex)
+        logging.info("Another instance is already running (err=%s). Exiting silently.", last_err)
         sys.exit(0)
     return mutex  # MUST keep reference alive — releasing frees the mutex
 
@@ -2897,14 +3078,13 @@ def enforce_single_daemon_instance():
 
     start_wait = time.monotonic()
     while True:
-        mutex = ctypes.windll.kernel32.CreateMutexW(None, True, DAEMON_MUTEX_NAME)
-        last_err = ctypes.windll.kernel32.GetLastError()
-        if last_err != 183:  # Successfully acquired without collision
+        mutex, last_err = _windows_create_permissive_mutex(DAEMON_MUTEX_NAME, True)
+        if mutex and last_err not in (183, 5):  # Successfully acquired without collision
             return mutex
         if mutex:
             ctypes.windll.kernel32.CloseHandle(mutex)
         if time.monotonic() - start_wait >= 5.0:
-            logging.info("Another daemon instance is already running. Exiting silently.")
+            logging.info("Another daemon instance is already running (err=%s). Exiting silently.", last_err)
             sys.exit(0)
         time.sleep(0.5)
 
@@ -4727,11 +4907,15 @@ def _is_agent_active(zw_client):
 def _is_daemon_running():
     if sys.platform != "win32":
         base_dir = get_base_dir()
-        # Linux daemon writes .zerowatch.lock in the shared secure state dir.
-        # Keep daemon.lock as a legacy fallback for older builds.
+        shared_state = _secure_state_dir(base_dir)
+        # Linux daemon now writes .zerowatch-daemon.lock (separate from GUI lock).
+        # Also check legacy .zerowatch.lock and daemon.lock for older builds.
         lock_candidates = [
-            os.path.join(_secure_state_dir(base_dir), ".zerowatch.lock"),
+            os.path.join(shared_state, ".zerowatch-daemon.lock"),
+            os.path.join(shared_state, ".zerowatch.lock"),
+            "/Library/Application Support/ZeroWatch/state/.zerowatch-daemon.lock",
             "/Library/Application Support/ZeroWatch/state/.zerowatch.lock",
+            "/var/lib/zerowatch/state/.zerowatch-daemon.lock",
             "/var/lib/zerowatch/state/.zerowatch.lock",
             _daemon_lock_path(base_dir),
         ]
@@ -4780,22 +4964,20 @@ def _is_daemon_running():
                 pass
         return False
 
-    probe = ctypes.windll.kernel32.CreateMutexW(None, True, DAEMON_MUTEX_NAME)
-    err = ctypes.windll.kernel32.GetLastError()
+    probe, err = _windows_create_permissive_mutex(DAEMON_MUTEX_NAME, True)
     if probe:
         ctypes.windll.kernel32.CloseHandle(probe)
-    return err == 183
+    return err in (183, 5) or not probe
 
 
 def _is_windows_mutex_held(mutex_name):
     """Return True when another process currently owns a named mutex."""
     if sys.platform != "win32":
         return False
-    probe = ctypes.windll.kernel32.CreateMutexW(None, True, mutex_name)
-    err = ctypes.windll.kernel32.GetLastError()
+    probe, err = _windows_create_permissive_mutex(mutex_name, True)
     if probe:
         ctypes.windll.kernel32.CloseHandle(probe)
-    return err == 183
+    return err in (183, 5) or not probe
 
 
 def _wait_for_auxiliary_processes(timeout=10.0):
@@ -5935,10 +6117,11 @@ def watchdog_process(target_exe_path):
     # Claim the watchdog mutex.  A daemon restart can briefly overlap the old
     # and new processes; without this check every restart leaves another
     # watchdog behind, which appears as extra SentinelAgent processes.
-    wd_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, WATCHDOG_MUTEX_NAME)
-    wd_error = ctypes.windll.kernel32.GetLastError()
-    if wd_error == 183:  # ERROR_ALREADY_EXISTS
-        logging.info("[WATCHDOG] Another watchdog is already active; exiting.")
+    wd_mutex, wd_error = _windows_create_permissive_mutex(WATCHDOG_MUTEX_NAME, True)
+    if not wd_mutex or wd_error in (183, 5):  # 183=ERROR_ALREADY_EXISTS, 5=ERROR_ACCESS_DENIED
+        if wd_mutex:
+            ctypes.windll.kernel32.CloseHandle(wd_mutex)
+        logging.info("[WATCHDOG] Another watchdog is already active (err=%s); exiting.", wd_error)
         return
 
     while True:
@@ -5953,11 +6136,10 @@ def watchdog_process(target_exe_path):
             # The watchdog must check BOTH — if either is held, the agent is alive.
             agent_alive = False
             for probe_name in (MUTEX_NAME, DAEMON_MUTEX_NAME):
-                probe_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, probe_name)
-                probe_err = ctypes.windll.kernel32.GetLastError()
+                probe_mutex, probe_err = _windows_create_permissive_mutex(probe_name, True)
                 if probe_mutex:
                     ctypes.windll.kernel32.CloseHandle(probe_mutex)
-                if probe_err == 183:  # ERROR_ALREADY_EXISTS — mutex is held
+                if probe_err in (183, 5):  # Mutex is held by the agent process
                     agent_alive = True
                     break
 
@@ -5997,11 +6179,10 @@ def watchdog_process(target_exe_path):
                         time.sleep(5)
                         # Check if the replacement agent acquired a mutex
                         for probe_name in (MUTEX_NAME, DAEMON_MUTEX_NAME):
-                            probe_mutex = ctypes.windll.kernel32.CreateMutexW(None, True, probe_name)
-                            probe_err = ctypes.windll.kernel32.GetLastError()
+                            probe_mutex, probe_err = _windows_create_permissive_mutex(probe_name, True)
                             if probe_mutex:
                                 ctypes.windll.kernel32.CloseHandle(probe_mutex)
-                            if probe_err == 183:  # ERROR_ALREADY_EXISTS
+                            if probe_err in (183, 5):  # ERROR_ALREADY_EXISTS or ERROR_ACCESS_DENIED
                                 replacement_started = True
                                 break
                         if replacement_started:
@@ -6042,8 +6223,25 @@ def watchdog_process(target_exe_path):
                     logging.critical("[WATCHDOG] All OTA recovery attempts failed. Exiting.")
                     sys.exit(1)
 
-                logging.info("[WATCHDOG] Main agent killed! Exiting watchdog (termination protection disabled).")
-                sys.exit(0)
+                # Main agent terminated without an authorized shutdown signal.
+                logging.warning(
+                    "[WATCHDOG] Main agent terminated unexpectedly! "
+                    "Self-protection guardian reviving SentinelAgent..."
+                )
+                try:
+                    from common.os_replacer import _relaunch_detached
+                    if _relaunch_detached(target_exe_path, reopen_gui=False):
+                        logging.info("[WATCHDOG] SentinelAgent successfully revived by guardian watchdog.")
+                        time.sleep(10)
+                        continue
+                    else:
+                        logging.error("[WATCHDOG] Detached relaunch returned False. Retrying in 10s...")
+                        time.sleep(10)
+                        continue
+                except Exception as revive_exc:
+                    logging.error("[WATCHDOG] Failed to revive main agent: %s. Retrying in 10s...", revive_exc)
+                    time.sleep(10)
+                    continue
 
             time.sleep(5)  # Reduced polling frequency (was 3s)
         except Exception as e:
@@ -6210,7 +6408,10 @@ def main_agent():
             logging.info("Watchdog guardian spawned as detached process.")
 
         if not skip_watchdog:
-            spawn_watchdog()
+            if not _is_windows_mutex_held(WATCHDOG_MUTEX_NAME):
+                spawn_watchdog()
+            else:
+                logging.info("[MAIN] Watchdog already active; skipping spawn.")
         else:
             logging.info("Skipping watchdog spawn (--no-watchdog mode, existing watchdog is monitoring).")
 
@@ -6689,13 +6890,13 @@ def main_agent():
                 break
 
             now = time.time()
-            if cert_pinning.PIN_MISMATCH_DETECTED:
+            if cert_pinning.get_pin_mismatch_detected():
                 if now < pin_mismatch_next_retry:
                     time.sleep(10)
                     continue
                 else:
                     logging.info("[PINNING] Retrying connection after pin mismatch backoff...")
-                    cert_pinning.PIN_MISMATCH_DETECTED = False
+                    cert_pinning.reset_pin_mismatch()
 
             # --- Responsive sleep: poll every 2 s for unlink/shutdown signals ---
             # This replaces a single time.sleep(30) so the daemon can react to an
@@ -6755,12 +6956,14 @@ def main_agent():
                 continue
             now = time.time()
 
-            if cert_pinning.PIN_MISMATCH_DETECTED:
+            if cert_pinning.get_pin_mismatch_detected():
                 backoff_time = [30, 120, 300, 900, 3600][min(pin_mismatch_backoff_idx, 4)]
                 logging.warning(f"[PINNING] Pin mismatch active. Backing off for {backoff_time} seconds...")
                 pin_mismatch_next_retry = now + backoff_time
                 pin_mismatch_backoff_idx += 1
                 continue
+            else:
+                pin_mismatch_backoff_idx = 0
 
             # --- Dynamic JWT Reloading for Re-enrollment ---
             if not zw_client.jwt:
@@ -6819,16 +7022,12 @@ def main_agent():
             # Check if Watchdog is still alive (every 60s) — Windows only
             if sys.platform == "win32" and not skip_watchdog and (now - last_watchdog_check) > 60:
                 last_watchdog_check = now
-                wd = ctypes.windll.kernel32.CreateMutexW(None, True, WATCHDOG_MUTEX_NAME)
-                wd_err = ctypes.windll.kernel32.GetLastError()
-                if wd:
-                    ctypes.windll.kernel32.CloseHandle(wd)
-
-                if wd_err != 183 and _is_windows_mutex_held(MUTEX_NAME):
-                    logging.warning("[MAIN] Watchdog missing while GUI is active; reviving watchdog...")
-                    spawn_watchdog()
-                elif wd_err != 183:
-                    logging.debug("[MAIN] GUI is not active; watchdog revival suppressed.")
+                if not _is_windows_mutex_held(WATCHDOG_MUTEX_NAME):
+                    if _is_windows_mutex_held(MUTEX_NAME):
+                        logging.warning("[MAIN] Watchdog missing while GUI is active; reviving watchdog...")
+                        spawn_watchdog()
+                    else:
+                        logging.debug("[MAIN] GUI is not active; watchdog revival suppressed.")
 
             # Poll asset info every 15 minutes
             if (now - last_asset_poll) >= 15 * 60:
@@ -6939,6 +7138,80 @@ def main_agent():
         ota_monitor.stop()
     logging.info("SentinelAgent shutdown completed.")
     return "stopped" if zw_client.jwt else "waiting"
+
+class PrivilegeRequiredFrame(tk.Frame):
+    """Displayed on macOS when the agent is launched by an unprivileged user
+    on a machine that has already been enrolled by root/admin.
+    """
+    def __init__(self, master, zw_client):
+        super().__init__(master)
+        self.zw_client = zw_client
+        self.configure(bg="#13171d")
+
+        c_bg = "#13171d"
+        c_card = "#181d24"
+        c_white = "#ffffff"
+        c_gray = "#94a3b8"
+        c_yellow = "#fbbf24"
+
+        container = tk.Frame(self, bg=c_bg)
+        container.pack(expand=True, fill=tk.BOTH, padx=30, pady=30)
+
+        card = tk.Frame(container, bg=c_card, bd=1, relief=tk.SOLID)
+        card.pack(expand=True, fill=tk.BOTH, padx=15, pady=15)
+
+        lbl_alert = tk.Label(
+            card,
+            text="ADMINISTRATIVE PRIVILEGES REQUIRED",
+            font=("Courier New", 13, "bold"),
+            fg=c_yellow,
+            bg=c_card
+        )
+        lbl_alert.pack(pady=(25, 8))
+
+        lbl_title = tk.Label(
+            card,
+            text="ZeroWatch is Already Enrolled",
+            font=("Arial", 16, "bold"),
+            fg=c_white,
+            bg=c_card
+        )
+        lbl_title.pack(pady=(0, 16))
+
+        msg = (
+            "This endpoint has already been joined to your organization by an administrator.\n\n"
+            "On macOS, ZeroWatch requires administrator privileges (sudo) to access Apple Keychain\n"
+            "system credentials, read inventory, and maintain continuous security monitoring.\n\n"
+            "Please launch the agent using sudo from your terminal:\n\n"
+            "    sudo /Applications/ZeroWatch/SentinelAgent\n\n"
+            "If the background daemon is already running, ZeroWatch is actively protecting your system."
+        )
+
+        lbl_body = tk.Label(
+            card,
+            text=msg,
+            font=("Arial", 11),
+            fg=c_gray,
+            bg=c_card,
+            justify=tk.CENTER
+        )
+        lbl_body.pack(pady=10, padx=20)
+
+        btn_quit = tk.Button(
+            card,
+            text="Close Window",
+            font=("Arial", 12, "bold"),
+            bg="#2a313a",
+            fg=c_white,
+            activebackground="#3b4452",
+            activeforeground=c_white,
+            bd=0,
+            padx=20,
+            pady=8,
+            cursor="hand2",
+            command=master.destroy
+        )
+        btn_quit.pack(pady=(15, 25))
 
 class EnrollmentFrame(tk.Frame):
     def __init__(self, master, zw_client):
@@ -7364,6 +7637,21 @@ class EnrollmentFrame(tk.Frame):
 
     def _run_join(self):
         try:
+            # Write consent file now so the background daemon can start even if
+            # the GUI is closed before the admin approves the join request.
+            # This is defensive — prompt_consent() normally writes it, but on
+            # some first-run paths the consent screen may not have been shown.
+            try:
+                _consent_path = os.path.join(
+                    _secure_state_dir(self.zw_client.base_dir), "consent_accepted.dat"
+                )
+                if not os.path.exists(_consent_path):
+                    os.makedirs(os.path.dirname(_consent_path), exist_ok=True)
+                    with open(_consent_path, "w") as _cf:
+                        _cf.write("1")
+            except Exception as _ce:
+                logging.debug("Could not write consent file during join: %s", _ce)
+
             if getattr(self, "is_individual", False):
                 res = self.zw_client.request_individual_join(self.individual_code)
                 if res.get("success"):
@@ -8070,13 +8358,17 @@ class DashboardFrame(tk.Frame):
         def on_unlink_click():
             import tkinter.messagebox as messagebox
             if messagebox.askyesno("Confirm Unlink", "Are you sure you want to unlink this device from the team? This action cannot be undone."):
-                res = self.zw_client.unlink_self()
-                # unlink_self returns a tuple (bool, str) usually or "unlinked"
-                success = False
-                msg = ""
-                if isinstance(res, tuple):
-                    success, msg = res
-                elif res == "unlinked":
+                try:
+                    res = self.zw_client.unlink_self()
+                    success = False
+                    msg = ""
+                    if isinstance(res, tuple):
+                        success, msg = res
+                    elif res == "unlinked":
+                        success = True
+                except Exception as _ue:
+                    logging.warning("[GUI] Exception during unlink_self: %s", _ue)
+                    self.zw_client.clear_local_state()
                     success = True
                 
                 if success:
@@ -8086,7 +8378,12 @@ class DashboardFrame(tk.Frame):
                     else:
                         sys.exit(0)
                 else:
-                    messagebox.showerror("Unlink Failed", f"Failed to unlink device: {msg}")
+                    self.zw_client.clear_local_state()
+                    show_windows_notification("Zerowatch", "Device unlinked locally.")
+                    if hasattr(self.winfo_toplevel(), 'show_enrollment'):
+                        self.winfo_toplevel().show_enrollment()
+                    else:
+                        sys.exit(0)
 
         unlink_btn = tk.Button(top3, text="Unlink", bg=self.c_red, fg=self.c_white, font=self.f_normal_bold, bd=0, relief=tk.FLAT, overrelief=tk.FLAT, highlightthickness=0, activebackground="#da3633", activeforeground=self.c_white, disabledforeground=self.c_gray, cursor="hand2", command=on_unlink_click)
         unlink_btn.pack(side=tk.RIGHT)
@@ -8231,10 +8528,17 @@ class DashboardFrame(tk.Frame):
                         fg=self.c_orange
                     ))
                 except _ota_updater.OTAError as exc:
-                    self.after(0, lambda e=exc: banner_lbl.config(
-                        text=f"✗ Update check failed: {e}",
-                        fg=self.c_red
-                    ))
+                    err_str = str(exc)
+                    if any(c in err_str for c in ("502", "503", "504", "Gateway Timeout", "temporarily unavailable")):
+                        self.after(0, lambda: banner_lbl.config(
+                            text="⚠ GitHub CDN is temporarily busy (504 Gateway Timeout). Please retry in a moment.",
+                            fg=self.c_orange
+                        ))
+                    else:
+                        self.after(0, lambda e=exc: banner_lbl.config(
+                            text=f"✗ Update check failed: {e}",
+                            fg=self.c_red
+                        ))
                 except Exception as exc:
                     self.after(0, lambda e=exc: banner_lbl.config(
                         text=f"✗ Network error: {e}",
@@ -9133,10 +9437,26 @@ class UnifiedSentinelGUI(tk.Tk):
             self.show_enrollment()
         elif force_frame == "dashboard":
             self.show_dashboard()
+        elif force_frame == "pending":
+            # Reopen directly on the pending-approval screen so the user sees
+            # the "waiting for admin approval" state rather than the enrollment
+            # form asking for a code they already submitted.
+            self.show_enrollment()   # builds the enrollment frame first
+            # Then navigate to pending without re-submitting the join request
+            enroll_frame = self.current_frame
+            if hasattr(enroll_frame, "_goto_pending"):
+                enroll_frame._goto_pending()
+            else:
+                # Fallback: show enrollment (user will see correct state via
+                # the polling thread started by show_enrollment)
+                logging.warning("[GUI] EnrollmentFrame has no _goto_pending — falling back to enrollment view.")
         else:
             # Default routing logic: strictly check enrollment status
             if self.zw_client.is_enrolled():
                 self.show_dashboard()
+            elif sys.platform == "darwin" and hasattr(os, "geteuid") and os.geteuid() != 0 and self.zw_client.has_root_enrollment():
+                logging.info("macOS normal user launch on root-enrolled system: displaying privilege required screen.")
+                self.show_privilege_required_screen()
             else:
                 self.show_enrollment()
 
@@ -9261,6 +9581,12 @@ class UnifiedSentinelGUI(tk.Tk):
         except Exception as exc:
             logging.error("[GUI] Notification processing failed: %s", exc)
         self.after(2000, self.process_notifications)
+
+    def show_privilege_required_screen(self):
+        if isinstance(self.current_frame, PrivilegeRequiredFrame):
+            return
+        self.title("ZEROWATCH SENTINEL AGENT — PRIVILEGES REQUIRED")
+        self._switch_frame(PrivilegeRequiredFrame)
 
     def show_enrollment(self):
         if isinstance(self.current_frame, EnrollmentFrame):
@@ -9466,13 +9792,20 @@ def run_interactive():
         )
         _append_gui_log(base_dir, "GUI startup: client initialized")
 
-        if not zw_client.is_enrolled():
+        # Determine enrollment state before showing consent or routing the GUI.
+        is_enrolled_locally = zw_client.is_enrolled()
+        is_pending_locally = zw_client.has_pending_join()
+
+        # Only force-show consent when the user has NEVER interacted with the
+        # agent (no enrollment and no pending request).  If a join request is
+        # already in-flight, the user already consented during the original
+        # enrollment submission — reopening the GUI must not re-show consent.
+        if not is_enrolled_locally and not is_pending_locally:
             prompt_consent(base_dir, force_show=True)
         else:
             prompt_consent(base_dir, force_show=False)
 
         # Default routing logic with a 2-second "Server Veto"
-        is_enrolled_locally = zw_client.is_enrolled()
         
         if is_enrolled_locally:
             logging.info("Startup: Device enrolled locally. Starting background service...")
@@ -9493,6 +9826,7 @@ def run_interactive():
                 logging.info("Startup: Server rejected enrollment. Wiping local state.")
                 zw_client.clear_local_state()
                 is_enrolled_locally = False
+                is_pending_locally = False
             else:
                 logging.info(f"Startup: Server verification result: {verify_res.get('status')}")
                 # FIX: Daemon spawned only after server confirms enrollment valid.
@@ -9503,6 +9837,13 @@ def run_interactive():
         if is_enrolled_locally:
             logging.info("Startup: Proceeding to Dashboard.")
             app = UnifiedSentinelGUI(zw_client, force_frame="dashboard")
+        elif is_pending_locally:
+            # Enrollment was submitted before the GUI closed; reopen on the
+            # pending-approval screen so the user sees progress instead of an
+            # enrollment form asking for a code they already entered.
+            logging.info("Startup: Pending enrollment detected — restoring Pending screen.")
+            _auto_bootstrap_background_agent()   # ensure daemon is polling
+            app = UnifiedSentinelGUI(zw_client, force_frame="pending")
         else:
             logging.info("Startup: Proceeding to Enrollment.")
             app = UnifiedSentinelGUI(zw_client, force_frame="enroll")
@@ -9763,17 +10104,17 @@ def main():
             "consent_accepted.dat"
         )
 
-        # Check if the agent is already linked
+        # Check if the agent is already linked (has JWT) OR has a pending enrollment
         token_win = _state_path(base_dir, "zerowatch_token.dat")
         token_nix = os.path.join(
             _secure_state_dir(base_dir),
             "agent_token.enc"
         )
+        join_state_win = _state_path(base_dir, TEAM_JOIN_STATE_FILE)
+        join_state_nix = os.path.join(_secure_state_dir(base_dir), "join_state.json")
 
         is_linked = os.path.exists(token_win) or os.path.exists(token_nix)
-        pending_enrollment = os.path.exists(
-            _state_path(base_dir, TEAM_JOIN_STATE_FILE)
-        )
+        has_join_state = os.path.exists(join_state_win) or os.path.exists(join_state_nix)
 
         # macOS launchd must be allowed to start before enrollment.  The
         # daemon owns pending-request polling and waits for shared enrollment
@@ -9784,10 +10125,10 @@ def main():
             sys.platform != "darwin"
             and not is_linked
             and not os.path.exists(consent_file)
-            and not pending_enrollment
+            and not has_join_state
         ):
             logging.info(
-                "Daemon blocked: Consent not accepted yet and agent is not linked."
+                "Daemon blocked: No enrollment in progress and consent not accepted yet."
             )
             sys.exit(0)
 

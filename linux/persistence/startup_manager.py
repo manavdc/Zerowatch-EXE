@@ -84,8 +84,18 @@ def _write_unit(unit_dir: str, exe_path: str, daemon_args: str, wanted_by: str) 
         # Place Environment= on its own line before Restart=.
         # When no URL is set (production binary), env_line is empty string.
         env_line = f"Environment=ZEROWATCH_API_URL={api_url}\n" if api_url else ""
+
+        # Format executable command: wrap with Python interpreter if script, quote if needed
+        import sys
+        if exe_path.endswith(".py"):
+            py_bin = f'"{sys.executable}"' if " " in sys.executable else sys.executable
+            script_path = f'"{exe_path}"' if " " in exe_path else exe_path
+            exec_cmd = f"{py_bin} {script_path}"
+        else:
+            exec_cmd = f'"{exe_path}"' if " " in exe_path and not (exe_path.startswith('"') and exe_path.endswith('"')) else exe_path
+
         content = _UNIT_TEMPLATE.format(
-            exe_path=exe_path,
+            exe_path=exec_cmd,
             args=args_suffix,
             env_line=env_line,
             wanted_by=wanted_by,
@@ -108,10 +118,20 @@ class LinuxPersistenceManager(PersistenceManager):
         exe_path: str,
         daemon_args: Optional[List[str]] = None,
     ) -> bool:
-        # The Linux agent binary has no --daemon flag — it always runs its
-        # blocking monitor loop directly.  Pass an empty string so ExecStart
-        # only contains the binary path.
-        args_str = " ".join(daemon_args) if daemon_args else ""
+        # Normalize and ensure daemon_args always includes '--daemon'
+        # so background systemd services always run headlessly and never attempt
+        # to open graphical GUI windows without a display.
+        if isinstance(daemon_args, str):
+            args_list = daemon_args.split()
+        elif daemon_args:
+            args_list = list(daemon_args)
+        else:
+            args_list = []
+
+        if "--daemon" not in args_list:
+            args_list.insert(0, "--daemon")
+
+        args_str = " ".join(args_list)
 
         # If a system-wide unit already exists, do not create a user unit.
         # This prevents duplicate daemon instances across sudo and non-sudo runs.
@@ -183,8 +203,16 @@ class LinuxPersistenceManager(PersistenceManager):
         return success
 
     def is_persistence_active(self) -> bool:
-        """Check whether the systemd unit file is currently installed on disk."""
+        """Check whether the systemd unit file is currently installed on disk and configured with daemon arguments."""
         system_path = os.path.join(_SYSTEM_UNIT_DIR, _SERVICE_NAME)
         user_path = os.path.join(_USER_UNIT_DIR_TEMPLATE, _SERVICE_NAME)
-        return os.path.isfile(system_path) or os.path.isfile(user_path)
+        for unit_file in (system_path, user_path):
+            if os.path.isfile(unit_file):
+                try:
+                    with open(unit_file, "r", encoding="utf-8") as fh:
+                        if "--daemon" in fh.read():
+                            return True
+                except Exception:
+                    return True
+        return False
 

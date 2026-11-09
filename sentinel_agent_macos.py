@@ -75,10 +75,10 @@ from common.os_replacer import commit_macos_update
 # AGENT CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-AGENT_VERSION      = "1.0.0-macos"
+AGENT_VERSION      = "1.0.48-macos"
 HEARTBEAT_INTERVAL = 30    # seconds between heartbeats
 MONITOR_INTERVAL   = 120   # seconds between delta scan checks
-RESTART_CHECK_TIME = 180  # 4 hours in seconds (OTA update & restart check interval)
+RESTART_CHECK_TIME = 14400  # 4 hours in seconds (OTA update & restart check interval)
 RECONNECT_DELAY    = 10    # seconds before reconnect attempt
 HEALTH_MARKER      = "/Library/Application Support/ZeroWatch/state/agent_heartbeat"
 
@@ -96,14 +96,28 @@ else:
 # ── SPKI pins (identical to Windows and Linux agents) ─────────────────────────
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
-        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
-        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
-        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="
-    ],
-    "zerowatch-testing.eastasia.cloudapp.azure.com": [
-        "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",
-        "EzSBE12fT2ZrphmumaBjrpdpXv9G71RhZQHMvuwszI4="
-    ],
+        # --- Leaf Public Keys (90-Day Lifespan) ---
+        "a6WoJxzcp0Im4dXEiaHUcio3U8wbbRWdVyaWoqsIlGQ=",  # Google Trust Services (Active Leaf from 2026-11-03)
+        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",  # Previous Leaf
+
+        # --- Intermediate CAs (1 to 5-Year Lifespan) ---
+        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",  # Google Trust Services WE1 Intermediate CA
+        "jQJTbIh0grw0/1TkHSumWb+Fs0Ggogr621gT3PvPKG0=",  # Let's Encrypt R3 Intermediate CA
+
+        # --- Root CAs (10 to 25-Year Lifespan - Immune to 90-Day Rotations) ---
+        "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",  # Google Trust Services GTS Root R1 (RSA 4096)
+        "Vfd95BwDeSQo+NUYxVEEIlvkOlWY2SalKK1lPhzOx78=",  # Google Trust Services GTS Root R2 (RSA 4096)
+        "QXnt2YHvdHR3tJYmQIr0Paosp6t/nggsEGD4QJZ3Q0g=",  # Google Trust Services GTS Root R3 (ECDSA P-256)
+        "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",  # Google Trust Services GTS Root R4 (ECDSA P-384)
+        "C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=",  # Let's Encrypt ISRG Root X1 (RSA 4096, valid to 2035)
+        "diGVwiVYbubAI3RW4hB9xU8e/CH2GnkuvVFZE8zmgzI=",  # Let's Encrypt ISRG Root X2 (ECDSA P-384, valid to 2040)
+        "K87oWBWM9UZfyddvDfoxL+8lpNyoUB2ptGtn0fv6G2Q=",  # GlobalSign Root CA (GTS cross-sign anchor)
+        "CLOmM1/OXvSPjw5UOYbAf9GKOxImEp9hhku9W90fHMk=",  # GlobalSign ECC Root R4
+        "cGuxAXyFXFkWm61cF4HPWX8S0srS9j0aSqN0k4AP+4A=",  # GlobalSign Root CA - R3
+
+        # --- Emergency / Rollover Backup Pin ---
+        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="   # Rollover backup pin
+    ]
 }
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -412,11 +426,31 @@ class MacOSAgentSession:
         hostname = parsed.hostname or ""
         if is_loopback(self._api_url):
             return requests.Session()
+        try:
+            from common.updater import load_cached_dynamic_pins
+            from common.cert.pinning import register_dynamic_pins
+            cached = load_cached_dynamic_pins()
+            if cached:
+                register_dynamic_pins(cached)
+        except Exception:
+            pass
         pins    = SPKI_PINS.get(hostname, [])
         adapter = build_pinning_adapter(pins)
-        sess    = requests.Session()
+        sess    = PinnedSession()
         sess.mount("https://", adapter)
         return sess
+
+    def heal_certificate_pins(self) -> bool:
+        """Forces an immediate out-of-band Ed25519 OTA refresh of dynamic certificate pins."""
+        try:
+            from common.updater import fetch_dynamic_pins
+            updated = fetch_dynamic_pins(timeout=10)
+            if updated:
+                logging.info(f"[PINNING] Certificate pins manually refreshed: {list(updated.keys())}")
+                return True
+        except Exception as e:
+            logging.warning(f"[PINNING] Manual certificate pin refresh failed: {e}")
+        return False
 
     @property
     def headers(self) -> dict:
@@ -458,42 +492,32 @@ class MacOSAgentSession:
                 else self._platform.secure_store.encrypt(data)
             )
             if result is not None:
-                # Validate the token is a proper ZW_KC reference or RAW fallback
-                if not (result.startswith(b"ZW_KC::") or result.startswith(b"RAW::")):
+                # Validate the token is a proper ZW_KC reference
+                if not result.startswith(b"ZW_KC::"):
                     logger.error(
                         "encrypt() returned unexpected token format (len=%d) — "
                         "discarding to prevent corrupt disk state", len(result)
                     )
                     return None
                 return result
-            # Keychain unavailable — store raw bytes as base64 in state dir
-            logger.warning(
-                "Keychain unavailable — storing token unprotected in state dir. "
-                "This is expected during development on non-macOS hosts."
-            )
-            import base64
-            return b"RAW::" + base64.b64encode(data)
+            # Keychain unavailable — never store unencrypted tokens in production
+            logger.error("Keychain unavailable — refusing to store unprotected token.")
+            return None
         except Exception as exc:
-            # A root LaunchDaemon may not be able to access the logged-in
-            # user's Keychain. Keep the agent alive and persist the JWT in the
-            # same shared state directory using the explicit RAW:: fallback.
-            # The fallback is macOS-only; Linux and Windows use their own
-            # session implementations.
-            logger.warning(
-                "SecureStore encrypt failed: %s; using protected-state fallback.",
+            logger.error(
+                "SecureStore encrypt failed: %s; unencrypted storage is disabled.",
                 exc,
             )
-            import base64
-            return b"RAW::" + base64.b64encode(data)
+            return None
 
     def _decrypt(self, data: bytes, purpose: str = "default") -> bytes | None:
         """
-        Decrypt via MacOSSecureStore, or handle the RAW:: fallback token.
+        Decrypt via MacOSSecureStore. Reject unencrypted RAW:: tokens.
         """
         try:
             if data.startswith(b"RAW::"):
-                import base64
-                return base64.b64decode(data[5:])
+                logger.error("Unencrypted RAW:: token rejected for security compliance.")
+                return None
             named_decrypt = getattr(self._platform.secure_store, "decrypt_named", None)
             return (
                 named_decrypt(data, purpose)

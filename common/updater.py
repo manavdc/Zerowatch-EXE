@@ -30,7 +30,7 @@ GitHub Releases distribution:
   Uses plain requests (no cert pinning) against GitHub CDN — the Ed25519
   signature is the trust anchor, not TLS.
 
-Background check: every UPDATE_CHECK_INTERVAL_SECS (4 hours) via a daemon thread.
+Background check: every UPDATE_CHECK_INTERVAL_SECS (4 minutes) via a daemon thread.
 Manual check:     UpdateChecker.check_for_update(force=True)
 ─────────────────────────────────────────────────────────────────────────────
 """
@@ -52,16 +52,54 @@ from typing import Callable, Optional
 import requests
 
 # ---------------------------------------------------------------------------
-# Public key trust anchor
+# Public key trust anchor & Pin Helpers
 # ---------------------------------------------------------------------------
-# Imported from cert_pinning to keep all embedded trust constants co-located.
-# Falls back to a module-level constant if cert_pinning is unavailable.
 try:
-    from cert_pinning import OTA_ED25519_PUBLIC_KEY_B64  # type: ignore
+    from common.cert.pinning import (
+        is_valid_sha256_base64,
+        register_dynamic_pins,
+        OTA_ED25519_PUBLIC_KEY_B64,
+    )
 except ImportError:
-    # Placeholder — REPLACE BEFORE PRODUCTION DEPLOYMENT.
-    # Generated via: python -c "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; k=Ed25519PrivateKey.generate(); print(k.public_key().public_bytes_raw().hex())"
-    OTA_ED25519_PUBLIC_KEY_B64 = "A05PfsGyjAJZJAP2u4qbqaUJUObMJkETbPeBcVecky0="
+    try:
+        from cert_pinning import (
+            is_valid_sha256_base64,
+            OTA_ED25519_PUBLIC_KEY_B64,
+        )
+        def register_dynamic_pins(pins: dict) -> None:
+            pass
+    except ImportError:
+        def is_valid_sha256_base64(pin: str) -> bool:
+            if not isinstance(pin, str) or len(pin) != 44 or not pin.endswith('='):
+                return False
+            try:
+                return len(base64.b64decode(pin)) == 32
+            except Exception:
+                return False
+
+        def register_dynamic_pins(pins: dict) -> None:
+            pass
+
+        OTA_ED25519_PUBLIC_KEY_B64 = "A05PfsGyjAJZJAP2u4qbqaUJUObMJkETbPeBcVecky0="
+
+
+def normalize_ed25519_signature(sig_bytes: bytes) -> bytes:
+    """
+    Normalizes signature bytes which may arrive in raw binary (64 bytes),
+    hex string (128 ASCII chars), or base64 string (88 ASCII chars).
+    """
+    if len(sig_bytes) == 64:
+        return sig_bytes
+    try:
+        sig_str = sig_bytes.decode('ascii', errors='ignore').strip()
+        if len(sig_str) == 128:
+            return bytes.fromhex(sig_str)
+        dec = base64.b64decode(sig_str)
+        if len(dec) == 64:
+            return dec
+    except Exception:
+        pass
+    return sig_bytes
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -78,7 +116,7 @@ MANIFEST_SIG_URL = f"{_RELEASES_BASE}/release-manifest.json.sig"
 MANIFEST_MAX_AGE_DAYS: int = 3
 
 # Background poll: 4 hours (14400 seconds) for local OTA verification & restart check
-RESTART_CHECK_TIME: int = 180
+RESTART_CHECK_TIME: int = 14400
 UPDATE_CHECK_INTERVAL_SECS: int = RESTART_CHECK_TIME
 
 # Download streaming chunk size
@@ -173,7 +211,7 @@ class _TUFLayers:
     """
 
     @staticmethod
-    def verify_root(manifest_bytes: bytes, sig_bytes: bytes) -> None:
+    def verify_root(manifest_bytes: bytes, sig_bytes: bytes, pub_key_b64: Optional[str] = None) -> None:
         """
         [ROOT LAYER] Verify the Ed25519 detached signature over the raw manifest bytes.
 
@@ -186,11 +224,14 @@ class _TUFLayers:
             from cryptography.exceptions import InvalidSignature
 
             # Decode the embedded public key (raw 32-byte Ed25519 key in base64)
-            pub_key_bytes = base64.b64decode(OTA_ED25519_PUBLIC_KEY_B64)
+            key_str = pub_key_b64 or OTA_ED25519_PUBLIC_KEY_B64
+            pub_key_bytes = base64.b64decode(key_str)
             pub_key = Ed25519PublicKey.from_public_bytes(pub_key_bytes)
 
-            # The signature file is raw bytes (64-byte Ed25519 signature)
-            pub_key.verify(sig_bytes, manifest_bytes)
+            # Normalize signature bytes (raw 64-byte, 128-hex, or 88-base64)
+            norm_sig = normalize_ed25519_signature(sig_bytes)
+
+            pub_key.verify(norm_sig, manifest_bytes)
             logger.debug("[ROOT] Manifest Ed25519 signature verified.")
         except ImportError as exc:
             raise OTAError(f"cryptography library unavailable: {exc}") from exc
@@ -482,6 +523,201 @@ def _verify_authenticode_windows(binary_path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic SPKI Pin Management (Ed25519-Signed OTA Recovery)
+# ---------------------------------------------------------------------------
+
+DYNAMIC_PINS_FILENAME = "dynamic_pins.json"
+
+
+def _resolve_dynamic_pins_path(target_dir: Optional[str] = None) -> str:
+    """Resolves writable destination path for cached dynamic pins."""
+    if target_dir:
+        return os.path.join(target_dir, DYNAMIC_PINS_FILENAME)
+
+    env_dir = os.environ.get("ZEROWATCH_STATE_DIR")
+    if env_dir and os.path.isdir(env_dir):
+        return os.path.join(env_dir, DYNAMIC_PINS_FILENAME)
+
+    if sys.platform == "win32":
+        prog_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        zw_dir = os.path.join(prog_data, "ZeroWatch")
+        try:
+            os.makedirs(zw_dir, exist_ok=True)
+            test_file = os.path.join(zw_dir, ".perm_test")
+            with open(test_file, "w") as f:
+                f.write("ok")
+            os.remove(test_file)
+            return os.path.join(zw_dir, DYNAMIC_PINS_FILENAME)
+        except Exception:
+            pass
+
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        if local_app:
+            zw_user = os.path.join(local_app, "ZeroWatch")
+            os.makedirs(zw_user, exist_ok=True)
+            return os.path.join(zw_user, DYNAMIC_PINS_FILENAME)
+
+    # Fallback to sys.argv[0] directory or cwd
+    base = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else os.getcwd()
+    return os.path.join(base, DYNAMIC_PINS_FILENAME)
+
+
+def verify_and_extract_pins(
+    manifest_bytes: bytes,
+    sig_bytes: bytes,
+    public_key_b64: Optional[str] = None,
+    enforce_timestamp: bool = True
+) -> dict[str, list[str]]:
+    """
+    Cryptographically verifies the manifest via Ed25519 root signature and timestamp freshness,
+    then extracts and structurally validates any contained SPKI pins.
+
+    Returns:
+        Dict mapping hostnames (str) to lists of valid SHA-256 base64 SPKI pins.
+    Raises:
+        ManifestVerificationError: if Ed25519 signature is invalid or tampered.
+        TimestampExpiredError: if manifest timestamp is stale (freeze attack).
+        OTAError: on malformed JSON or invalid payload structure.
+    """
+    # 1. Verify Ed25519 detached signature
+    _TUFLayers.verify_root(manifest_bytes, sig_bytes, pub_key_b64=public_key_b64)
+
+    # 2. Parse JSON
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise OTAError(f"Manifest is not valid JSON after signature check: {exc}") from exc
+
+    # 3. Guard against freeze / replay attacks
+    if enforce_timestamp:
+        _TUFLayers.verify_timestamp(manifest)
+
+    # 4. Extract and validate spki_pins
+    raw_pins = manifest.get("spki_pins")
+    if not isinstance(raw_pins, dict) or not raw_pins:
+        return {}
+
+    validated_pins: dict[str, list[str]] = {}
+    for host, pins in raw_pins.items():
+        if not isinstance(host, str) or not host.strip():
+            continue
+        cleaned_host = host.strip().lower()
+        if not isinstance(pins, list):
+            continue
+        valid_list = [str(p) for p in pins if is_valid_sha256_base64(str(p))]
+        if valid_list:
+            validated_pins[cleaned_host] = list(dict.fromkeys(valid_list))
+
+    return validated_pins
+
+
+def save_dynamic_pins(pins: dict[str, list[str]], target_dir: Optional[str] = None) -> bool:
+    """
+    Atomically persists cryptographically verified dynamic pins to disk (dynamic_pins.json)
+    and hot-reloads them into the runtime memory cache (register_dynamic_pins).
+    """
+    if not isinstance(pins, dict) or not pins:
+        return False
+
+    # Immediate in-memory registration for running process
+    try:
+        register_dynamic_pins(pins)
+    except Exception as exc:
+        logger.debug("[OTA] Failed registering dynamic pins in memory: %s", exc)
+
+    # Atomic write to persistent file
+    pins_path = _resolve_dynamic_pins_path(target_dir)
+    tmp_path = f"{pins_path}.tmp"
+    try:
+        os.makedirs(os.path.dirname(pins_path), exist_ok=True)
+        payload = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "spki_pins": pins,
+        }
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp_path, pins_path)
+        logger.info("[OTA] Saved %d dynamic pin domain(s) to %s", len(pins), pins_path)
+        return True
+    except Exception as exc:
+        logger.warning("[OTA] Failed writing dynamic pins to %s: %s", pins_path, exc)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
+def load_cached_dynamic_pins(target_dir: Optional[str] = None) -> dict[str, list[str]]:
+    """
+    Loads previously verified dynamic pins from dynamic_pins.json on disk.
+    Filters every pin string to ensure valid base64 SHA-256 format.
+    """
+    pins_path = _resolve_dynamic_pins_path(target_dir)
+    if not os.path.exists(pins_path):
+        return {}
+
+    try:
+        with open(pins_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw_pins = data.get("spki_pins", {})
+        if not isinstance(raw_pins, dict):
+            return {}
+
+        validated: dict[str, list[str]] = {}
+        for host, pins in raw_pins.items():
+            if not isinstance(host, str) or not isinstance(pins, list):
+                continue
+            valid = [str(p) for p in pins if is_valid_sha256_base64(str(p))]
+            if valid:
+                validated[host.strip().lower()] = valid
+        return validated
+    except Exception as exc:
+        logger.debug("[OTA] Failed reading cached dynamic pins from %s: %s", pins_path, exc)
+        return {}
+
+
+def fetch_dynamic_pins(
+    manifest_url: Optional[str] = None,
+    manifest_sig_url: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+    public_key_b64: Optional[str] = None,
+    timeout: int = 15,
+) -> dict[str, list[str]]:
+    """
+    Out-of-band OTA retrieval: Fetches the latest signed release manifest from the CDN,
+    validates the Ed25519 signature and timestamp, extracts new `spki_pins`, and
+    persists them locally.
+
+    Safe to call directly when a PinError occurs without downloading binary payloads.
+    """
+    m_url = manifest_url or MANIFEST_URL
+    s_url = manifest_sig_url or MANIFEST_SIG_URL
+    sess = session or requests.Session()
+
+    logger.info("[OTA] Fetching dynamic SPKI pins from %s...", m_url)
+    resp_m = sess.get(m_url, timeout=timeout)
+    resp_m.raise_for_status()
+    manifest_bytes = resp_m.content
+
+    resp_s = sess.get(s_url, timeout=timeout)
+    resp_s.raise_for_status()
+    sig_bytes = resp_s.content
+
+    verified = verify_and_extract_pins(
+        manifest_bytes,
+        sig_bytes,
+        public_key_b64=public_key_b64,
+        enforce_timestamp=True,
+    )
+    if verified:
+        save_dynamic_pins(verified)
+        logger.info("[OTA] Successfully updated dynamic pins via Ed25519 OTA: %s", list(verified.keys()))
+    return verified
+
+
+# ---------------------------------------------------------------------------
 # UpdateChecker
 # ---------------------------------------------------------------------------
 
@@ -579,11 +815,44 @@ class UpdateChecker:
         Returns UpdateInfo if a newer version is available.
         Raises UpdateNotAvailable if current version is already up-to-date.
         """
-        logger.info("[OTA] Fetching manifest from GitHub Releases CDN...")
+        logger.info("[OTA] Fetching manifest from GitHub Releases...")
 
         # 1. Fetch raw manifest bytes and signature
-        manifest_bytes = self._fetch_raw(MANIFEST_URL)
-        sig_bytes      = self._fetch_raw(MANIFEST_SIG_URL)
+        manifest_bytes = None
+        sig_bytes = None
+        asset_api_urls: dict[str, str] = {}
+
+        # First attempt: GitHub REST API (bypasses 504 CDN gateway timeouts)
+        try:
+            api_resp = self._session.get(
+                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                headers={"User-Agent": "SentinelAgent-OTA", "Accept": "application/vnd.github.v3+json"},
+                timeout=10,
+            )
+            if api_resp.status_code == 200:
+                rel_data = api_resp.json()
+                for asset in rel_data.get("assets", []):
+                    name = asset.get("name")
+                    url = asset.get("url")
+                    if name and url:
+                        asset_api_urls[name] = url
+
+                if "release-manifest.json" in asset_api_urls and "release-manifest.json.sig" in asset_api_urls:
+                    manifest_bytes = self._fetch_raw(
+                        asset_api_urls["release-manifest.json"],
+                        headers={"Accept": "application/octet-stream", "User-Agent": "SentinelAgent-OTA"}
+                    )
+                    sig_bytes = self._fetch_raw(
+                        asset_api_urls["release-manifest.json.sig"],
+                        headers={"Accept": "application/octet-stream", "User-Agent": "SentinelAgent-OTA"}
+                    )
+        except Exception as api_err:
+            logger.debug("[OTA] GitHub API release check failed (%s); trying direct CDN download", api_err)
+
+        # Fallback to direct CDN download if API was not used or failed
+        if manifest_bytes is None or sig_bytes is None:
+            manifest_bytes = self._fetch_raw(MANIFEST_URL)
+            sig_bytes      = self._fetch_raw(MANIFEST_SIG_URL)
 
         # 2. ROOT layer — Ed25519 signature over entire manifest JSON
         _TUFLayers.verify_root(manifest_bytes, sig_bytes)
@@ -596,6 +865,19 @@ class UpdateChecker:
 
         # 3. TIMESTAMP layer — freeze attack protection
         _TUFLayers.verify_timestamp(manifest)
+
+        # Dynamic SPKI Pin Ingestion: If manifest includes updated pins, verify and cache them immediately
+        raw_pins = manifest.get("spki_pins")
+        if isinstance(raw_pins, dict) and raw_pins:
+            try:
+                verified_pins = verify_and_extract_pins(
+                    manifest_bytes, sig_bytes, enforce_timestamp=False
+                )
+                if verified_pins:
+                    save_dynamic_pins(verified_pins)
+                    logger.info("[OTA] Verified and registered dynamic SPKI pins from release manifest: %s", list(verified_pins.keys()))
+            except Exception as pin_err:
+                logger.warning("[OTA] Failed to apply dynamic SPKI pins from manifest: %s", pin_err)
 
         # 4. SNAPSHOT layer — mix-and-match attack protection
         _TUFLayers.verify_snapshot(manifest)
@@ -623,7 +905,11 @@ class UpdateChecker:
             )
 
         filename = entry["filename"]
-        asset_url = f"https://github.com/{GITHUB_REPO}/releases/latest/download/{filename}"
+        # Use direct API asset download URL if available, otherwise direct download URL
+        asset_url = asset_api_urls.get(
+            filename,
+            f"https://github.com/{GITHUB_REPO}/releases/latest/download/{filename}"
+        )
 
         target = TargetInfo(
             filename    = filename,
@@ -648,13 +934,19 @@ class UpdateChecker:
             target       = target,
         )
 
-    def _fetch_raw(self, url: str) -> bytes:
+    def _fetch_raw(self, url: str, headers: Optional[dict] = None) -> bytes:
         """Download a small file (manifest/sig) and return its raw bytes."""
         try:
-            resp = self._session.get(url, timeout=_HTTP_TIMEOUT)
+            req_headers = {"User-Agent": "SentinelAgent-OTA"}
+            if headers:
+                req_headers.update(headers)
+            resp = self._session.get(url, headers=req_headers, timeout=_HTTP_TIMEOUT)
             resp.raise_for_status()
             return resp.content
         except requests.HTTPError as exc:
+            status_code = getattr(exc.response, "status_code", 0)
+            if status_code in (502, 503, 504):
+                raise OTAError(f"GitHub CDN is temporarily unavailable (HTTP {status_code} Gateway Timeout). Please retry shortly.") from exc
             raise OTAError(f"HTTP error fetching {url}: {exc}") from exc
         except requests.RequestException as exc:
             raise OTAError(f"Network error fetching {url}: {exc}") from exc
@@ -730,7 +1022,10 @@ class BinaryDownloader:
         try:
             with open(tmp_path, "wb") as fh:
                 while bytes_done < total and retries <= max_retries:
-                    headers = {}
+                    headers = {
+                        "Accept": "application/octet-stream",
+                        "User-Agent": "SentinelAgent-OTA",
+                    }
                     if bytes_done > 0:
                         headers["Range"] = f"bytes={bytes_done}-"
 

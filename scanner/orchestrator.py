@@ -80,6 +80,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
@@ -269,12 +270,40 @@ class ScanOrchestrator:
 
     def _state_dir(self) -> str:
         """Returns the path to the agent's state directory."""
-        # Mirrors the existing _secure_state_dir() / _state_path() logic
-        # from sentinel_agent.py without importing it.
-        candidates = [
-            os.path.join(os.environ.get("PROGRAMDATA", ""), "ZeroWatch", "state"),
-            os.path.join(self._base_dir, "state"),
-        ]
+        # 1. If base_dir already points to a state directory, prioritize it directly.
+        if self._base_dir and (self._base_dir.endswith("state") or os.path.basename(self._base_dir) == "state"):
+            try:
+                os.makedirs(self._base_dir, exist_ok=True)
+                test = os.path.join(self._base_dir, ".write_test")
+                with open(test, "w") as fh:
+                    fh.write("x")
+                os.remove(test)
+                return self._base_dir
+            except OSError:
+                pass
+
+        # 2. Platform-aware canonical candidates
+        if sys.platform.startswith("linux"):
+            candidates = [
+                "/var/lib/zerowatch/state",
+                "/var/tmp/zerowatch/state",
+                os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "zerowatch", "state"),
+                "/tmp/zerowatch/state",
+                os.path.join(self._base_dir, "state"),
+            ]
+        elif sys.platform == "darwin":
+            candidates = [
+                "/Library/Application Support/ZeroWatch/state",
+                os.path.expanduser("~/Library/Application Support/ZeroWatch/state"),
+                os.path.join(self._base_dir, "state"),
+            ]
+        else:
+            prog_data = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
+            candidates = [
+                os.path.join(prog_data, "ZeroWatch", "state"),
+                os.path.join(self._base_dir, "state"),
+            ]
+
         for c in candidates:
             try:
                 os.makedirs(c, exist_ok=True)
@@ -283,6 +312,17 @@ class ScanOrchestrator:
                 with open(test, "w") as fh:
                     fh.write("x")
                 os.remove(test)
+
+                # Migrate legacy scan_cache.db if it was created in CWD "ZeroWatch/state"
+                legacy_cwd_db = os.path.join("ZeroWatch", "state", "scan_cache.db")
+                target_db = os.path.join(c, "scan_cache.db")
+                if os.path.isfile(legacy_cwd_db) and not os.path.exists(target_db):
+                    try:
+                        import shutil
+                        shutil.copy2(legacy_cwd_db, target_db)
+                    except OSError:
+                        pass
+
                 return c
             except OSError:
                 pass
