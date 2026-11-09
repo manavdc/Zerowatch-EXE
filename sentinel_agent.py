@@ -5022,7 +5022,7 @@ def _detach_macos_daemon_from_terminal() -> None:
         logging.warning("macOS daemon detachment failed; continuing: %s", exc)
 
 
-def _auto_bootstrap_background_agent() -> None:
+def _auto_bootstrap_background_agent(force: bool = False) -> None:
     """Ensure startup persistence and background daemon are active for GUI sessions."""
     global _last_daemon_spawn_at
     # Make startup persistence idempotent so a single GUI launch is enough.
@@ -5040,7 +5040,7 @@ def _auto_bootstrap_background_agent() -> None:
             if _is_daemon_running():
                 return
             now = time.monotonic()
-            if now - _last_daemon_spawn_at < _DAEMON_SPAWN_COOLDOWN:
+            if not force and (now - _last_daemon_spawn_at < _DAEMON_SPAWN_COOLDOWN):
                 logging.debug("Daemon spawn suppressed by cooldown.")
                 return
             _last_daemon_spawn_at = now
@@ -7548,7 +7548,7 @@ class EnrollmentFrame(tk.Frame):
             # GUI/startup triggers so the pending state cannot be left with
             # only the Tk polling thread alive.
             try:
-                _auto_bootstrap_background_agent()
+                _auto_bootstrap_background_agent(force=True)
             except Exception as exc:
                 logging.warning("[GUI] Pre-approval daemon bootstrap failed: %s", exc)
 
@@ -7590,11 +7590,11 @@ class EnrollmentFrame(tk.Frame):
         def _post_enrollment_tasks():
             _append_gui_log(self.zw_client.base_dir, "Starting post-enrollment system integration...")
             
-            # Send immediate baseline inventory sync so backend builds CVE
-            # feed right away.  Skip on macOS where the background daemon
-            # owns inventory collection — running a GUI scan here races
-            # with the daemon and can upload an empty/partial result.
-            if sys.platform != "darwin":
+            # Send immediate baseline inventory sync on Windows so backend builds
+            # CVE feed right away. Skip on Linux and macOS where the background daemon
+            # owns inventory collection with its cross-process approval sync claim — running
+            # a GUI scan on POSIX races with the daemon and causes duplicate full sync requests.
+            if sys.platform == "win32":
                 try:
                     hardware_data = get_detailed_hardware_profile()
                     fast_software = get_installed_software_registry()
@@ -9331,7 +9331,7 @@ class UnifiedSentinelGUI(tk.Tk):
             # background daemon is running through the same idempotent path
             # used by approval notifications and startup repair.
             if self.zw_client and (self.zw_client.has_pending_join() or self.zw_client.is_enrolled()):
-                _auto_bootstrap_background_agent()
+                _auto_bootstrap_background_agent(force=True)
         except Exception as exc:
             logging.warning("Background daemon bootstrap on GUI close failed: %s", exc)
         self.destroy()

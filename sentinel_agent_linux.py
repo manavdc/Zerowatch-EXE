@@ -305,18 +305,24 @@ def _acquire_single_instance_lock(state_dir: str) -> bool:
         pass
 
     try:
-        _lock_fh = open(lock_path, "w")
+        _lock_fh = open(lock_path, "a+")
         try:
             os.chmod(lock_path, 0o666)
         except OSError:
             pass
         fcntl.flock(_lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fh.seek(0)
+        _lock_fh.truncate()
         _lock_fh.write(str(os.getpid()) + "\n")
         _lock_fh.flush()
         return True
     except BlockingIOError:
         try:
-            pid = open(lock_path).read().strip()
+            if _lock_fh:
+                _lock_fh.seek(0)
+                pid = _lock_fh.read().strip()
+            else:
+                pid = open(lock_path).read().strip()
         except OSError:
             pid = "unknown"
         logger.error(
@@ -455,26 +461,67 @@ class LinuxAgentSession:
                 pass
 
     def load_join_state(self) -> dict:
-        """Load enrollment state written by the GUI in the shared state dir."""
-        for path in (self._join_path, os.path.join(self._state_dir, "zw_team_join_state.dat")):
-            if not os.path.exists(path):
-                continue
+        """Load enrollment state written by the GUI in the shared state dir.
+
+        Checks both zw_team_join_state.dat (GUI/Windows-compatible DPAPI/AES)
+        and join_state.json, sorted by newest mtime, and prioritizes active
+        enrollment records ('pending', 'approved').
+        """
+        candidates = [
+            os.path.join(self._state_dir, "zw_team_join_state.dat"),
+            self._join_path,
+        ]
+        existing_paths = [p for p in candidates if os.path.exists(p)]
+        existing_paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+
+        # 1. Prefer newest active state (pending or approved)
+        for path in existing_paths:
             try:
                 with open(path, "rb") as fh:
                     raw = fh.read()
-                decoded = self._decrypt(raw) or raw
-                state = json.loads(decoded.decode("utf-8"))
+                decoded = None
+                try:
+                    decoded = self._decrypt(raw)
+                except Exception:
+                    pass
+                payload = decoded if decoded is not None else raw
+                state = json.loads(payload.decode("utf-8"))
                 if isinstance(state, dict):
-                    return state
+                    status = str(state.get("status") or "").lower()
+                    if status in ("pending", "approved"):
+                        return state
             except Exception as exc:
                 logger.debug("Join state load failed from %s: %s", path, exc)
+
+        # 2. Fall back to any parseable state
+        for path in existing_paths:
+            try:
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+                decoded = None
+                try:
+                    decoded = self._decrypt(raw)
+                except Exception:
+                    pass
+                payload = decoded if decoded is not None else raw
+                state = json.loads(payload.decode("utf-8"))
+                if isinstance(state, dict):
+                    return state
+            except Exception:
+                pass
         return {}
 
     def save_join_state(self, updates: dict) -> None:
-        """Merge *updates* into the persisted join_state.json without overwriting
-        fields that are not being changed. Used by the approval-sync state machine."""
+        """Merge *updates* into the persisted join_state.json and zw_team_join_state.dat
+        without overwriting fields that are not being changed."""
         existing = self.load_join_state()
         merged   = {**existing, **updates}
+        dev_id = getattr(self, "_device_id", None)
+        if dev_id:
+            if "deviceId" not in merged:
+                merged["deviceId"] = dev_id
+            if "device_id" not in merged:
+                merged["device_id"] = dev_id
         try:
             data = json.dumps(merged).encode("utf-8")
             enc  = self._encrypt(data)
@@ -568,6 +615,7 @@ class LinuxAgent:
 
         # HTTP session
         self._session = LinuxAgentSession(BASE_API_URL, self._state_dir, self._platform)
+        self._session._device_id = self._device_id
 
         # Build ScanOrchestrator with Linux implementations injected
         self._orchestrator = ScanOrchestrator(
@@ -691,19 +739,86 @@ class LinuxAgent:
                 logger.warning("Auth check failed: %s", exc)
                 self._session.clear_jwt()
 
+        # Check for environment-variable codes (headless / scripted enrollment)
+        team_code = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
+        individual_code = os.environ.get("INDIVIDUAL_CODE") or os.environ.get("ZEROWATCH_INDIVIDUAL_CODE")
+
         state = self._session.load_join_state()
-        if str(state.get("status") or "").lower() in {"pending", "approved"}:
-            # ── FIXED: No hard deadline. Poll until shutdown, approval, or denial.
-            # The previous 600-second deadline caused the agent to silently fall
-            # through to the env-var flow when the admin approved after 10 minutes,
-            # permanently breaking enrollment for agents whose GUI was closed.
+        has_pending_join = str(state.get("status") or "").lower() in {"pending", "approved"}
+
+        # If not pending and codes are not in environment, wait responsively (5s intervals)
+        # matching Windows _wait_for_enrollment without 120-second backoff sleeps.
+        if not has_pending_join and not team_code and not individual_code:
+            logger.info(
+                "[DAEMON_WAITING] Waiting for enrollment: team code in GUI OR "
+                "env-var codes (device_id=%s)...",
+                self._device_id,
+            )
+            wait_count = 0
+            while not self._shutdown_event.is_set():
+                # 1. Check if GUI completed enrollment and wrote a JWT
+                if self._session.load_jwt():
+                    try:
+                        resp = self._session.get("/agent/info")
+                        if resp.status_code == 200:
+                            logger.info(
+                                "[DAEMON_WAITING] JWT detected on disk and verified (device_id=%s).",
+                                self._device_id,
+                            )
+                            return True
+                    except Exception:
+                        pass
+
+                # 2. Check if GUI submitted a join request and wrote pending join state
+                state = self._session.load_join_state()
+                if str(state.get("status") or "").lower() in {"pending", "approved"}:
+                    logger.info(
+                        "[DAEMON_WAITING] Active enrollment detected (status=%s); "
+                        "transitioning to approval polling (device_id=%s).",
+                        state.get("status"), self._device_id,
+                    )
+                    has_pending_join = True
+                    break
+
+                # 3. Check for runtime env-var codes
+                team_code       = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
+                individual_code = os.environ.get("INDIVIDUAL_CODE") or os.environ.get("ZEROWATCH_INDIVIDUAL_CODE")
+                if team_code or individual_code:
+                    logger.info("[DAEMON_WAITING] Enrollment code found in environment. Proceeding.")
+                    break
+
+                self._shutdown_event.wait(timeout=5)
+                wait_count += 1
+                if wait_count % 12 == 0:  # Log every ~60 seconds
+                    logger.info(
+                        "[DAEMON_WAITING] Still waiting for enrollment... (device_id=%s)",
+                        self._device_id,
+                    )
+
+            if not has_pending_join and not team_code and not individual_code:
+                return False
+
+        if has_pending_join:
             logger.info(
                 "[PENDING_APPROVAL] Resuming persisted enrollment; "
-                "polling indefinitely for administrator approval (device_id=%s).",
+                "polling for administrator approval (device_id=%s).",
                 self._device_id,
             )
             consecutive_errors = 0
             while not self._shutdown_event.is_set():
+                # Check if GUI already validated and saved JWT
+                if self._session.load_jwt():
+                    try:
+                        resp = self._session.get("/agent/info")
+                        if resp.status_code == 200:
+                            logger.info(
+                                "[APPROVAL_DETECTED] Valid JWT detected; authenticated (device_id=%s).",
+                                self._device_id,
+                            )
+                            return True
+                    except Exception:
+                        pass
+
                 try:
                     response = self._session.get(
                         f"/agent/join-status?deviceId={self._device_id}"
@@ -722,6 +837,8 @@ class LinuxAgent:
                             fresh_state["teamId"] = data.get("teamId") or fresh_state.get("teamId")
                             fresh_state["organizationName"] = data.get("organizationName") or fresh_state.get("organizationName")
                             fresh_state["requestId"] = data.get("requestId") or fresh_state.get("requestId")
+                            fresh_state["deviceId"] = self._device_id
+                            fresh_state["device_id"] = self._device_id
                             self._session.save_join_state(fresh_state)
                             
                             logger.info(
@@ -733,15 +850,14 @@ class LinuxAgent:
                             return True
                         if status == "denied":
                             logger.error(
-                                "[ENROLLMENT] Persisted enrollment denied by administrator "
-                                "(device_id=%s).",
+                                "[ENROLLMENT] Persisted enrollment denied by administrator (device_id=%s).",
                                 self._device_id,
                             )
+                            clear_device_state(self._state_dir)
                             return False
                         # Still pending — reset error counter
                         consecutive_errors = 0
                     elif response.status_code in (401, 403, 404):
-                        # Backend says the request no longer exists — stop waiting
                         logger.warning(
                             "[ENROLLMENT] Join-status returned HTTP %d; clearing pending state.",
                             response.status_code,
@@ -756,69 +872,9 @@ class LinuxAgent:
                         "Persisted enrollment status check failed (attempt %d): %s",
                         consecutive_errors, exc,
                     )
-                # Back-off: 8s normally, up to 60s after repeated errors
-                wait = min(8 * (1 + consecutive_errors // 5), 60)
+                # Responsive 5-second polling (same as Windows time.sleep(5)), backed off only on errors
+                wait = 5 if consecutive_errors < 3 else min(5 * (1 + consecutive_errors // 3), 30)
                 self._shutdown_event.wait(timeout=wait)
-
-        # Retrieve codes from environment variables (same as Windows)
-        team_code = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
-        individual_code = os.environ.get("INDIVIDUAL_CODE") or os.environ.get("ZEROWATCH_INDIVIDUAL_CODE")
-
-        if not team_code and not individual_code:
-            logger.warning(
-                "No enrollment code found in environment. "
-                "Set TEAM_CODE=<your-team-code> or INDIVIDUAL_CODE=<your-code> "
-                "then restart the agent, OR enroll the device from the ZeroWatch dashboard."
-            )
-            logger.info(
-                "[DAEMON_WAITING] Waiting for credentials: env-var codes OR "
-                "GUI-written JWT/join_state.json (device_id=%s)...",
-                self._device_id,
-            )
-            jwt_path        = os.path.join(self._state_dir, "agent_token.enc")
-            join_state_path = os.path.join(self._state_dir, "join_state.json")
-            legacy_jwt_path = os.path.join(self._state_dir, "zerowatch_token.dat")
-            wait_count = 0
-            while not self._shutdown_event.is_set():
-                self._shutdown_event.wait(timeout=8)
-                wait_count += 1
-
-                # Check for env-var codes being set
-                team_code       = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
-                individual_code = os.environ.get("INDIVIDUAL_CODE") or os.environ.get("ZEROWATCH_INDIVIDUAL_CODE")
-                if team_code or individual_code:
-                    logger.info("[DAEMON_WAITING] Enrollment code found in environment. Proceeding.")
-                    break
-
-                # Check if the GUI wrote a JWT or join_state.json after re-enrollment.
-                # If so, return False so run()'s outer retry loop calls
-                # _register_or_authenticate() again from the top (JWT-load path).
-                if os.path.exists(jwt_path) or os.path.exists(legacy_jwt_path):
-                    logger.info(
-                        "[DAEMON_WAITING] JWT appeared on disk (GUI re-enrolled?). "
-                        "Restarting authentication (device_id=%s).",
-                        self._device_id,
-                    )
-                    return False  # run() will retry immediately
-
-                join_state = self._session.load_join_state()
-                if str(join_state.get("status") or "").lower() in {"pending", "approved"}:
-                    logger.info(
-                        "[DAEMON_WAITING] join_state.json updated by GUI (status=%s). "
-                        "Restarting authentication (device_id=%s).",
-                        join_state.get("status"), self._device_id,
-                    )
-                    return False  # run() will retry immediately
-
-                if wait_count % 8 == 0:  # Log every ~64 seconds
-                    logger.info(
-                        "[DAEMON_WAITING] Still waiting for credentials... "
-                        "(checked %d times, device_id=%s)",
-                        wait_count, self._device_id,
-                    )
-
-            if not team_code and not individual_code:
-                return False
 
 
         # 1. Team Code Join Flow
@@ -1116,6 +1172,11 @@ class LinuxAgent:
         if not hasattr(self, "_initial_scan_done"):
             self._initial_scan_done = threading.Event()
 
+        if not approval_sync_claimed:
+            logger.info("[STARTUP_SCAN] Approval sync not claimed; skipping initial scan.")
+            self._initial_scan_done.set()
+            return
+
         # Collect full hardware profile
         try:
             hardware = self._platform.hardware_collector.get_detailed_hardware_profile()
@@ -1286,21 +1347,29 @@ class LinuxAgent:
         monitor.start()
         logger.info("Heartbeat monitor started (interval=%ds).", HEARTBEAT_INTERVAL)
 
-        # Approval-sync idempotency check
+        # Approval-sync idempotency check (matching Windows behavior)
         approval_sync_claimed = self._claim_approval_sync()
-        if approval_sync_claimed:
+        approval_sync_already_complete = self._approval_sync_complete()
+
+        if approval_sync_already_complete:
+            logger.info(
+                "[ENROLLMENT] Approval sync already complete; skipping duplicate startup sync (device_id=%s).",
+                self._device_id,
+            )
+        elif not approval_sync_claimed:
+            logger.info(
+                "[ENROLLMENT] Approval sync claimed by another worker; skipping duplicate startup sync (device_id=%s).",
+                self._device_id,
+            )
+        else:
             logger.info(
                 "[ENROLLMENT] Approval claimed by Linux daemon; "
                 "starting complete inventory sync (device_id=%s).",
                 self._device_id,
             )
-
-        # Initial startup scan (L0 + priority L1/L2 within 60s)
-        self._initial_scan_and_sync(approval_sync_claimed=approval_sync_claimed)
-
-        # The initial scan may continue after the fast fallback. Do not start
-        # another worker against the shared SQLite cache until it completes.
-        self._initial_scan_done.wait()
+            # Initial startup scan (L0 + priority L1/L2 within 60s)
+            self._initial_scan_and_sync(approval_sync_claimed=True)
+            self._initial_scan_done.wait()
 
         # Start background L1/L2 filesystem scans (4h priority / 24h deep)
         self._orchestrator.start_periodic_scans(on_delta=self._on_fs_delta)

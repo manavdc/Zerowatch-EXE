@@ -123,3 +123,77 @@ class TestLinuxInventoryPipeline:
         assert sync_calls[1] == ("complete", 2)
         agent._finish_approval_sync.assert_called_once_with(True)
 
+    @patch("sentinel_agent_linux.LinuxAgentSession")
+    def test_initial_scan_skipped_when_not_claimed(self, mock_session_cls):
+        """When approval sync is not claimed (e.g. already complete or claimed by another worker),
+        _initial_scan_and_sync must skip both Stage 1 and Stage 2 completely."""
+        from sentinel_agent_linux import LinuxAgent
+
+        agent = LinuxAgent.__new__(LinuxAgent)
+        agent._device_id = "test-device-4"
+        agent._shutdown_event = threading.Event()
+        agent._sync_full_with_retry = MagicMock()
+        agent._finish_approval_sync = MagicMock()
+
+        agent._initial_scan_and_sync(approval_sync_claimed=False)
+
+        assert agent._sync_full_with_retry.call_count == 0
+        assert agent._finish_approval_sync.call_count == 0
+        assert agent._initial_scan_done.is_set() is True
+
+    def test_load_join_state_prefers_active_pending_state(self, tmp_path):
+        """load_join_state must prioritize active 'pending'/'approved' state across dat/json files."""
+        import json
+        from sentinel_agent_linux import LinuxAgentSession
+
+        state_dir = str(tmp_path)
+        # Old json file with status "none"
+        old_json = tmp_path / "join_state.json"
+        old_json.write_text(json.dumps({"status": "none"}), encoding="utf-8")
+
+        # Newer dat file with status "pending"
+        new_dat = tmp_path / "zw_team_join_state.dat"
+        new_dat.write_text(json.dumps({"status": "pending", "teamCode": "ABCDEF"}), encoding="utf-8")
+
+        mock_plat = MagicMock()
+        mock_plat.secure_store.decrypt.side_effect = lambda b: b
+        session = LinuxAgentSession("http://127.0.0.1:8000", state_dir, mock_plat)
+
+        loaded = session.load_join_state()
+        assert loaded.get("status") == "pending"
+        assert loaded.get("teamCode") == "ABCDEF"
+
+    @patch("sentinel_agent_linux.LinuxAgentSession")
+    def test_register_or_authenticate_polls_and_detects_approval(self, mock_session_cls):
+        """_register_or_authenticate must poll join-status and return True upon approval."""
+        from sentinel_agent_linux import LinuxAgent
+
+        agent = LinuxAgent.__new__(LinuxAgent)
+        agent._device_id = "test-device-5"
+        agent._state_dir = "/tmp/test"
+        agent._shutdown_event = threading.Event()
+        agent._platform = MagicMock()
+        agent._platform.hardware_collector.collect_fingerprint.return_value = {}
+
+        mock_session = MagicMock()
+        mock_session.load_jwt.side_effect = [False, False]  # no initial JWT
+        mock_session.load_join_state.return_value = {"status": "pending", "teamCode": "ABC"}
+
+        # Simulate join-status returning approved on poll
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "status": "approved",
+            "jwt": "approved-jwt-token-123",
+            "teamCode": "ABC",
+            "requestId": "req-999",
+        }
+        mock_session.get.return_value = mock_resp
+        agent._session = mock_session
+
+        res = agent._register_or_authenticate()
+
+        assert res is True
+        mock_session.save_jwt.assert_called_once_with("approved-jwt-token-123")
+        mock_session.save_join_state.assert_called()
+
