@@ -750,13 +750,34 @@ except Exception:
 
 
 def _resolve_base_api_url():
-    # Priority: env override -> dev mode flag -> local json config -> baked-in default -> source/localhost fallback.
+    # Priority: CLI flags (--server / --prod / --dev / --local) -> env override -> local json config -> baked-in default -> testing fallback.
+    for i, arg in enumerate(sys.argv):
+        if arg == "--server" and i + 1 < len(sys.argv):
+            s_url = sys.argv[i + 1].strip().rstrip("/")
+            if not s_url.endswith("/api"):
+                s_url += "/api"
+            return s_url
+        if arg.startswith("--server="):
+            s_url = arg.split("=", 1)[1].strip().rstrip("/")
+            if not s_url.endswith("/api"):
+                s_url += "/api"
+            return s_url
+
+    if "--prod" in sys.argv or os.environ.get("ZEROWATCH_PROD_MODE") == "1":
+        return "https://zerowatch.deepcytes.io/api"
+
     env_url = os.environ.get("ZEROWATCH_API_URL") or os.environ.get("AGENT_SERVER_URL")
     if env_url:
         return str(env_url).rstrip("/")
 
-    if "--dev" in sys.argv or os.environ.get("ZEROWATCH_DEV_MODE") == "1":
-        return "https://zerowatch.deepcytes.io/api"
+    if (
+        "--dev" in sys.argv
+        or "--local" in sys.argv
+        or "--test" in sys.argv
+        or os.environ.get("ZEROWATCH_DEV_MODE") == "1"
+        or os.environ.get("ZEROWATCH_LOCAL") == "1"
+    ):
+        return "http://localhost:3001/api"
 
     # Search multiple candidate locations for agent_config.json
     candidate_dirs = [
@@ -782,12 +803,8 @@ def _resolve_base_api_url():
     if FORCED_BASE_API_URL:
         return str(FORCED_BASE_API_URL).rstrip("/")
 
-    # If running from uncompiled python source (.py file), default to production backend
-    is_script_run = not IS_COMPILED and not getattr(sys, "frozen", False) and str(sys.argv[0]).endswith(".py")
-    if is_script_run:
-        return "https://zerowatch.deepcytes.io/api"
-
-    return "https://zerowatch.deepcytes.io/api"
+    # Default to local dev backend for testing branch
+    return "http://localhost:3001/api"
 
 
 BASE_API_URL = _resolve_base_api_url()

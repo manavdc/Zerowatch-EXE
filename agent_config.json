@@ -1,0 +1,4 @@
+{
+  "api_base_url": "http://localhost:3001/api",
+  "comment": "Local development and testing endpoint for Windows Sentinel Agent"
+}
