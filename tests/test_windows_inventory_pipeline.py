@@ -119,3 +119,48 @@ class TestWindowsInventoryPipeline:
         assert call_json["batch_count"] == 5
         assert len(call_json["added"]) == 1
 
+    def test_orchestrator_deduplicates_sub_binaries(self):
+        """Orchestrator must not create duplicate software items from sub-binaries in registered app paths."""
+        from scanner.orchestrator import ScanOrchestrator
+        from common.scanner.models import SoftwareItem
+
+        reg_chrome = SoftwareItem(
+            name="Google Chrome",
+            version="157.0.8103.51",
+            vendor="Google LLC",
+            source="registry",
+            install_location=r"C:\Program Files\Google\Chrome\Application"
+        )
+        pe_chrome_helper = SoftwareItem(
+            name="Google Chrome",
+            version="153.0.8002.0",
+            vendor="Google LLC",
+            source="pe_binary",
+            scan_path=r"C:\Program Files\Google\Chrome\Application\PlatformExperienceHelper\platform_experience_helper.exe"
+        )
+
+        deduped = ScanOrchestrator._deduplicate([reg_chrome, pe_chrome_helper])
+        assert len(deduped) == 1
+        assert deduped[0].version == "157.0.8103.51"
+        assert deduped[0].source == "registry"
+
+    def test_fs_walker_skips_ide_internal_extensions(self):
+        """fs_walker must skip internal IDE language grammar directories."""
+        from windows.scanner.fs_walker import _should_skip_dir
+        import os
+
+        class MockDirEntry:
+            def __init__(self, name):
+                self.name = name
+
+        # Path inside IDE resources/app/extensions
+        entry = MockDirEntry("python")
+        path = r"c:\users\admin\appdata\local\programs\antigravity ide\resources\app\extensions\python"
+        assert _should_skip_dir(entry, path) is True
+
+        # Normal project directory
+        entry_proj = MockDirEntry("myproject")
+        path_proj = r"c:\projects\myproject"
+        assert _should_skip_dir(entry_proj, path_proj) is False
+
+
