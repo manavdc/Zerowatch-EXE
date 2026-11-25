@@ -147,6 +147,9 @@ def _should_skip_dir(
     if name_lower in SKIP_DIR_NAMES:
         return True
 
+    if "resources\\app\\extensions" in abs_path_lower or "resources/app/extensions" in abs_path_lower:
+        return True
+
     if conditional_skip and name_lower in conditional_skip:
         return True
 

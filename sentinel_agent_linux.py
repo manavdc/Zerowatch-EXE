@@ -65,7 +65,7 @@ from common.state_cleanup import clear_device_state
 AGENT_VERSION = "1.0.0-linux"
 HEARTBEAT_INTERVAL = 30        # seconds between heartbeats
 MONITOR_INTERVAL   = 120       # seconds between delta scan checks
-RESTART_CHECK_TIME = 180  # 4 hours in seconds (OTA update & restart check interval)
+RESTART_CHECK_TIME = 14400  # 4 hours in seconds (OTA update & restart check interval)
 RECONNECT_DELAY    = 10        # seconds before reconnect attempt
 
 # Build-time server URL injection (written by run_agent.sh)
@@ -104,14 +104,28 @@ if "localhost" in BASE_API_URL or "127.0.0.1" in BASE_API_URL:
 # ── SPKI pins (identical to Windows agent) ────────────────────────────────────
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
-        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
-        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
-        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="
-    ],
-    "zerowatch-testing.eastasia.cloudapp.azure.com": [
-        "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",
-        "EzSBE12fT2ZrphmumaBjrpdpXv9G71RhZQHMvuwszI4="
-    ],
+        # --- Leaf Public Keys (90-Day Lifespan) ---
+        "a6WoJxzcp0Im4dXEiaHUcio3U8wbbRWdVyaWoqsIlGQ=",  # Google Trust Services (Active Leaf from 2026-11-03)
+        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",  # Previous Leaf
+
+        # --- Intermediate CAs (1 to 5-Year Lifespan) ---
+        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",  # Google Trust Services WE1 Intermediate CA
+        "jQJTbIh0grw0/1TkHSumWb+Fs0Ggogr621gT3PvPKG0=",  # Let's Encrypt R3 Intermediate CA
+
+        # --- Root CAs (10 to 25-Year Lifespan - Immune to 90-Day Rotations) ---
+        "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",  # Google Trust Services GTS Root R1 (RSA 4096)
+        "Vfd95BwDeSQo+NUYxVEEIlvkOlWY2SalKK1lPhzOx78=",  # Google Trust Services GTS Root R2 (RSA 4096)
+        "QXnt2YHvdHR3tJYmQIr0Paosp6t/nggsEGD4QJZ3Q0g=",  # Google Trust Services GTS Root R3 (ECDSA P-256)
+        "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",  # Google Trust Services GTS Root R4 (ECDSA P-384)
+        "C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=",  # Let's Encrypt ISRG Root X1 (RSA 4096, valid to 2035)
+        "diGVwiVYbubAI3RW4hB9xU8e/CH2GnkuvVFZE8zmgzI=",  # Let's Encrypt ISRG Root X2 (ECDSA P-384, valid to 2040)
+        "K87oWBWM9UZfyddvDfoxL+8lpNyoUB2ptGtn0fv6G2Q=",  # GlobalSign Root CA (GTS cross-sign anchor)
+        "CLOmM1/OXvSPjw5UOYbAf9GKOxImEp9hhku9W90fHMk=",  # GlobalSign ECC Root R4
+        "cGuxAXyFXFkWm61cF4HPWX8S0srS9j0aSqN0k4AP+4A=",  # GlobalSign Root CA - R3
+
+        # --- Emergency / Rollover Backup Pin ---
+        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="   # Rollover backup pin
+    ]
 }
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -163,31 +177,65 @@ _SHARED_IDENTITY_FILES = (
     "device_fingerprint.json",
     "asset_info.json",
     "dashboard_cache.dat",
+    "scan_cache.db",
 )
 
 def _get_state_dir() -> str:
+    system_parent = "/var/lib/zerowatch"
     system_dir = "/var/lib/zerowatch/state"
     # XDG user dir - MUST match sentinel_agent.py's GUI fallback so the daemon
     # reads the same JWT and join_state.json that the GUI wrote.
     xdg_data_home = os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share"))
     xdg_dir  = os.path.join(xdg_data_home, "zerowatch", "state")
     user_dir = xdg_dir
+    var_tmp_dir = "/var/tmp/zerowatch/state"
     local_dir = "/tmp/zerowatch/state"
 
     # ── Try system dir first (preferred — consistent across UIDs) ──────
     try:
         os.makedirs(system_dir, mode=0o777, exist_ok=True)
-        os.chmod(system_dir, 0o777)
+        try:
+            os.chmod(system_parent, 0o777)
+            os.chmod(system_dir, 0o777)
+        except OSError:
+            pass
         _probe = os.path.join(system_dir, ".write_probe")
         with open(_probe, "w") as _fh:
             _fh.write("x")
         os.remove(_probe)
+
+        # Privileged repair: ensure all existing files in system dir are world-writable (0666)
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            for entry in os.listdir(system_dir):
+                fpath = os.path.join(system_dir, entry)
+                if os.path.isfile(fpath):
+                    try:
+                        os.chmod(fpath, 0o666)
+                    except OSError:
+                        pass
+
+            # If launched via sudo, import any state from the calling user's directory
+            sudo_user = os.environ.get("SUDO_USER")
+            if sudo_user:
+                sudo_user_dir = os.path.expanduser(f"~{sudo_user}/.local/share/zerowatch/state")
+                if os.path.isdir(sudo_user_dir):
+                    for name in _SHARED_IDENTITY_FILES:
+                        src = os.path.join(sudo_user_dir, name)
+                        dst = os.path.join(system_dir, name)
+                        if os.path.isfile(src) and not os.path.exists(dst):
+                            try:
+                                import shutil as _shutil
+                                _shutil.copy2(src, dst)
+                                os.chmod(dst, 0o666)
+                            except OSError:
+                                pass
+
         return system_dir                          # writable → use it
     except OSError:
         pass  # root-owned or missing; fall through to user-dir
 
     # ── System dir not writable. Find the first user-writable fallback ─
-    for fallback in (user_dir, local_dir):
+    for fallback in (var_tmp_dir, user_dir, local_dir):
         try:
             os.makedirs(fallback, mode=0o777, exist_ok=True)
             os.chmod(fallback, 0o777)
@@ -236,13 +284,21 @@ _lock_fh = None   # module-level handle — keeps fd open for the process lifeti
 
 def _acquire_single_instance_lock(state_dir: str) -> bool:
     """
-    Acquire an exclusive non-blocking flock on the ZeroWatch lock file.
-    Returns True if this process is the only running instance.
+    Acquire an exclusive non-blocking flock on the ZeroWatch daemon lock file.
+
+    The daemon uses '.zerowatch-daemon.lock' so it can coexist with a running
+    GUI process (which the Windows GUI's _spawn_daemon_process() may launch
+    while the user has the GUI open).  The old '.zerowatch.lock' name is kept
+    as a compatibility fallback for probing by sentinel_agent.py.
     """
     global _lock_fh
     import fcntl
 
-    lock_path = os.path.join(state_dir, ".zerowatch.lock")
+    # Use a daemon-specific lock file so the GUI and daemon can coexist.
+    # sentinel_agent.py's _is_daemon_running() checks both names.
+    is_daemon = "--daemon" in sys.argv
+    lock_name = ".zerowatch-daemon.lock" if is_daemon else ".zerowatch.lock"
+    lock_path = os.path.join(state_dir, lock_name)
     try:
         os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
     except OSError:
@@ -264,8 +320,8 @@ def _acquire_single_instance_lock(state_dir: str) -> bool:
         except OSError:
             pid = "unknown"
         logger.error(
-            "ZeroWatch agent is already running (pid=%s). "
-            "Only one instance may run at a time. Exiting.",
+            "ZeroWatch daemon is already running (pid=%s). "
+            "Only one daemon instance may run at a time. Exiting.",
             pid,
         )
         return False
@@ -307,11 +363,31 @@ class LinuxAgentSession:
         if is_loopback(self._api_url):
             sess = requests.Session()
             return sess
+        try:
+            from common.updater import load_cached_dynamic_pins
+            from common.cert.pinning import register_dynamic_pins
+            cached = load_cached_dynamic_pins()
+            if cached:
+                register_dynamic_pins(cached)
+        except Exception:
+            pass
         pins = SPKI_PINS.get(hostname, [])
         adapter = build_pinning_adapter(pins)
-        sess = requests.Session()
+        sess = PinnedSession()
         sess.mount("https://", adapter)
         return sess
+
+    def heal_certificate_pins(self) -> bool:
+        """Forces an immediate out-of-band Ed25519 OTA refresh of dynamic certificate pins."""
+        try:
+            from common.updater import fetch_dynamic_pins
+            updated = fetch_dynamic_pins(timeout=10)
+            if updated:
+                logging.info(f"[PINNING] Certificate pins manually refreshed: {list(updated.keys())}")
+                return True
+        except Exception as e:
+            logging.warning(f"[PINNING] Manual certificate pin refresh failed: {e}")
+        return False
 
     @property
     def headers(self) -> dict:
@@ -877,7 +953,8 @@ class LinuxAgent:
         return False
 
     def _sync_full(self, software: list, hardware: dict | None = None,
-                   inventory_scope: str = "complete") -> int:
+                   inventory_scope: str = "complete",
+                   batch_index: int = 1, batch_count: int = 1) -> int:
         """Push full software inventory and hardware profile to backend."""
         if hardware is None:
             try:
@@ -894,6 +971,8 @@ class LinuxAgent:
             "hardware":  hardware,
             "inventoryScope": inventory_scope,
             "inventoryRevision": time.time_ns(),
+            "batch_index": batch_index,
+            "batch_count": batch_count,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         try:
@@ -907,32 +986,26 @@ class LinuxAgent:
             logger.warning("Full sync error: %s", exc)
             return 0
 
-    def _sync_complete_inventory(self, software_list: list, hardware: dict | None = None) -> bool:
-        """Sync complete inventory, proactively chunking large payloads.
+    def _sync_complete_inventory(self, software_list: list, hardware: dict | None = None,
+                                 inventory_scope: str = "complete") -> bool:
+        """Sync complete inventory, falling back to chunked delivery only on HTTP 413.
 
-        Cloudflare and similar WAF/proxy layers silently kill SSL connections
-        for oversized request bodies (returning SSLEOFError, status 0).  To
-        avoid this, inventories with >= 400 items are chunked proactively
-        without attempting the full payload first.  Smaller inventories still
-        try a single request and only fall back to chunking on 413 or
-        connection errors.
+        Attempts a single sync_full request first (fastest and atomic).
+        Only falls back to chunking if the backend or proxy returns HTTP 413
+        (Payload Too Large) or connection drops.
         """
         items = list(software_list or [])
         if not items:
             return False
 
-        # For small inventories, try sending everything in one request.
-        if len(items) < 400:
-            status_code = self._sync_full(items, hardware, inventory_scope="complete")
-            if status_code in (200, 201, 204):
-                return True
-            # Only fall back to chunking on 413 or connection-level failures
-            # (status 0 = exception before any HTTP response, e.g. SSLEOFError).
-            if status_code not in (413, 0):
-                return False
-            logger.info("[SYNC] Full sync returned %d; falling back to chunked delivery.", status_code)
-        else:
-            logger.info("[SYNC] Large inventory (%d items); proactively chunking to avoid proxy drops.", len(items))
+        # Attempt atomic single-request upload first
+        status_code = self._sync_full(items, hardware, inventory_scope=inventory_scope)
+        if status_code in (200, 201, 204):
+            return True
+        if status_code not in (413, 0):
+            return False
+
+        logger.info("[SYNC] Full sync returned %d; falling back to chunked delivery.", status_code)
 
         batches = []
         current = []
@@ -947,19 +1020,28 @@ class LinuxAgent:
         if current:
             batches.append(current)
 
-        logger.info("[SYNC] Chunking inventory (%d items) into %d requests.", len(items), len(batches))
-        first_status = self._sync_full(batches[0], hardware, inventory_scope="complete")
+        batch_count = len(batches)
+        logger.info("[SYNC] Chunking inventory (%d items) into %d requests.", len(items), batch_count)
+        first_status = self._sync_full(
+            batches[0], hardware, inventory_scope=inventory_scope,
+            batch_index=1, batch_count=batch_count,
+        )
         if first_status not in (200, 201, 204):
             return False
 
         for index, batch in enumerate(batches[1:], start=2):
-            if not self._sync_delta(batch, []):
-                logger.warning("[SYNC] Inventory chunk %d/%d failed.", index, len(batches))
+            if not self._sync_delta(
+                batch, [], inventory_scope=inventory_scope,
+                batch_index=index, batch_count=batch_count,
+            ):
+                logger.warning("[SYNC] Inventory chunk %d/%d failed.", index, batch_count)
                 return False
         logger.info("[SYNC] Chunked inventory sync finished: %d items delivered.", len(items))
         return True
 
-    def _sync_delta(self, added: list, removed: list) -> bool:
+    def _sync_delta(self, added: list, removed: list,
+                    inventory_scope: str = "delta",
+                    batch_index: int = 1, batch_count: int = 1) -> bool:
         """Push incremental delta to backend."""
         if not added and not removed:
             return True
@@ -967,6 +1049,9 @@ class LinuxAgent:
             "deviceId": self._device_id,
             "added":    added,
             "removed":  removed,
+            "inventoryScope": inventory_scope,
+            "batch_index": batch_index,
+            "batch_count": batch_count,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         try:
@@ -1014,7 +1099,7 @@ class LinuxAgent:
         for attempt in range(3):
             if self._shutdown_event.is_set():
                 return False
-            if self._sync_complete_inventory(software, hardware):
+            if self._sync_complete_inventory(software, hardware, inventory_scope=inventory_scope):
                 return True
             logger.warning("Full sync attempt %d/3 failed. Retrying in 15s...", attempt + 1)
             self._shutdown_event.wait(timeout=15)
@@ -1022,65 +1107,14 @@ class LinuxAgent:
         return False
 
     def _initial_scan_and_sync(self, approval_sync_claimed: bool = False) -> None:
-        """Run a startup-optimized L0 + priority-path L1/L2 scan.
-
-        Strategy:
-          1. Run run_startup_scan() which does:
-             - L0 (package managers) synchronously (<1s)
-             - L1/L2 on priority paths only, parallelized with 6 workers
-          2. 90-second safety timeout as a defensive backstop.
-          3. If the priority scan exceeds the timeout or errors out,
-             fall back to L0-only sync so the device goes Active immediately.
-             The periodic deep scan will fill in the rest.
-
-        The full-disk exhaustive walk is NOT run at startup. It runs on the
-        existing 24h cadence via start_periodic_scans().
-
-        approval_sync_claimed: if True this invocation owns the approval-sync slot
-            and must call _finish_approval_sync() when the upload completes.
+        """Run two-stage post-enrollment scan:
+        1. Immediate Layer 0 baseline (package managers: dpkg/rpm/pacman/snap/flatpak)
+           published to backend immediately within ~10 seconds of joining.
+        2. Background Layer 1 + 2 startup scan (priority filesystem, ELF, manifests)
+           published to backend as complete inventory within ~1 minute of joining.
         """
-        _SAFETY_TIMEOUT = 90  # seconds — backstop for pathological disks
-
-        startup_items: list = []
-        scan_done = threading.Event()
-        self._initial_scan_done = scan_done
-        scan_error: list = []
-
-        logger.info(
-            "[STARTUP_SCAN_STARTED] Linux initial scan started "
-            "(timeout=%ds, device_id=%s, approval_claimed=%s).",
-            _SAFETY_TIMEOUT, self._device_id, approval_sync_claimed,
-        )
-
-        def _run_startup():
-            try:
-                logger.info(
-                    "[STARTUP_SCAN] L0 + priority-path L1/L2 scan started "
-                    "(device_id=%s).", self._device_id,
-                )
-                result = self._orchestrator.run_startup_scan(
-                    stop_event=self._shutdown_event,
-                )
-                startup_items.extend(result)
-                logger.info(
-                    "[STARTUP_SCAN] Priority scan finished: %d items (device_id=%s).",
-                    len(startup_items), self._device_id,
-                )
-            except Exception as exc:
-                scan_error.append(exc)
-                logger.error(
-                    "[STARTUP_SCAN] Scan error (device_id=%s): %s",
-                    self._device_id, exc, exc_info=True,
-                )
-            finally:
-                scan_done.set()
-
-        scan_thread = threading.Thread(
-            target=_run_startup, daemon=True, name="initial-startup-scan",
-        )
-        scan_thread.start()
-
-        completed_in_time = scan_done.wait(timeout=_SAFETY_TIMEOUT)
+        if not hasattr(self, "_initial_scan_done"):
+            self._initial_scan_done = threading.Event()
 
         # Collect full hardware profile
         try:
@@ -1089,46 +1123,19 @@ class LinuxAgent:
             logger.warning("Hardware collection failed: %s", hw_exc)
             hardware = {}
 
-        if completed_in_time and not scan_error:
-            logger.info(
-                "[STARTUP_SCAN] Completed within %ds — "
-                "syncing %d items in one shot (device_id=%s).",
-                _SAFETY_TIMEOUT, len(startup_items), self._device_id,
-            )
-            logger.info("[INVENTORY_UPLOAD_STARTED] device_id=%s items=%d", self._device_id, len(startup_items))
-            ok = self._sync_full_with_retry(startup_items, hardware, "complete")
-            logger.info("[INVENTORY_UPLOAD_COMPLETED] device_id=%s success=%s", self._device_id, ok)
-            if approval_sync_claimed:
-                self._finish_approval_sync(ok)
-                logger.info("[FULL_SYNC_COMPLETED] device_id=%s", self._device_id)
-            return
-
-        # ── Safety timeout path: fall back to L0-only sync ───────────────────
-        if not completed_in_time:
-            logger.warning(
-                "[STARTUP_SCAN] Priority scan exceeded %ds safety timeout — "
-                "falling back to L0-only immediate sync. "
-                "L1/L2 results will arrive via periodic deep scan.",
-                _SAFETY_TIMEOUT,
-            )
-        else:
-            logger.warning(
-                "[STARTUP_SCAN] Scan encountered an error (%s) — "
-                "falling back to L0-only sync.",
-                scan_error[0],
-            )
-
+        # ── Stage 1: Fast Immediate Layer 0 Baseline Sync (<1s collection, immediate send) ──
+        raw_items = []
         try:
             raw_items = self._platform.software_collector.collect_software()
-            items = []
+            l0_items = []
             for item in raw_items:
                 try:
                     if hasattr(item, "to_api_dict"):
-                        items.append(item.to_api_dict())
+                        l0_items.append(item.to_api_dict())
                     elif isinstance(item, dict):
-                        items.append(item)
+                        l0_items.append(item)
                     else:
-                        items.append({
+                        l0_items.append({
                             "name":     getattr(item, "name", ""),
                             "version":  getattr(item, "version", ""),
                             "vendor":   getattr(item, "vendor", ""),
@@ -1138,8 +1145,15 @@ class LinuxAgent:
                 except Exception:
                     pass
 
-            logger.info("Fallback L0 scan: %d items — syncing now.", len(items))
-            self._sync_full_with_retry(items, hardware, "partial")
+            logger.info(
+                "[STARTUP_SCAN] Publishing initial Layer 0 baseline (%d items, device_id=%s)...",
+                len(l0_items), self._device_id,
+            )
+            l0_ok = self._sync_full_with_retry(l0_items, hardware, inventory_scope="partial")
+            logger.info(
+                "[STARTUP_SCAN] Initial Layer 0 baseline synced to backend: %s (%d items).",
+                l0_ok, len(l0_items),
+            )
 
             # Seed orchestrator snapshot so subsequent deltas are accurate
             try:
@@ -1148,13 +1162,57 @@ class LinuxAgent:
                         if hasattr(item, "dedup_key"):
                             self._orchestrator._last_snapshot[item.dedup_key()] = item
             except Exception as seed_exc:
-                logger.debug("Snapshot seed skipped (non-fatal): %s", seed_exc)
+                logger.debug("Snapshot seed skipped: %s", seed_exc)
+        except Exception as l0_exc:
+            logger.error("[STARTUP_SCAN] Immediate Layer 0 baseline failed: %s", l0_exc, exc_info=True)
 
-            if approval_sync_claimed:
-                self._finish_approval_sync(False)
+        # ── Stage 2: Background Layer 1 + 2 Priority Startup Scan ──────────
+        def _run_deep_startup():
+            started = time.perf_counter()
+            logger.info(
+                "[STARTUP_SCAN] Background priority L1/L2 scan started "
+                "(device_id=%s, approval_claimed=%s).",
+                self._device_id, approval_sync_claimed,
+            )
+            sync_ok = False
+            try:
+                startup_items = self._orchestrator.run_startup_scan(
+                    stop_event=self._shutdown_event,
+                )
+                if startup_items and self._session._jwt:
+                    logger.info(
+                        "[INVENTORY_UPLOAD_STARTED] device_id=%s items=%d",
+                        self._device_id, len(startup_items),
+                    )
+                    sync_ok = self._sync_full_with_retry(startup_items, hardware, inventory_scope="complete")
+                    logger.info(
+                        "[STARTUP_SCAN] Complete inventory synced: %d items in %.1fs (device_id=%s, success=%s).",
+                        len(startup_items), time.perf_counter() - started, self._device_id, sync_ok,
+                    )
+                    if approval_sync_claimed:
+                        self._finish_approval_sync(sync_ok)
+                        logger.info("[FULL_SYNC_COMPLETED] device_id=%s", self._device_id)
+            except Exception as exc:
+                logger.error(
+                    "[STARTUP_SCAN] Background deep scan error (device_id=%s): %s",
+                    self._device_id, exc, exc_info=True,
+                )
+                if approval_sync_claimed:
+                    self._finish_approval_sync(False)
+            finally:
+                self._initial_scan_done.set()
+                if self._session._jwt and not self._shutdown_event.is_set():
+                    try:
+                        self._orchestrator.start_periodic_scans(on_delta=self._on_fs_delta)
+                        logger.info("Periodic filesystem scans started after initial deep scan.")
+                    except Exception as p_exc:
+                        logger.warning("Failed to start periodic filesystem scans: %s", p_exc)
 
-        except Exception as exc:
-            logger.error("Fallback L0 scan failed: %s", exc, exc_info=True)
+        scan_thread = threading.Thread(
+            target=_run_deep_startup, daemon=True, name="initial-startup-scan",
+        )
+        scan_thread.start()
+        logger.info("[STARTUP_SCAN] Background priority scan queued immediately after Layer 0 baseline.")
 
     def _on_fs_delta(self, added_items: list, removed_items: list) -> None:
         """

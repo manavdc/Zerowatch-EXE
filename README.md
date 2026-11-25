@@ -62,12 +62,19 @@ https://github.com/user-attachments/assets/77a62549-01ed-4cab-a0dd-2f37109f0a86
 chmod +x SentinelAgent-linux-x64
 ```
 
-### 2. Launch the GUI and Enroll
-Run the binary as the logged-in desktop user. This opens the ZeroWatch GUI:
+### 2. Run in Headless / Daemon Mode (Recommended for Servers & CLI)
+Pass your `TEAM_CODE` (or `INDIVIDUAL_CODE`) via `sudo env` and launch with `--daemon`:
 ```bash
-./zerowatch-agent-linux-x64
+sudo env TEAM_CODE="<your-team-code>" ./SentinelAgent-linux-x64 --daemon
 ```
-Complete enrollment in the GUI. The same launch now auto-registers startup persistence and starts the detached background agent automatically (works for both normal-user and sudo launches). No second daemon command is required.
+*(For individual enrollment, replace `TEAM_CODE` with `INDIVIDUAL_CODE="<your-individual-code>"`.)*
+
+### 3. Launch the GUI and Enroll (Desktop)
+Alternatively, run the binary as the logged-in desktop user to open the ZeroWatch GUI:
+```bash
+./SentinelAgent-linux-x64
+```
+Complete enrollment in the GUI. The same launch auto-registers startup persistence and starts the detached background agent automatically (works for both normal-user and `sudo` launches).
 
 Linux persistence behavior:
 - Normal user launch: installs a user systemd unit (`systemctl --user`) and auto-starts the daemon.
@@ -83,22 +90,25 @@ Linux persistence behavior:
 
 ## macOS Setup & Execution
 
+> [!IMPORTANT]
+> **Administrator Privileges Required (`sudo`):**
+> On macOS, ZeroWatch must be launched with `sudo` privileges. Administrator access is required to securely interact with the Apple System Keychain (`/Library/Keychains/System.keychain`), install system-wide LaunchDaemons, and protect stored credentials from unprivileged processes.
+> 
+> If the agent was previously enrolled using `sudo` and is subsequently launched as a standard user without `sudo`, the agent detects the existing administrative enrollment and will prompt you to relaunch using `sudo` rather than displaying a duplicate enrollment screen.
 
 ### 1. Make the Binary Executable
 ```bash
 chmod +x SentinelAgent-macos-arm64
 ```
 
-### 2. Launch the GUI and Enroll
-Run the binary as the logged-in macOS user. This opens the ZeroWatch GUI:
+### 2. Launch with Administrator Privileges and Enroll
+Run the binary using `sudo`:
 ```bash
-./zerowatch-agent-macos
+sudo ./zerowatch-agent-macos
 ```
-Complete enrollment in the GUI. The GUI then starts the detached background agent; closing the GUI or terminal does not stop it.
+Complete enrollment in the GUI. The agent registers the system LaunchDaemon in `/Library/LaunchDaemons` and auto-starts the background monitoring daemon. Closing the GUI does not stop the background protection service.
 
-macOS persistence behavior:
-- Normal user launch: installs a per-user LaunchAgent in `~/Library/LaunchAgents` and auto-starts it.
-- `sudo` launch: installs a system LaunchDaemon in `/Library/LaunchDaemons` and auto-starts it.
-
-No separate daemon command is required after GUI enrollment.
-`tail -f agent_output.log`
+### Service Control Commands (macOS)
+* **Check Status**: `sudo launchctl list | grep zerowatch`
+* **View Live Logs**: `tail -f /Library/Application\ Support/ZeroWatch/agent_output.log`
+* **Stop Daemon**: `sudo launchctl unload /Library/LaunchDaemons/io.deepcytes.zerowatch.daemon.plist`

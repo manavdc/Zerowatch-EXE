@@ -114,6 +114,7 @@ SKIP_DIR_NAMES_COMMON: FrozenSet[str] = frozenset({
     "cmake-build-release",
     ".git", ".svn", ".hg", ".bzr",
     ".idea", ".vscode",
+    ".antigravity", ".antigravity-ide", ".cursor", ".windsurf",
     ".sonarwork",
     "cache", "caches", ".cache",
     "tmp", "temp",

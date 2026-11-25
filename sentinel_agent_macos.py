@@ -75,11 +75,12 @@ from common.os_replacer import commit_macos_update
 # AGENT CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-AGENT_VERSION      = "1.0.0-macos"
+AGENT_VERSION      = "1.0.48-macos"
 HEARTBEAT_INTERVAL = 30    # seconds between heartbeats
 MONITOR_INTERVAL   = 120   # seconds between delta scan checks
-RESTART_CHECK_TIME = 180  # 4 hours in seconds (OTA update & restart check interval)
+RESTART_CHECK_TIME = 14400  # 4 hours in seconds (OTA update & restart check interval)
 RECONNECT_DELAY    = 10    # seconds before reconnect attempt
+HEALTH_MARKER      = "/Library/Application Support/ZeroWatch/state/agent_heartbeat"
 
 # Build-time server URL injection (written by run_agent.sh)
 _BUILD_CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_build_config.py")
@@ -95,14 +96,28 @@ else:
 # ── SPKI pins (identical to Windows and Linux agents) ─────────────────────────
 SPKI_PINS = {
     "zerowatch.deepcytes.io": [
-        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",
-        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",
-        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="
-    ],
-    "zerowatch-testing.eastasia.cloudapp.azure.com": [
-        "SOt+phzxLXUaMmNKG6d4kz7QTSoip7zJudN8vGJNdI4=",
-        "EzSBE12fT2ZrphmumaBjrpdpXv9G71RhZQHMvuwszI4="
-    ],
+        # --- Leaf Public Keys (90-Day Lifespan) ---
+        "a6WoJxzcp0Im4dXEiaHUcio3U8wbbRWdVyaWoqsIlGQ=",  # Google Trust Services (Active Leaf from 2026-11-03)
+        "MZ4Kk+NPs6uc35JlOBNODqa+AZvqgtCq+sSjXx9W/k4=",  # Previous Leaf
+
+        # --- Intermediate CAs (1 to 5-Year Lifespan) ---
+        "kIdp6NNEd8wsugYyyIYFsi1ylMCED3hZbSR8ZFsa/A4=",  # Google Trust Services WE1 Intermediate CA
+        "jQJTbIh0grw0/1TkHSumWb+Fs0Ggogr621gT3PvPKG0=",  # Let's Encrypt R3 Intermediate CA
+
+        # --- Root CAs (10 to 25-Year Lifespan - Immune to 90-Day Rotations) ---
+        "hxqRlPTu1bMS/0DITB1SSu0vd4u/8l8TjPgfaAp63Gc=",  # Google Trust Services GTS Root R1 (RSA 4096)
+        "Vfd95BwDeSQo+NUYxVEEIlvkOlWY2SalKK1lPhzOx78=",  # Google Trust Services GTS Root R2 (RSA 4096)
+        "QXnt2YHvdHR3tJYmQIr0Paosp6t/nggsEGD4QJZ3Q0g=",  # Google Trust Services GTS Root R3 (ECDSA P-256)
+        "mEflZT5enoR1FuXLgYYGqnVEoZvmf9c2bVBpiOjYQ0c=",  # Google Trust Services GTS Root R4 (ECDSA P-384)
+        "C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=",  # Let's Encrypt ISRG Root X1 (RSA 4096, valid to 2035)
+        "diGVwiVYbubAI3RW4hB9xU8e/CH2GnkuvVFZE8zmgzI=",  # Let's Encrypt ISRG Root X2 (ECDSA P-384, valid to 2040)
+        "K87oWBWM9UZfyddvDfoxL+8lpNyoUB2ptGtn0fv6G2Q=",  # GlobalSign Root CA (GTS cross-sign anchor)
+        "CLOmM1/OXvSPjw5UOYbAf9GKOxImEp9hhku9W90fHMk=",  # GlobalSign ECC Root R4
+        "cGuxAXyFXFkWm61cF4HPWX8S0srS9j0aSqN0k4AP+4A=",  # GlobalSign Root CA - R3
+
+        # --- Emergency / Rollover Backup Pin ---
+        "F9lRuoRnviTJKIdnkPA/fgjKP4lCNbWuIC23cQ7mlJU="   # Rollover backup pin
+    ]
 }
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -284,6 +299,20 @@ def _inventory_scan_enabled() -> bool:
         return True
 
 
+def _touch_health_marker() -> None:
+    """Publish daemon liveness for launchd activation checks."""
+    try:
+        os.makedirs(os.path.dirname(HEALTH_MARKER), mode=0o777, exist_ok=True)
+        with open(HEALTH_MARKER, "a", encoding="utf-8"):
+            os.utime(HEALTH_MARKER, None)
+        try:
+            os.chmod(HEALTH_MARKER, 0o666)
+        except OSError:
+            pass
+    except OSError as exc:
+        logger.debug("Unable to update daemon health marker: %s", exc)
+
+
 # ── Single-instance lock ───────────────────────────────────────────────
 
 _LOCK_FILE_PATH = "/Library/Application Support/ZeroWatch/state/.zerowatch.lock"
@@ -397,11 +426,31 @@ class MacOSAgentSession:
         hostname = parsed.hostname or ""
         if is_loopback(self._api_url):
             return requests.Session()
+        try:
+            from common.updater import load_cached_dynamic_pins
+            from common.cert.pinning import register_dynamic_pins
+            cached = load_cached_dynamic_pins()
+            if cached:
+                register_dynamic_pins(cached)
+        except Exception:
+            pass
         pins    = SPKI_PINS.get(hostname, [])
         adapter = build_pinning_adapter(pins)
-        sess    = requests.Session()
+        sess    = PinnedSession()
         sess.mount("https://", adapter)
         return sess
+
+    def heal_certificate_pins(self) -> bool:
+        """Forces an immediate out-of-band Ed25519 OTA refresh of dynamic certificate pins."""
+        try:
+            from common.updater import fetch_dynamic_pins
+            updated = fetch_dynamic_pins(timeout=10)
+            if updated:
+                logging.info(f"[PINNING] Certificate pins manually refreshed: {list(updated.keys())}")
+                return True
+        except Exception as e:
+            logging.warning(f"[PINNING] Manual certificate pin refresh failed: {e}")
+        return False
 
     @property
     def headers(self) -> dict:
@@ -421,6 +470,20 @@ class MacOSAgentSession:
         Always validates the returned token before returning — prevents writing
         corrupt non-token bytes to disk which would cause decrypt failures later.
         """
+        # Shared enrollment state is coordination data between the console
+        # user and the root LaunchDaemon. Do not turn it into a per-UID
+        # Keychain reference.
+        if purpose != "jwt":
+            import base64
+            return b"RAW::" + base64.b64encode(data)
+
+        # The normal GUI user cannot write the System keychain. The daemon
+        # owns the credential record; the GUI uses an explicit transitional
+        # envelope instead of repeatedly provoking errSecWrPerm (-61).
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            import base64
+            return b"RAW::" + base64.b64encode(data)
+
         try:
             named_encrypt = getattr(self._platform.secure_store, "encrypt_named", None)
             result = (
@@ -429,42 +492,32 @@ class MacOSAgentSession:
                 else self._platform.secure_store.encrypt(data)
             )
             if result is not None:
-                # Validate the token is a proper ZW_KC reference or RAW fallback
-                if not (result.startswith(b"ZW_KC::") or result.startswith(b"RAW::")):
+                # Validate the token is a proper ZW_KC reference
+                if not result.startswith(b"ZW_KC::"):
                     logger.error(
                         "encrypt() returned unexpected token format (len=%d) — "
                         "discarding to prevent corrupt disk state", len(result)
                     )
                     return None
                 return result
-            # Keychain unavailable — store raw bytes as base64 in state dir
-            logger.warning(
-                "Keychain unavailable — storing token unprotected in state dir. "
-                "This is expected during development on non-macOS hosts."
-            )
-            import base64
-            return b"RAW::" + base64.b64encode(data)
+            # Keychain unavailable — never store unencrypted tokens in production
+            logger.error("Keychain unavailable — refusing to store unprotected token.")
+            return None
         except Exception as exc:
-            # A root LaunchDaemon may not be able to access the logged-in
-            # user's Keychain. Keep the agent alive and persist the JWT in the
-            # same shared state directory using the explicit RAW:: fallback.
-            # The fallback is macOS-only; Linux and Windows use their own
-            # session implementations.
-            logger.warning(
-                "SecureStore encrypt failed: %s; using protected-state fallback.",
+            logger.error(
+                "SecureStore encrypt failed: %s; unencrypted storage is disabled.",
                 exc,
             )
-            import base64
-            return b"RAW::" + base64.b64encode(data)
+            return None
 
     def _decrypt(self, data: bytes, purpose: str = "default") -> bytes | None:
         """
-        Decrypt via MacOSSecureStore, or handle the RAW:: fallback token.
+        Decrypt via MacOSSecureStore. Reject unencrypted RAW:: tokens.
         """
         try:
             if data.startswith(b"RAW::"):
-                import base64
-                return base64.b64decode(data[5:])
+                logger.error("Unencrypted RAW:: token rejected for security compliance.")
+                return None
             named_decrypt = getattr(self._platform.secure_store, "decrypt_named", None)
             return (
                 named_decrypt(data, purpose)
@@ -632,6 +685,7 @@ class MacOSAgent:
         # ── Single-instance guard ─────────────────────────────────────────────
         if not _acquire_single_instance_lock():
             sys.exit(1)
+        _touch_health_marker()
 
         logger.info("ZeroWatch macOS Agent %s starting", AGENT_VERSION)
         logger.info("API URL:   %s", BASE_API_URL)
@@ -798,6 +852,7 @@ class MacOSAgent:
             )
             consecutive_errors = 0
             while not self._shutdown_event.is_set():
+                _touch_health_marker()
                 try:
                     response = self._session.get(
                         f"/agent/join-status?deviceId={self._device_id}"
@@ -807,6 +862,10 @@ class MacOSAgent:
                         status = str(data.get("status") or "").lower()
                         if status == "approved" and data.get("jwt"):
                             self._session.save_jwt(data["jwt"])
+                            self._session.save_join_state({
+                                "status": "approved",
+                                **({"requestId": data["requestId"]} if data.get("requestId") else {}),
+                            })
                             logger.info(
                                 "[APPROVAL_DETECTED] Persisted enrollment approved; "
                                 "daemon authenticated (device_id=%s).",
@@ -848,14 +907,62 @@ class MacOSAgent:
                 "Set TEAM_CODE=<your-team-code> or INDIVIDUAL_CODE=<your-code> "
                 "then restart the agent, OR enroll the device from the ZeroWatch dashboard."
             )
-            logger.info("Waiting for enrollment code to be set in environment (Ctrl+C to abort)...")
+            logger.info(
+                "[DAEMON_WAITING] Waiting for credentials: env-var codes OR "
+                "GUI-written JWT/join_state.json (device_id=%s)...",
+                self._device_id,
+            )
+            # Paths where the GUI (or a previous daemon session) persists
+            # enrollment credentials.  The daemon must discover these even
+            # after the GUI process has exited — launchd keeps the daemon
+            # alive independently.
+            jwt_path        = os.path.join(self._state_dir, "agent_token.enc")
+            join_state_path = os.path.join(self._state_dir, "join_state.json")
+            legacy_jwt_path = os.path.join(self._state_dir, "zerowatch_token.dat")
+            wait_count = 0
             while not self._shutdown_event.is_set():
-                self._shutdown_event.wait(timeout=30)
-                team_code = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
+                _touch_health_marker()
+                self._shutdown_event.wait(timeout=8)
+                wait_count += 1
+
+                # Check for env-var codes being set
+                team_code       = os.environ.get("TEAM_CODE") or os.environ.get("ZEROWATCH_TEAM_CODE")
                 individual_code = os.environ.get("INDIVIDUAL_CODE") or os.environ.get("ZEROWATCH_INDIVIDUAL_CODE")
                 if team_code or individual_code:
-                    logger.info("Enrollment code found. Proceeding with enrollment...")
+                    logger.info("[DAEMON_WAITING] Enrollment code found in environment. Proceeding.")
                     break
+
+                # Check if the GUI wrote a JWT or join_state.json after
+                # enrollment.  Return False so run()'s outer retry loop
+                # calls _register_or_authenticate() again from the top,
+                # where load_jwt() / load_join_state() will pick up the
+                # GUI-written credentials.  This is the critical fix: without
+                # it the daemon stays stuck in this loop forever after the
+                # GUI closes, because env vars die with the GUI process.
+                if os.path.exists(jwt_path) or os.path.exists(legacy_jwt_path):
+                    logger.info(
+                        "[DAEMON_WAITING] JWT appeared on disk (GUI enrolled?). "
+                        "Restarting authentication (device_id=%s).",
+                        self._device_id,
+                    )
+                    return False  # run() will retry immediately
+
+                join_state = self._session.load_join_state()
+                if str(join_state.get("status") or "").lower() in {"pending", "approved"}:
+                    logger.info(
+                        "[DAEMON_WAITING] join_state.json updated by GUI (status=%s). "
+                        "Restarting authentication (device_id=%s).",
+                        join_state.get("status"), self._device_id,
+                    )
+                    return False  # run() will retry immediately
+
+                if wait_count % 8 == 0:  # Log every ~64 seconds
+                    logger.info(
+                        "[DAEMON_WAITING] Still waiting for credentials... "
+                        "(checked %d times, device_id=%s)",
+                        wait_count, self._device_id,
+                    )
+
             if not team_code and not individual_code:
                 return False
 
@@ -882,6 +989,10 @@ class MacOSAgent:
                     status = data.get("status")
                     if status == "approved" and data.get("jwt"):
                         self._session.save_jwt(data.get("jwt"))
+                        self._session.save_join_state({
+                            "status": "approved",
+                            **({"requestId": data["requestId"]} if data.get("requestId") else {}),
+                        })
                         logger.info("Agent joined and approved immediately.")
                         return True
 
@@ -893,6 +1004,7 @@ class MacOSAgent:
                     # Infinite retry poll -- no hard deadline (fixes the 600s bug)
                     consecutive_errors = 0
                     while not self._shutdown_event.is_set():
+                        _touch_health_marker()
                         try:
                             status_resp = self._session.get(
                                 f"/agent/join-status?deviceId={self._device_id}"
@@ -903,6 +1015,10 @@ class MacOSAgent:
                                     token = status_data.get("jwt")
                                     if token:
                                         self._session.save_jwt(token)
+                                        self._session.save_join_state({
+                                            "status": "approved",
+                                            **({"requestId": status_data["requestId"]} if status_data.get("requestId") else {}),
+                                        })
                                         logger.info(
                                             "[APPROVAL_DETECTED] Device approved! "
                                             "Enrollment complete (device_id=%s).",
@@ -963,6 +1079,10 @@ class MacOSAgent:
                     token = data.get("jwt")
                     if token:
                         self._session.save_jwt(token)
+                        self._session.save_join_state({
+                            "status": "approved",
+                            **({"requestId": data["requestId"]} if data.get("requestId") else {}),
+                        })
                         logger.info("Agent enrolled and linked.")
                         return True
                     logger.error("Individual enrollment succeeded but no token returned.")
@@ -980,7 +1100,8 @@ class MacOSAgent:
 
     def _sync_full(self, software: list, hardware: dict,
                    inventory_scope: str = "complete", inventory_revision: str | None = None,
-                   batch_index: int | None = None, batch_count: int | None = None) -> int:
+                   batch_index: int | None = None, batch_count: int | None = None,
+                   timeout: int = 60) -> int:
         """Push full software + hardware inventory to backend. Returns HTTP status code."""
         payload = {
             "deviceId":  self._device_id,
@@ -995,7 +1116,7 @@ class MacOSAgent:
         if batch_count is not None:
             payload["inventoryBatchCount"] = batch_count
         try:
-            resp = self._session.post("/agent/sync/full", payload, timeout=60)
+            resp = self._session.post("/agent/sync/full", payload, timeout=timeout)
             if resp.status_code in (200, 201, 204):
                 logger.info("Full sync: %d software items (scope=%s)", len(software), inventory_scope)
                 return resp.status_code
@@ -1171,22 +1292,75 @@ class MacOSAgent:
         """
         if not hasattr(self, "_initial_scan_done"):
             self._initial_scan_done = threading.Event()
-        if not _inventory_scan_enabled():
+        inventory_enabled = _inventory_scan_enabled()
+        logger.info(
+            "[INVENTORY_CONFIG] macOS startup inventory enabled=%s",
+            inventory_enabled,
+        )
+        if not inventory_enabled:
             logger.info("Inventory scan disabled by administrator; skipping initial inventory upload.")
             if approval_sync_claimed:
                 self._finish_approval_sync(False)
             self._initial_scan_done.set()
             return
 
+        # Send Layer 0 immediately after authentication.  The priority/deep
+        # scanner must not be allowed to delay the first useful inventory
+        # upload; macOS package/application collection is bounded and is the
+        # expected first sync for a newly approved device.
+        try:
+            layer0 = self._orchestrator._run_layer0()
+            layer0_items = _items_to_dicts(
+                self._orchestrator._deduplicate(layer0)
+            )
+            logger.info(
+                "[L0_SYNC_STARTED] macOS baseline device_id=%s items=%d",
+                getattr(self, "_device_id", "unknown"), len(layer0_items),
+            )
+            l0_status = self._sync_full(
+                layer0_items,
+                {},
+                inventory_scope="partial",
+                timeout=5,
+            )
+            l0_ok = l0_status in (200, 201, 204)
+            logger.info(
+                "[L0_SYNC_COMPLETED] macOS device_id=%s success=%s http=%s",
+                getattr(self, "_device_id", "unknown"), l0_ok, l0_status,
+            )
+            if not l0_ok:
+                with getattr(self, "_pending_full_lock", threading.Lock()):
+                    self._pending_full_inventory = (list(layer0_items), {})
+                    self._pending_full_approval = approval_sync_claimed
+        except Exception as exc:
+            logger.warning("[L0_SYNC] Fast macOS baseline failed: %s", exc)
+
+        # Never let a macOS collector prevent the initial upload forever.
+        # The known-good Kratimacos implementation used a bounded startup
+        # phase and an L0 fallback; retain that behavior here.
+        startup_safety_timeout = 55
         startup_items = []
+        layer0_items = []
+        ok = False
         scan_done = threading.Event()
         scan_error = []
+        deep_scan_required = [True]
 
         def _run_startup():
             try:
-                # run_full_scan is the authoritative complete-inventory API.
-                # Keep a compatibility fallback for older orchestrator builds
-                # and lightweight test doubles that do not expose it.
+                # Publish the bounded startup inventory first.  The daemon
+                # must not make the server wait for an exhaustive all-drive
+                # walk before it sends its first inventory.
+                startup_scan = getattr(self._orchestrator, "run_startup_scan", None)
+                if callable(startup_scan):
+                    result = startup_scan(stop_event=self._shutdown_event)
+                    if isinstance(result, list):
+                        startup_items.extend(result)
+                        return
+
+                # Older orchestrator builds may not expose the bounded
+                # startup scan. Their full scan is already exhaustive, so use
+                # it as the one baseline upload and do not repeat it below.
                 full_scan = getattr(self._orchestrator, "run_full_scan", None)
                 if callable(full_scan):
                     result = full_scan(
@@ -1195,21 +1369,17 @@ class MacOSAgent:
                     )
                     if isinstance(result, list):
                         startup_items.extend(result)
+                        deep_scan_required[0] = False
                         return
 
-                result = self._orchestrator.run_startup_scan(
-                    stop_event=self._shutdown_event,
+                # Compatibility fallback for older orchestrator builds and
+                # lightweight test doubles that do not expose startup_scan.
+                # Keep this bounded: the exhaustive run_full_scan belongs to
+                # the deep worker below and must not be executed twice.
+                layer0 = self._orchestrator._run_layer0()
+                startup_items.extend(
+                    _items_to_dicts(self._orchestrator._deduplicate(layer0))
                 )
-                if isinstance(result, list):
-                    startup_items.extend(result)
-                else:
-                    # Preserve the old minimal fallback only when the
-                    # complete scanner is unavailable, never as a successful
-                    # "complete" upload.
-                    layer0 = self._orchestrator._run_layer0()
-                    startup_items.extend(
-                        _items_to_dicts(self._orchestrator._deduplicate(layer0))
-                    )
             except Exception as exc:
                 scan_error.append(exc)
             finally:
@@ -1234,7 +1404,7 @@ class MacOSAgent:
         ).start()
 
         logger.info(
-            "[STARTUP_SCAN_STARTED] macOS complete inventory scan started "
+            "[STARTUP_SCAN_STARTED] macOS baseline inventory scan started "
             "(device_id=%s, approval_claimed=%s).",
             getattr(self, "_device_id", "unknown"), approval_sync_claimed,
         )
@@ -1242,15 +1412,21 @@ class MacOSAgent:
             target=_run_startup, daemon=True, name="initial-startup-scan",
         ).start()
         try:
-            # This is a background daemon thread, so completion—not a GUI
-            # timeout—defines when the complete inventory may be uploaded.
-            completed = scan_done.wait()
+            # This bounded scan is intentionally uploaded before the deep
+            # filesystem walk. It gives the backend an immediate inventory
+            # while the daemon continues collecting the complete result.
+            completed = scan_done.wait(timeout=startup_safety_timeout)
+            if not completed:
+                logger.warning(
+                    "[STARTUP_SCAN] Priority scan exceeded %ds; using L0 fallback.",
+                    startup_safety_timeout,
+                )
             if not hardware_done.wait(timeout=30):
                 logger.warning("Hardware profile timed out; syncing inventory without hardware details.")
             hw = hardware
             if completed and not scan_error:
                 logger.info(
-                    "[STARTUP_SCAN] Complete inventory collected: "
+                    "[STARTUP_SCAN] Baseline inventory collected: "
                     "%d software items (device_id=%s).",
                     len(startup_items), getattr(self, "_device_id", "unknown"),
                 )
@@ -1269,24 +1445,79 @@ class MacOSAgent:
                     with getattr(self, "_pending_full_lock", threading.Lock()):
                         self._pending_full_inventory = (list(startup_items), dict(hw))
                         self._pending_full_approval = approval_sync_claimed
-                if approval_sync_claimed:
-                    self._finish_approval_sync(ok)
-                    logger.info("[FULL_SYNC_COMPLETED] device_id=%s", getattr(self, "_device_id", "unknown"))
             else:
+                deep_scan_required[0] = False
                 logger.warning(
-                    "[STARTUP_SCAN] Complete scan failed; syncing L0 fallback "
+                    "[STARTUP_SCAN] Baseline scan failed; syncing L0 fallback "
                     "as partial inventory (device_id=%s).",
                     getattr(self, "_device_id", "unknown"),
                 )
-                layer0 = self._orchestrator._run_layer0()
-                layer0_dicts = _items_to_dicts(self._orchestrator._deduplicate(layer0))
+                layer0_dicts = list(layer0_items)
                 logger.info(
                     "[INVENTORY_UPLOAD_STARTED] L0 fallback device_id=%s items=%d",
                     getattr(self, "_device_id", "unknown"), len(layer0_dicts),
                 )
                 self._sync_full_with_retry(layer0_dicts, hw, "partial")
-                if approval_sync_claimed:
-                    self._finish_approval_sync(False)
+
+            # The exhaustive scan is separate from the first upload for the
+            # current orchestrator. Do not start periodic cache scans until
+            # this worker has finished, so the SQLite snapshot cannot be
+            # modified concurrently.
+            self._deep_scan_done = threading.Event()
+
+            if not deep_scan_required[0]:
+                self._deep_scan_done.set()
+                logger.info("[DEEP_SCAN] Baseline was already exhaustive; no second scan required.")
+                if approval_sync_claimed and ok:
+                    self._finish_approval_sync(True)
+                return
+
+            def _run_deep_inventory():
+                deep_ok = False
+                try:
+                    full_scan = getattr(self._orchestrator, "run_full_scan", None)
+                    if not callable(full_scan):
+                        logger.warning("[DEEP_SCAN] Complete scanner is unavailable.")
+                        return
+                    logger.info("[DEEP_SCAN] Exhaustive macOS inventory scan started.")
+                    complete_items = full_scan(
+                        include_filesystem=True,
+                        stop_event=self._shutdown_event,
+                    )
+                    if not isinstance(complete_items, list):
+                        logger.warning("[DEEP_SCAN] Scanner returned no inventory list.")
+                        return
+                    logger.info(
+                        "[DEEP_SCAN] Complete inventory collected: %d items.",
+                        len(complete_items),
+                    )
+                    deep_ok = self._sync_full_with_retry(complete_items, hw)
+                    logger.info(
+                        "[FULL_SYNC_COMPLETED] device_id=%s success=%s items=%d",
+                        getattr(self, "_device_id", "unknown"), deep_ok,
+                        len(complete_items),
+                    )
+                    if deep_ok:
+                        with getattr(self, "_pending_full_lock", threading.Lock()):
+                            self._pending_full_inventory = None
+                            self._pending_full_approval = False
+                        if approval_sync_claimed:
+                            self._finish_approval_sync(True)
+                    else:
+                        with getattr(self, "_pending_full_lock", threading.Lock()):
+                            self._pending_full_inventory = (list(complete_items), dict(hw))
+                            self._pending_full_approval = approval_sync_claimed
+                except Exception as exc:
+                    logger.error("[DEEP_SCAN] Complete inventory failed: %s", exc, exc_info=True)
+                finally:
+                    self._deep_scan_done.set()
+
+            threading.Thread(
+                target=_run_deep_inventory,
+                daemon=True,
+                name="macos-deep-inventory-sync",
+            ).start()
+            logger.info("[DEEP_SCAN] Complete inventory worker queued in background.")
         except Exception as exc:
             logger.error("Initial scan failed: %s", exc, exc_info=True)
         finally:
@@ -1316,6 +1547,7 @@ class MacOSAgent:
         logger.info("macOS heartbeat monitor started (interval=%ds).", HEARTBEAT_INTERVAL)
 
         while not self._shutdown_event.is_set() and not self._stop_event.is_set():
+            _touch_health_marker()
             now = time.monotonic()
 
             # Retry a complete startup upload until it is acknowledged. This
@@ -1425,6 +1657,9 @@ class MacOSAgent:
         # Keep the periodic scanner off the shared cache until the initial
         # deep scan and its follow-up upload have completed.
         self._initial_scan_done.wait()
+        deep_scan_done = getattr(self, "_deep_scan_done", None)
+        if deep_scan_done is not None:
+            deep_scan_done.wait()
 
         # Start periodic filesystem scans (priority + deep) so macOS does a
         # true folder/file deep scan instead of only hardware/software inventory.
@@ -1483,8 +1718,15 @@ def main() -> int:
         return 1
 
     _daemonize_if_needed()
-    agent = MacOSAgent()
-    return agent.run()
+    try:
+        agent = MacOSAgent()
+        return agent.run()
+    except Exception:
+        # Keep the failure visible in the LaunchDaemon error log.  Without
+        # this, launchd only reports a successful kickstart followed by an
+        # exited job, which hides the reason inventory/heartbeat never ran.
+        logger.exception("Fatal macOS agent startup/runtime failure")
+        raise
 
 
 if __name__ == "__main__":

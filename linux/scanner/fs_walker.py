@@ -88,14 +88,10 @@ PRIORITY_DIRS: List[str] = [
     "/usr/sbin",
     "/bin",
     "/sbin",
-    "/usr/lib",
-    "/usr/lib64",
     "/usr/local/bin",
-    "/usr/local/lib",
     "/usr/local/sbin",
     "/opt",
-    "/var/lib",
-    "/snap",
+    "/snap/bin",
 ]
 
 # ELF shared library extensions.
