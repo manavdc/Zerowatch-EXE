@@ -101,9 +101,3 @@ curl -X POST http://localhost:3000/api/agent/sbom \
 ## 7. Security Considerations
 - **Transient File Cleanup**: `scan_sbom.js` generates intermediate JSON files (`temp-agent-sbom.json`, `temp-grype.json`). The script uses a `finally` block to ensure all temporary JSON files are purged upon exit, avoiding sensitive file leakage.
 - **Dependency Pinning**: The GitHub Actions workflow pins the exact version hashes of Syft and Grype actions to prevent supply-chain attacks.
-
----
-
-## 8. Open Issues, Technical Debt & Handoff Notes
-- [ ] **Technical Debt**: In `update_latex.js`, LaTeX special characters (`_`, `%`, `&`, `#`) in package names are escaped using manual regexes. A dedicated LaTeX sanitizer module should be adopted to prevent TeX syntax compilation errors on unusual package names.
-- [ ] **TODO**: Add support for VEX (Vulnerability Exploitability eXchange) statements directly into the generated CycloneDX SBOM to document false-positive justifications.

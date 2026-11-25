@@ -103,9 +103,3 @@ print("Connection Status:", response.status_code)
 ## 7. Security Considerations
 - **Pinning Public Keys vs. Certificates**: ZeroWatch pins the Subject Public Key Info (SPKI), *not* the entire certificate. This allows certificates to be re-issued with updated expiration dates without altering the public key, preserving compatibility across agent fleets.
 - **Non-Latching Recovery**: Early pinning implementations permanently crashed upon pin mismatch. ZeroWatch implements a resilient 5-minute backoff (`PIN_MISMATCH_COOLDOWN`). If a server certificate issue is resolved, agents resume communication automatically.
-
----
-
-## 8. Open Issues, Technical Debt & Handoff Notes
-- [ ] **Technical Debt**: In `Endpoint-Agent/cert_pinning.py`, legacy module-level variables (`PIN_MISMATCH_DETECTED`) exist alongside class-level state in `common.cert.pinning`. Recommend refactoring all callers to use `common.cert.pinning.PinnedSession` directly.
-- [ ] **TODO**: Implement automated alerting in the agent when an AIA chase occurs, warning administrators that the server certificate chain is missing intermediate bundles.
