@@ -62,12 +62,19 @@ https://github.com/user-attachments/assets/77a62549-01ed-4cab-a0dd-2f37109f0a86
 chmod +x SentinelAgent-linux-x64
 ```
 
-### 2. Launch the GUI and Enroll
-Run the binary as the logged-in desktop user. This opens the ZeroWatch GUI:
+### 2. Run in Headless / Daemon Mode (Recommended for Servers & CLI)
+Pass your `TEAM_CODE` (or `INDIVIDUAL_CODE`) via `sudo env` and launch with `--daemon`:
 ```bash
-./zerowatch-agent-linux-x64
+sudo env TEAM_CODE="<your-team-code>" ./SentinelAgent-linux-x64 --daemon
 ```
-Complete enrollment in the GUI. The same launch now auto-registers startup persistence and starts the detached background agent automatically (works for both normal-user and sudo launches). No second daemon command is required.
+*(For individual enrollment, replace `TEAM_CODE` with `INDIVIDUAL_CODE="<your-individual-code>"`.)*
+
+### 3. Launch the GUI and Enroll (Desktop)
+Alternatively, run the binary as the logged-in desktop user to open the ZeroWatch GUI:
+```bash
+./SentinelAgent-linux-x64
+```
+Complete enrollment in the GUI. The same launch auto-registers startup persistence and starts the detached background agent automatically (works for both normal-user and `sudo` launches).
 
 Linux persistence behavior:
 - Normal user launch: installs a user systemd unit (`systemctl --user`) and auto-starts the daemon.
