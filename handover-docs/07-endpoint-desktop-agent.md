@@ -120,9 +120,3 @@ curl -X GET http://localhost:3000/api/agent/update/manifest
 ## 7. Security Considerations
 - **Cryptographic Update Signatures**: The agent will refuse to execute an update binary unless the accompanying manifest is validated against the hardcoded `OTA_ED25519_PUBLIC_KEY_B64`.
 - **Kill-Switch Verification**: Decommissioned devices wipe local configuration files and stop transmission immediately upon receiving the verified kill command.
-
----
-
-## 8. Open Issues, Technical Debt & Handoff Notes
-- [ ] **Technical Debt**: In `backend/index.js`, DEV-OTA update routes are marked as developer-only. For enterprise production, binary streaming should be offloaded from Node.js to pre-signed S3 or Cloudflare R2 download URLs.
-- [ ] **TODO**: Implement Windows service wrapper and Linux systemd auto-installation scripts in the agent build pipeline.
